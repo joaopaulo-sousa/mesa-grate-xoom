@@ -1,3 +1,5 @@
+#include <math.h>
+
 #include "grate_common.h"
 #include "grate_compiler.h"
 #include "fpir.h"
@@ -24,6 +26,72 @@ fp_alu_src_reg(int index)
       .index = 16 + index
    };
    return src;
+}
+
+static struct fp_alu_src_operand
+fp_alu_src_uniform(int index)
+{
+   assert(index >= 0 && index < GRATE_FP_NUM_CONSTS);
+   struct fp_alu_src_operand src = {
+      .index = 32 + index,
+      .datatype = FP_DATATYPE_FP20
+   };
+   return src;
+}
+
+uint32_t
+grate_float_to_fp20(float f)
+{
+   union { uint32_t u; float f; } v = { .f = f };
+   uint32_t sign, exponent, mantissa;
+
+   if (f == 0.0f)
+      return 0;
+
+   sign = (v.u >> 31) & 0x1;
+   exponent = (v.u >> 23) & 0xff;
+   mantissa = v.u & 0x7fffff;
+
+   if (exponent == 0xff)
+      exponent = 0x3f;
+   else
+      exponent = (exponent - 127 + 31) & 0x3f;
+
+   return (sign << 19) | (exponent << 13) | (mantissa >> (23 - 13));
+}
+
+/* Allocate (or reuse) an ALU uniform register holding an fp20 immediate */
+static int
+fp_const_slot(struct grate_fp_shader *fp, float value)
+{
+   uint32_t fp20 = grate_float_to_fp20(value);
+   int i;
+
+   for (i = GRATE_FP_NUM_CONSTS - 1; i >= 0; i--)
+      if ((fp->info.imm_mask & (1u << i)) && fp->info.consts[i] == fp20)
+         return i;
+
+   for (i = GRATE_FP_NUM_CONSTS - 1; i >= 0; i--)
+      if (!(fp->info.used_mask & (1u << i)))
+         break;
+   assert(i >= 0);
+
+   fp->info.consts[i] = fp20;
+   fp->info.imm_mask |= 1u << i;
+   fp->info.used_mask |= 1u << i;
+   return i;
+}
+
+/* ALU uniform register of a user uniform component */
+static int
+fp_uniform_slot(struct grate_fp_shader *fp, int index, int comp)
+{
+   int slot = index * 4 + comp;
+
+   assert(slot < GRATE_FP_NUM_CONSTS);
+   assert(!(fp->info.imm_mask & (1u << slot)));
+   fp->info.used_mask |= 1u << slot;
+   return slot;
 }
 
 static struct fp_alu_src_operand
@@ -122,6 +190,18 @@ emit_vMOV(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst,
          mfu->var[i].tram_row = src->Index;
          fp->info.max_tram_row = MAX2(fp->info.max_tram_row, src->Index);
          src0 = fp_alu_src_row(comp);
+      } else if (src->File == TGSI_FILE_IMMEDIATE) {
+         assert(src->Index < fp->num_immediates);
+         float value = fp->immediates[src->Index][comp];
+         if (src->Absolute)
+            value = fabsf(value);
+         if (src->Negate)
+            value = -value;
+         src0 = fp_alu_src_uniform(fp_const_slot(fp, value));
+      } else if (src->File == TGSI_FILE_CONSTANT) {
+         src0 = fp_alu_src_uniform(fp_uniform_slot(fp, src->Index, comp));
+         src0.negate = src->Negate;
+         src0.absolute_value = src->Absolute;
       } else
          src0 = fp_alu_src_reg(src->Index + comp);
 
@@ -211,6 +291,9 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
    fp->info.num_inputs = 0;
    fp->info.color_input = -1;
    fp->info.max_tram_row = 1;
+   fp->info.used_mask = 0;
+   fp->info.imm_mask = 0;
+   fp->num_immediates = 0;
 
    while (!tgsi_parse_end_of_tokens(tgsi)) {
       tgsi_parse_token(tgsi);
@@ -218,6 +301,16 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
       case TGSI_TOKEN_TYPE_DECLARATION:
          emit_tgsi_declaration(fp, &tgsi->FullToken.FullDeclaration);
          break;
+
+      case TGSI_TOKEN_TYPE_IMMEDIATE: {
+         const struct tgsi_full_immediate *imm = &tgsi->FullToken.FullImmediate;
+         unsigned n = MIN2(imm->Immediate.NrTokens - 1, 4);
+         assert(fp->num_immediates < GRATE_FP_MAX_IMMEDIATES);
+         for (unsigned i = 0; i < 4; i++)
+            fp->immediates[fp->num_immediates][i] = i < n ? imm->u[i].Float : 0.0f;
+         fp->num_immediates++;
+         break;
+      }
 
       case TGSI_TOKEN_TYPE_INSTRUCTION:
          if (tgsi->FullToken.FullInstruction.Instruction.Opcode != TGSI_OPCODE_END)

@@ -19,6 +19,10 @@ struct grate_vp_shader {
    int num_immediates;
 };
 
+/* ALU uniform registers 32..63, loaded from TGR3D_ALU_GLOBALS(0..31) */
+#define GRATE_FP_NUM_CONSTS 32
+#define GRATE_FP_MAX_IMMEDIATES 32
+
 struct grate_fp_info {
    struct {
       uint32_t src;
@@ -27,13 +31,23 @@ struct grate_fp_info {
    int num_inputs;
    int color_input;
    int max_tram_row;
+   /* ALU uniform registers: user uniforms at index * 4 + component from the
+    * bottom, immediates (fp20, already converted) allocated from the top */
+   uint32_t consts[GRATE_FP_NUM_CONSTS];
+   uint32_t used_mask;      /* slots read by the shader */
+   uint32_t imm_mask;       /* slots holding immediates */
 };
+
+uint32_t
+grate_float_to_fp20(float f);
 
 struct grate_fp_shader {
    struct list_head fp_instructions;
    struct list_head alu_instructions;
    struct list_head mfu_instructions;
    struct grate_fp_info info;
+   float immediates[GRATE_FP_MAX_IMMEDIATES][4];
+   int num_immediates;
 };
 
 void

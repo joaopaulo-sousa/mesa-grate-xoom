@@ -676,6 +676,29 @@ emit_program(struct grate_context *context, uint32_t **ptrp)
    emit_shader(stream, ptrp, &context->vshader->blob);
    emit_shader(stream, ptrp, &context->fshader->blob);
 
+   /* fragment shader constants: ALU uniform registers 32.. */
+   const struct grate_fp_info *fpinfo = &context->fshader->info;
+   if (fpinfo->used_mask) {
+      const struct pipe_constant_buffer *cb =
+         &context->constant_buffer[MESA_SHADER_FRAGMENT];
+      const float *user = cb->user_buffer;
+      unsigned user_len = user ? cb->buffer_size / sizeof(float) : 0;
+      uint32_t consts[GRATE_FP_NUM_CONSTS];
+
+      for (int i = 0; i < GRATE_FP_NUM_CONSTS; i++) {
+         if (fpinfo->imm_mask & (1u << i))
+            consts[i] = fpinfo->consts[i];
+         else if (i < (int)user_len)
+            consts[i] = grate_float_to_fp20(user[i]);
+         else
+            consts[i] = 0;
+      }
+
+      GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_ALU_GLOBALS(0),
+                                                   GRATE_FP_NUM_CONSTS));
+      grate_stream_push_words(stream, ptrp, consts, GRATE_FP_NUM_CONSTS, 0);
+   }
+
    cull_face_linker_setup = TGR3D_SU_PARAM_SUBPIX_XOFF(0x38) |
                             TGR3D_SU_PARAM_SUBPIX_YOFF(0x38) |
                             TGR3D_SU_PARAM_TRANSPOSE_XY(TGR3D_STATE_DISABLED) |
