@@ -237,11 +237,20 @@ grate_init_state(struct grate_context *context, uint32_t **ptrp)
                                                 TGR3D_PSEQ_CTL_MERGE_SPAN_STARTS |
                                                 TGR3D_PSEQ_CTL_MERGE_REGISTERS |
                                                 TGR3D_PSEQ_CTL_REMOVE_KILLED_PIXELS));
-   else
-      GRATE_PUSHBUF_WORD(ptr, host1x_opcode_imm(REG_TGR3D_PSEQ_CTL,
-                                                TGR3D_PSEQ_CTL_MERGE_SPAN_STARTS |
-                                                TGR3D_PSEQ_CTL_MERGE_REGISTERS |
-                                                TGR3D_PSEQ_CTL_REMOVE_KILLED_PIXELS));
+   else {
+      /*
+       * Same as the grate tests (and the blob): MAX_OUT = 0x12c quads in
+       * flight. With MAX_OUT = 0 pixels never recirculate through the
+       * pipeline, so only the first instruction batch of a fragment
+       * program runs.
+       */
+      GRATE_PUSHBUF_WORD(ptr, host1x_opcode_incr(REG_TGR3D_PSEQ_CTL, 1));
+      GRATE_PUSHBUF_WORD(ptr, (0x2232 << 16) | TGR3D_PSEQ_CTL_MAX_OUT(0x12c) |
+                              TGR3D_PSEQ_CTL_MERGE_SPAN_STARTS |
+                              TGR3D_PSEQ_CTL_MERGE_REGISTERS |
+                              TGR3D_PSEQ_CTL_REMOVE_KILLED_PIXELS |
+                              TGR3D_PSEQ_CTL_ALLOW_QID_COLLISIONS);
+   }
 
    GRATE_PUSHBUF_WORD(ptr, host1x_opcode_imm(REG_TGR3D_PSEQ_TIMEOUT, 0));
    GRATE_PUSHBUF_WORD(ptr, host1x_opcode_imm(REG_TGR3D_PSEQ_PC, 0));

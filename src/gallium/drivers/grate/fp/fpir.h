@@ -55,6 +55,11 @@ struct fp_alu_instr {
    enum fp_alu_op op;
    enum fp_scale scale;
 
+   /* "recv": rC is replaced by the previous slot's result (ALU0 takes ALU3) */
+   bool accumulate_this;
+   /* "send" */
+   bool accumulate_other;
+
    struct fp_alu_dst_operand dst;
    struct fp_alu_src_operand src[4];
 };

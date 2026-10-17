@@ -202,9 +202,11 @@ grate_create_fs_state(struct pipe_context *pcontext,
    util_dynarray_init(&buf, NULL);
 
 #define PUSH(x) util_dynarray_append_typed(&buf, uint32_t, (x))
+   /* one pixel packet row (ALU buffer size 1); MAX_QID matches PSEQ_CTL
+    * MAX_OUT = 0x12c as in the grate tests: (0x12c - 1) / (rows * 4) */
    PUSH(host1x_opcode_incr(REG_TGR3D_GLOBAL_PIX_ATTR, 1));
-   // TODO: document/convert these values
-   PUSH(0x58000000);
+   PUSH(TGR3D_GLOBAL_PIX_ATTR_MAX_QID((0x12c - 1) / 4) |
+        TGR3D_GLOBAL_PIX_ATTR_NUM_ROWS(0));
 
    PUSH(host1x_opcode_imm(REG_TGR3D_PSEQ_QUAD_ID, 0));
    PUSH(host1x_opcode_imm(REG_TGR3D_GLOBAL_INST_OFFSET, 0));
@@ -218,9 +220,14 @@ grate_create_fs_state(struct pipe_context *pcontext,
    // TODO: document/convert these values
    PUSH(0x20006000 | num_fp_instrs);
 
+   /*
+    * FP_PSEQ_DW_CFG: PSEQ_TO_DW_EXEC_NB (bits 6..12) = how many instruction
+    * batches run before the DW stage stores the pixel. Every batch we emit
+    * has an ALU packet, so the store has to wait for all of them (a value
+    * of 1 stores the pixel right after the first batch).
+    */
    PUSH(host1x_opcode_incr(REG_TGR3D_PSEQ_DWR_IF_STATE, 1));
-   // TODO: document/convert these values
-   PUSH(0x00000040);
+   PUSH(num_fp_instrs << 6);
 
    if (soc_id == DRM_TEGRA_SOC_T114) {
       // TODO: document/convert these values
