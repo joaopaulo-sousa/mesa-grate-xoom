@@ -114,7 +114,7 @@ grate_set_viewport_states(struct pipe_context *pcontext,
                           const struct pipe_viewport_state *viewports)
 {
    struct grate_context *context = grate_context(pcontext);
-   static const float zeps = powf(2.0f, -21);
+   static const float zeps = 0x1p-21f; /* 2^-21 */
    unsigned int hw_scale;
 
    if (context->drm->soc_id == DRM_TEGRA_SOC_T114)
