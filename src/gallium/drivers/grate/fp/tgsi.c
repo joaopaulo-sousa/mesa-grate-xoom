@@ -147,6 +147,11 @@ fp_alu_nop(void)
  * - A register written by ALU packet P can be read from packet P+2 on (the
  *   packets are counted across EXECs). Packet P+1 reads the result of slot s
  *   of packet P as "alu<s>" instead.
+ * - The TEX of EXEC k samples with the coordinates in a register pair of row
+ *   k, r(4k)/r(4k+1) or r(4k+2)/r(4k+3), and writes the texel as four fixed10
+ *   halves to the other pair, readable by the ALU from EXEC k on. Only
+ *   coordinates that are a varying are supported (the NVIDIA compiler uses
+ *   one-row programs for dependent reads).
  *
  * TGSI is lowered to scalar units (one slot, or slots 0..n-1 of a packet for
  * a DPn) in SSA form, the units are list-scheduled into packets and EXECs
@@ -160,6 +165,7 @@ fp_alu_nop(void)
 #define FP_MAX_EXECS 4
 #define FP_MAX_PACKETS_PER_EXEC 3
 #define FP_MAX_PACKETS 32
+#define FP_MAX_TEXTURES FP_MAX_EXECS
 
 #define FP_ALU_RESULT_REG(s) (24 + (s))
 
@@ -167,14 +173,15 @@ enum fp_opnd_kind {
    FP_OPND_UNIFORM = 0,   /* ALU uniform register (constants, immediates) */
    FP_OPND_VALUE,         /* result of a unit */
    FP_OPND_INPUT,         /* interpolated varying component */
+   FP_OPND_TEXEL,         /* texture sample channel */
    FP_OPND_ZERO,          /* fixed10 0 and 1 of r31, for fixed10 results */
    FP_OPND_ONE,
 };
 
 struct fp_opnd {
    enum fp_opnd_kind kind;
-   int index;      /* uniform slot, unit, or TGSI input */
-   int comp;       /* input component */
+   int index;      /* uniform slot, unit, TGSI input or texture fetch */
+   int comp;       /* input component, texel channel */
    bool negate;
    bool absolute;
 };
@@ -212,6 +219,16 @@ struct fp_compiler {
    /* EXEC whose MFU fetches TGSI input i component c, and the reverse */
    int fetch_exec[FP_MAX_INPUTS][4];
    int exec_input[FP_MAX_EXECS][4];
+
+   /* texture fetches: coordinates = TGSI input components 2*pair, +1 */
+   struct {
+      int input;
+      int pair;
+      int sampler;
+      int exec;
+      bool live;
+   } tex[FP_MAX_TEXTURES];
+   int num_tex;
 
    int packet_exec[FP_MAX_PACKETS];
    int num_packets;
@@ -499,6 +516,60 @@ emit_dot(struct fp_compiler *c, const struct tgsi_full_instruction *inst,
    }
 }
 
+/*
+ * TEX with varying coordinates: one texture fetch per EXEC, the texel
+ * channels become fixed10 operands. A colour destination gets copies.
+ */
+static void
+emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
+{
+   const struct tgsi_dst_register *dst = &inst->Dst[0].Register;
+   struct fp_opnd s = fp_src(c, &inst->Src[0].Register, 0);
+   struct fp_opnd t = fp_src(c, &inst->Src[0].Register, 1);
+
+   if (inst->Texture.Texture != TGSI_TEXTURE_2D &&
+       inst->Texture.Texture != TGSI_TEXTURE_RECT) {
+      fp_fail(c, "only 2D textures are supported");
+      return;
+   }
+   if (s.kind != FP_OPND_INPUT || t.kind != FP_OPND_INPUT ||
+       s.index != t.index || s.negate || s.absolute || t.negate ||
+       t.absolute || (s.comp & 1) || t.comp != s.comp + 1) {
+      fp_fail(c, "texture coordinates must be a varying .xy or .zw "
+                 "(dependent texture reads are not supported)");
+      return;
+   }
+   if (c->num_tex == FP_MAX_TEXTURES) {
+      fp_fail(c, "too many texture fetches");
+      return;
+   }
+
+   int n = c->num_tex++;
+   c->tex[n].input = s.index;
+   c->tex[n].pair = s.comp / 2;
+   c->tex[n].sampler = inst->Src[1].Register.Index;
+   c->tex[n].exec = -1;
+   c->tex[n].live = false;
+
+   for (int i = 0; i < 4; i++) {
+      if (!(dst->WriteMask & (1 << i)))
+         continue;
+      struct fp_opnd texel = { .kind = FP_OPND_TEXEL, .index = n, .comp = i };
+      if (dst->File == TGSI_FILE_TEMPORARY && !inst->Instruction.Saturate &&
+          dst->Index < FP_MAX_TEMPS) {
+         c->temps[dst->Index][i] = texel;
+         c->temp_written[dst->Index][i] = true;
+         continue;
+      }
+      bool output = dst->File == TGSI_FILE_OUTPUT;
+      struct fp_unit *m = fp_new_unit(c);
+      m->saturate = inst->Instruction.Saturate != 0;
+      fp_unit_op(&m->slots[0], FP_ALU_OP_MAD, texel, fp_opnd_one(c, output),
+                 fp_opnd_zero(c, output));
+      fp_dst(c, m, dst, i);
+   }
+}
+
 static void
 emit_tgsi_instr(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
 {
@@ -523,6 +594,10 @@ emit_tgsi_instr(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
       emit_dot(c, inst, 4);
       break;
 
+   case TGSI_OPCODE_TEX:
+      emit_tex(c, inst);
+      break;
+
    default:
       fprintf(stderr, "GRATE FRAG TGSI UNIMPLEMENTED: 0x%02x\n", inst->Instruction.Opcode);
       c->failed = true;
@@ -543,9 +618,13 @@ fp_dead_code(struct fp_compiler *c)
          u->live = true;
       if (!u->live)
          continue;
-      fp_unit_foreach_src(u, k, j)
-         if (u->slots[k].src[j].kind == FP_OPND_VALUE)
-            c->units[u->slots[k].src[j].index].live = true;
+      fp_unit_foreach_src(u, k, j) {
+         struct fp_opnd *o = &u->slots[k].src[j];
+         if (o->kind == FP_OPND_VALUE)
+            c->units[o->index].live = true;
+         else if (o->kind == FP_OPND_TEXEL)
+            c->tex[o->index].live = true;
+      }
    }
 }
 
@@ -557,6 +636,25 @@ fp_assign_inputs(struct fp_compiler *c)
    memset(c->fetch_exec, -1, sizeof(c->fetch_exec));
    memset(c->exec_input, -1, sizeof(c->exec_input));
 
+   /*
+    * Texture fetches first, one EXEC each: the coordinate pair is fetched by
+    * that EXEC's MFU, the other pair receives the texel (-2: no varying).
+    */
+   int e = 0;
+   for (int n = 0; n < c->num_tex; n++) {
+      if (!c->tex[n].live)
+         continue;
+      int p = c->tex[n].pair, in = c->tex[n].input;
+      c->tex[n].exec = e;
+      for (int k = 0; k < 2; k++) {
+         c->exec_input[e][2 * p + k] = in;
+         if (c->fetch_exec[in][2 * p + k] < 0)
+            c->fetch_exec[in][2 * p + k] = e;
+         c->exec_input[e][2 * (1 - p) + k] = -2;
+      }
+      e++;
+   }
+
    for (int i = 0; i < c->num_units; i++) {
       struct fp_unit *u = &c->units[i];
       if (!u->live)
@@ -565,9 +663,8 @@ fp_assign_inputs(struct fp_compiler *c)
          struct fp_opnd *o = &u->slots[k].src[j];
          if (o->kind != FP_OPND_INPUT || c->fetch_exec[o->index][o->comp] >= 0)
             continue;
-         int e;
          for (e = 0; e < FP_MAX_EXECS; e++)
-            if (c->exec_input[e][o->comp] < 0)
+            if (c->exec_input[e][o->comp] == -1)
                break;
          if (e == FP_MAX_EXECS) {
             fp_fail(c, "too many varyings");
@@ -579,18 +676,33 @@ fp_assign_inputs(struct fp_compiler *c)
    }
 }
 
-/* Row register an input component is interpolated into */
-static int
-fp_input_reg(struct fp_compiler *c, const struct fp_opnd *o)
-{
-   return 4 * c->fetch_exec[o->index][o->comp] + o->comp;
-}
-
-/* fixed10 colour channel -> r2/r3 half, BGRA */
+/* fixed10 colour channel -> r2/r3 half, BGRA (also the texel layout) */
 static int
 fp_output_half(int chan)
 {
    return chan < 3 ? (2 - chan) : 3;
+}
+
+/* EXEC from which an input or texel operand can be read */
+static int
+fp_opnd_exec(struct fp_compiler *c, const struct fp_opnd *o)
+{
+   if (o->kind == FP_OPND_INPUT)
+      return c->fetch_exec[o->index][o->comp];
+   if (o->kind == FP_OPND_TEXEL)
+      return c->tex[o->index].exec;
+   return 0;
+}
+
+/* Row register holding an input component or a texel channel */
+static int
+fp_opnd_reg(struct fp_compiler *c, const struct fp_opnd *o)
+{
+   if (o->kind == FP_OPND_INPUT)
+      return 4 * c->fetch_exec[o->index][o->comp] + o->comp;
+   assert(o->kind == FP_OPND_TEXEL);
+   int base = c->tex[o->index].pair ? 0 : 2;
+   return 4 * c->tex[o->index].exec + base + fp_output_half(o->comp) / 2;
 }
 
 static bool
@@ -606,8 +718,8 @@ fp_unit_ready(struct fp_compiler *c, int index, int packet, int exec)
             return false;
          if (!d->forward && d->packet == packet - 1)
             return false;
-      } else if (o->kind == FP_OPND_INPUT) {
-         if (c->fetch_exec[o->index][o->comp] > exec)
+      } else if (o->kind == FP_OPND_INPUT || o->kind == FP_OPND_TEXEL) {
+         if (fp_opnd_exec(c, o) > exec)
             return false;
       }
    }
@@ -616,10 +728,12 @@ fp_unit_ready(struct fp_compiler *c, int index, int packet, int exec)
       return true;
 
    /*
-    * A colour write overwrites r2 or r3: the varyings the first MFU put
-    * there must have been read, and earlier writes of the channel done.
+    * A colour write overwrites r2 or r3: the varyings or texels the first
+    * EXEC put there must have been read, and earlier writes of the channel
+    * done.
     */
-   int reg = 2 + fp_output_half(u->output_chan) / 2;
+   int half = fp_output_half(u->output_chan);
+   int reg = 2 + half / 2;
    for (int i = 0; i < c->num_units; i++) {
       struct fp_unit *r = &c->units[i];
       if (!r->live || i == index)
@@ -631,7 +745,11 @@ fp_unit_ready(struct fp_compiler *c, int index, int packet, int exec)
          continue;
       fp_unit_foreach_src(r, k, j) {
          struct fp_opnd *o = &r->slots[k].src[j];
-         if (o->kind == FP_OPND_INPUT && fp_input_reg(c, o) == reg)
+         /* an fp20 varying uses the whole register, a texel one half */
+         if (o->kind == FP_OPND_INPUT && fp_opnd_reg(c, o) == reg)
+            return false;
+         if (o->kind == FP_OPND_TEXEL && fp_opnd_reg(c, o) == reg &&
+             fp_output_half(o->comp) % 2 == half % 2)
             return false;
       }
    }
@@ -815,11 +933,28 @@ fp_alloc_regs(struct fp_compiler *c)
             if (u->packet >= d->packet + 2 || !d->forward)
                last_read[o->index] = MAX2(last_read[o->index], u->packet);
          } else if (o->kind == FP_OPND_INPUT) {
-            int r = fp_input_reg(c, o);
+            int r = fp_opnd_reg(c, o);
+            if (r != 2 && r != 3)
+               busy_until[r] = MAX2(busy_until[r], u->packet);
+         } else if (o->kind == FP_OPND_TEXEL) {
+            int r = fp_opnd_reg(c, o);
             if (r != 2 && r != 3)
                busy_until[r] = MAX2(busy_until[r], u->packet);
          }
       }
+   }
+
+   /* the TEX of EXEC e reads and writes row e during that EXEC */
+   for (int n = 0; n < c->num_tex; n++) {
+      if (!c->tex[n].live)
+         continue;
+      int e = c->tex[n].exec, last = 0;
+      for (int p = 0; p < c->num_packets; p++)
+         if (c->packet_exec[p] == e)
+            last = p;
+      for (int r = 4 * e; r < 4 * e + 4; r++)
+         if (r != 2 && r != 3)
+            busy_until[r] = MAX2(busy_until[r], last);
    }
 
    for (int p = 0; p < c->num_packets; p++) {
@@ -856,7 +991,12 @@ fp_resolve(struct fp_compiler *c, const struct fp_opnd *o, int packet)
       ret = fp_alu_src_uniform(o->index);
       break;
    case FP_OPND_INPUT:
-      ret = fp_alu_src_row(fp_input_reg(c, o));
+      ret = fp_alu_src_row(fp_opnd_reg(c, o));
+      break;
+   case FP_OPND_TEXEL:
+      ret = fp_alu_src_row(fp_opnd_reg(c, o));
+      ret.datatype = FP_DATATYPE_FIXED10;
+      ret.sub_reg_select_high = fp_output_half(o->comp) % 2;
       break;
    case FP_OPND_VALUE: {
       struct fp_unit *d = &c->units[o->index];
@@ -954,6 +1094,16 @@ fp_emit(struct fp_compiler *c)
          list_addtail(&mfu->link, &fp->mfu_instructions);
       }
 
+      /* TEX word: sampler, coordinates r2/r3 (bit 4), texel to r2/r3 (bit 5),
+       * enable (bit 10) */
+      for (int n = 0; n < c->num_tex; n++) {
+         if (!c->tex[n].live || c->tex[n].exec != e)
+            continue;
+         inst->tex = (c->tex[n].sampler & 0xf) | c->tex[n].pair << 4 |
+                     (1 - c->tex[n].pair) << 5 | 1 << 10;
+         fp->info.sampler_mask |= 1u << c->tex[n].sampler;
+      }
+
       inst->alu_sched.address = list_length(&fp->alu_instructions);
       for (; packet < c->num_packets && c->packet_exec[packet] == e; packet++) {
          struct fp_alu_instr_packet *pkt = CALLOC_STRUCT(fp_alu_instr_packet);
@@ -1045,6 +1195,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
    fp->info.max_tram_row = 1;
    fp->info.used_mask = 0;
    fp->info.imm_mask = 0;
+   fp->info.sampler_mask = 0;
    fp->num_immediates = 0;
 
    c->fp = fp;
@@ -1103,6 +1254,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
       /* still emit something sane: magenta, one packet */
       memset(c->exec_input, -1, sizeof(c->exec_input));
       c->num_units = 0;
+      c->num_tex = 0;
       for (int i = 0; i < 4; i++) {
          struct fp_unit *u = fp_new_unit(c);
          struct fp_opnd one = fp_opnd_one(c, true);

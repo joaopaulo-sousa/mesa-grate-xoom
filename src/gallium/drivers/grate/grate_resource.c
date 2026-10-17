@@ -184,8 +184,17 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
                          PIPE_BIND_SCANOUT | PIPE_BIND_DEPTH_STENCIL)) {
       if (template->bind & PIPE_BIND_DEPTH_STENCIL)
          resource->pitch = align(resource->pitch, 256);
-      else
+      else if (!(template->bind & PIPE_BIND_SAMPLER_VIEW))
          resource->pitch = align(resource->pitch, 32);
+      else
+         /*
+          * The TEX unit derives the row pitch from the width (measured with
+          * RGBA8888): power-of-two widths are aligned to 16 bytes, others to
+          * 64 bytes.
+          */
+         resource->pitch = align(resource->pitch,
+                                 util_is_power_of_two_nonzero(template->width0) ?
+                                 16 : 64);
 
       flags = DRM_TEGRA_GEM_CREATE_BOTTOM_UP;
    }

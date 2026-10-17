@@ -171,7 +171,22 @@ grate_set_sampler_views(struct pipe_context *pctx, mesa_shader_stage shader,
                         unsigned unbind_num_trailing_slots,
                         struct pipe_sampler_view **views)
 {
-   grate_unimplemented();
+   struct grate_context *context = grate_context(pctx);
+   unsigned i, end = start_slot + num_views + unbind_num_trailing_slots;
+
+   if (shader != MESA_SHADER_FRAGMENT)
+      return;
+
+   for (i = start_slot; i < end && i < ARRAY_SIZE(context->sampler_views); i++) {
+      struct pipe_sampler_view *view =
+         views && i < start_slot + num_views ? views[i - start_slot] : NULL;
+      pipe_sampler_view_reference(&context->sampler_views[i], view);
+   }
+
+   context->num_sampler_views = 0;
+   for (i = 0; i < ARRAY_SIZE(context->sampler_views); i++)
+      if (context->sampler_views[i])
+         context->num_sampler_views = i + 1;
 }
 
 static void
@@ -269,7 +284,14 @@ grate_bind_sampler_states(struct pipe_context *pcontext,
                           unsigned start_slot, unsigned num_samplers,
                           void **samplers)
 {
-   grate_unimplemented();
+   struct grate_context *context = grate_context(pcontext);
+
+   if (shader != MESA_SHADER_FRAGMENT)
+      return;
+
+   for (unsigned i = 0; i < num_samplers; i++)
+      if (start_slot + i < ARRAY_SIZE(context->samplers))
+         context->samplers[start_slot + i] = samplers ? samplers[i] : NULL;
 }
 
 static void
@@ -728,6 +750,70 @@ emit_program(struct grate_context *context, uint32_t **ptrp)
    grate_stream_push_words(stream, ptrp, linker_insts, ARRAY_SIZE(linker_insts), 0);
 }
 
+static bool
+grate_wrap_clamps(unsigned wrap)
+{
+   return wrap == PIPE_TEX_WRAP_CLAMP || wrap == PIPE_TEX_WRAP_CLAMP_TO_EDGE ||
+          wrap == PIPE_TEX_WRAP_CLAMP_TO_BORDER;
+}
+
+/*
+ * Texture descriptors of the samplers the fragment shader reads: linear
+ * level 0 only. The TEX unit derives the pitch from the width (rows aligned
+ * to 64 bytes, see grate_screen_resource_create).
+ */
+static void
+emit_textures(struct grate_context *context, uint32_t **ptrp)
+{
+   struct grate_stream *stream = &context->gr3d->stream;
+   uint32_t mask = context->fshader ? context->fshader->info.sampler_mask : 0;
+
+   u_foreach_bit(i, mask) {
+      struct pipe_sampler_view *view = context->sampler_views[i];
+      const struct pipe_sampler_state *sampler = context->samplers[i];
+      if (!view || !view->texture)
+         continue;
+
+      struct grate_resource *res = grate_resource(view->texture);
+      unsigned width = view->texture->width0, height = view->texture->height0;
+      uint32_t lo, hi;
+
+      lo = TGR3D_TEX_TEXDESC_LO_SURF_FORMAT(res->format) |
+           TGR3D_TEX_TEXDESC_LO_LAYOUT(TGR3D_LAYOUT_LINEAR);
+      if (sampler) {
+         if (sampler->mag_img_filter == PIPE_TEX_FILTER_LINEAR)
+            lo |= TGR3D_TEX_TEXDESC_LO_LERP_MAG;
+         if (sampler->min_img_filter == PIPE_TEX_FILTER_LINEAR)
+            lo |= TGR3D_TEX_TEXDESC_LO_LERP_MIN;
+         if (grate_wrap_clamps(sampler->wrap_s))
+            lo |= TGR3D_TEX_TEXDESC_LO_CLAMP_S(TGR3D_CLAMP_CLAMP);
+         if (grate_wrap_clamps(sampler->wrap_t))
+            lo |= TGR3D_TEX_TEXDESC_LO_CLAMP_T(TGR3D_CLAMP_CLAMP);
+         if (sampler->wrap_s == PIPE_TEX_WRAP_MIRROR_REPEAT)
+            lo |= TGR3D_TEX_TEXDESC_LO_MIRROR_S(TGR3D_STATE_ENABLED);
+         if (sampler->wrap_t == PIPE_TEX_WRAP_MIRROR_REPEAT)
+            lo |= TGR3D_TEX_TEXDESC_LO_MIRROR_T(TGR3D_STATE_ENABLED);
+      }
+
+      /* bit 7: sample the base level only (no mipmaps yet) */
+      hi = TGR3D_TEX_TEXDESC_HI_BASE_LEVEL_ONLY(TGR3D_STATE_ENABLED);
+      if (util_is_power_of_two_nonzero(width) &&
+          util_is_power_of_two_nonzero(height))
+         hi |= TGR3D_TEX_TEXDESC_HI_LOG2_WIDTH(util_logbase2(width)) |
+               TGR3D_TEX_TEXDESC_HI_LOG2_HEIGHT(util_logbase2(height));
+      else
+         hi |= TGR3D_TEX_TEXDESC_HI_NON_POWER_OF_TWO(TGR3D_STATE_ENABLED) |
+               TGR3D_TEX_TEXDESC_HI_WIDTH(width) |
+               TGR3D_TEX_TEXDESC_HI_HEIGHT(height);
+
+      GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_TEX_TEXADDR(i), 1));
+      grate_stream_push_reloc(stream, ptrp, res->bo, 0);
+      GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_TEX_TEXDESC_LO(i), 2));
+      GRATE_PUSHBUF_WORD(*ptrp, lo);
+      GRATE_PUSHBUF_WORD(*ptrp, hi);
+   }
+}
+
 void
 grate_emit_state(struct grate_context *context, uint32_t **ptrp)
 {
@@ -739,6 +825,7 @@ grate_emit_state(struct grate_context *context, uint32_t **ptrp)
    emit_attribs(context, ptrp);
    emit_vs_uniforms(context, ptrp);
    emit_program(context, ptrp);
+   emit_textures(context, ptrp);
 }
 
 void

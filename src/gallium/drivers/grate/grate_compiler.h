@@ -37,6 +37,7 @@ struct grate_fp_info {
    uint32_t consts[GRATE_FP_NUM_CONSTS];
    uint32_t used_mask;      /* slots read by the shader */
    uint32_t imm_mask;       /* slots holding immediates */
+   uint32_t sampler_mask;   /* samplers read */
 };
 
 uint32_t
