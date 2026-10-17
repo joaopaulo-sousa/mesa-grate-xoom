@@ -45,6 +45,9 @@
       mesa_logw("GRATE TODO: %s()\n", __func__); \
 } while (0)
 
+/* GPU job/fence wait timeout: one second */
+#define GRATE_JOB_TIMEOUT_NS 1000000000ull
+
 #define grate_trace() do { \
    if (grate_debug & GRATE_DEBUG_TRACE) \
       mesa_logd("GRATE: %s()\n", __func__); \

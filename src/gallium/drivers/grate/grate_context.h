@@ -63,6 +63,9 @@ grate_context(struct pipe_context *context)
    return (struct grate_context *)context;
 }
 
+void
+grate_context_flush_streams(struct grate_context *context);
+
 struct pipe_context *
 grate_screen_context_create(struct pipe_screen *pscreen,
                             void *priv, unsigned flags);

@@ -51,7 +51,17 @@ struct grate_stream {
    struct drm_tegra_pushbuf *pushbuf;
 
    int num_words;
+
+   /*
+    * A job is submitted and freed immediately, so the stream is FREE again
+    * before anyone asks to wait. Keep the fence of the last submission so a
+    * later wait still has something to wait on.
+    */
+   struct drm_tegra_fence last_fence;
+   bool fence_pending;
 };
+
+int grate_stream_wait(struct grate_stream *stream);
 
 struct grate_reloc {
    const void *addr;

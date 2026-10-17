@@ -86,6 +86,15 @@ grate_resource_transfer_map(struct pipe_context *pcontext,
    if (usage & PIPE_MAP_DIRECTLY)
       return NULL;
 
+   /*
+    * Nothing records which resource a submitted job touched, so the only safe
+    * thing is to let everything already submitted land before handing out a
+    * CPU pointer. Otherwise a readback races the GPU still writing the render
+    * target, which is what made large frames come back half drawn.
+    */
+   if (!(usage & PIPE_MAP_UNSYNCHRONIZED))
+      grate_context_flush_streams(context);
+
    ptrans = slab_alloc(&context->transfer_pool);
    if (!ptrans)
       return NULL;
@@ -543,7 +552,13 @@ grate_clear_depth_stencil(struct pipe_context *pipe,
 static void
 grate_flush_resource(struct pipe_context *ctx, struct pipe_resource *resource)
 {
-   //TODO grate_unimplemented();
+   /*
+    * Called when a resource is about to be handed to the window system - for
+    * weston, the buffer it is about to scan out. Nothing else waits for the
+    * GPU on that path, so without this the compositor flips a frame that is
+    * still being drawn, and the display shows part of the previous one.
+    */
+   grate_context_flush_streams(grate_context(ctx));
 }
 
 void

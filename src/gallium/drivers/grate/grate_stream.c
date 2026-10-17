@@ -36,6 +36,8 @@
 #include <assert.h>
 #include <sched.h>
 #include <stdio.h>
+#include <time.h>
+#include <stdlib.h>
 #include <stdlib.h>
 #include <stdarg.h>
 #include <stdint.h>
@@ -124,7 +126,9 @@ grate_stream_flush(struct grate_stream *stream, bool wait)
       goto cleanup;
    }
 
-   result = drm_tegra_job_submit(stream->job, NULL);
+   result = drm_tegra_job_submit(stream->job, &stream->last_fence);
+   if (result == 0)
+      stream->fence_pending = true;
    if (result != 0) {
       grate_loge("drm_tegra_job_submit() failed %d\n", result);
       result = -1;
@@ -132,11 +136,20 @@ grate_stream_flush(struct grate_stream *stream, bool wait)
    }
 
    if (wait) {
-      result = drm_tegra_job_wait(stream->job, 1000000);
+      /*
+       * The timeout is in nanoseconds. This used to ask for 1000000, i.e. one
+       * millisecond, which a full screen draw comfortably exceeds: the wait
+       * then returned early and whatever read the render target next saw a
+       * half finished frame. Give the GPU a second, which is still far longer
+       * than any sane draw and short enough to notice a hang.
+       */
+      result = drm_tegra_job_wait(stream->job, GRATE_JOB_TIMEOUT_NS);
       if (result != 0) {
-         grate_loge("drm_tegra_job_wait() failed %d\n", result);
+         fprintf(stderr, "grate: gpu job did not complete within %llu ms: %d\n",
+                 (unsigned long long)(GRATE_JOB_TIMEOUT_NS / 1000000ull), result);
          result = -1;
       }
+      stream->fence_pending = false;
    }
 
 cleanup:
@@ -387,4 +400,42 @@ int grate_stream_push_words(struct grate_stream *stream, uint32_t **ptrp, const 
    *ptrp += src_words;
 
    return ret ? -1 : 0;
+}
+
+/*
+ * Wait for anything this stream has submitted. Flushing is not enough on its
+ * own: a draw submits with wait=false and frees the job straight away, so by
+ * the time a readback asks, the stream is FREE and only the fence is left.
+ */
+int
+grate_stream_wait(struct grate_stream *stream)
+{
+   int err;
+
+   if (stream->status != GRATE_STREAM_FREE)
+      return grate_stream_flush(stream, true);
+
+   if (!stream->fence_pending)
+      return 0;
+
+   struct timespec t0, t1;
+   bool trace = getenv("GRATE_WAIT_TRACE") != NULL;
+   if (trace)
+      clock_gettime(CLOCK_MONOTONIC, &t0);
+
+   err = drm_tegra_fence_wait(&stream->last_fence, GRATE_JOB_TIMEOUT_NS);
+   stream->fence_pending = false;
+
+   if (trace) {
+      clock_gettime(CLOCK_MONOTONIC, &t1);
+      double ms = (t1.tv_sec - t0.tv_sec) * 1000.0 +
+                  (t1.tv_nsec - t0.tv_nsec) / 1000000.0;
+      fprintf(stderr, "grate: waited %.2f ms on syncpt %u threshold %u (err %d)\n",
+              ms, stream->last_fence.syncpt, stream->last_fence.value, err);
+   }
+
+   if (err != 0)
+      fprintf(stderr, "grate: waiting for the gpu failed: %d\n", err);
+
+   return err;
 }

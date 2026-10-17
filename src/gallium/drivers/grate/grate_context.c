@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 #include "util/u_memory.h"
 #include "util/u_upload_mgr.h"
@@ -81,12 +82,31 @@ grate_context_destroy(struct pipe_context *pcontext)
    FREE(context);
 }
 
+void
+grate_context_flush_streams(struct grate_context *context)
+{
+   /*
+    * There are no fence objects yet, so a flush is synchronous: submit
+    * whatever is pending on both channels and wait for it. Without this
+    * nothing ever waits for the GPU - draws are submitted with wait=false -
+    * and a map handed out straight afterwards sees a half drawn frame.
+    */
+   if (context->gr3d)
+      grate_stream_wait(&context->gr3d->stream);
+   if (context->gr2d)
+      grate_stream_wait(&context->gr2d->stream);
+}
+
 static void
 grate_context_flush(struct pipe_context *pcontext,
                     struct pipe_fence_handle **pfence,
                     enum pipe_flush_flags flags)
 {
-   //TODO grate_unimplemented();
+   grate_context_flush_streams(grate_context(pcontext));
+
+   /* the work is already done, so there is nothing to wait on */
+   if (pfence)
+      *pfence = NULL;
 }
 
 struct pipe_context *
