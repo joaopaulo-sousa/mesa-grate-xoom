@@ -31,6 +31,7 @@ struct grate_fp_info {
    int num_inputs;
    int color_input;
    int max_tram_row;
+   int num_rows;            /* pixel packet rows (r0-r3, r4-r7, ...) */
    /* ALU uniform registers: user uniforms at index * 4 + component from the
     * bottom, immediates (fp20, already converted) allocated from the top */
    uint32_t consts[GRATE_FP_NUM_CONSTS];

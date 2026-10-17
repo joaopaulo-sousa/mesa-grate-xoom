@@ -205,8 +205,8 @@ grate_create_fs_state(struct pipe_context *pcontext,
    /* one pixel packet row (ALU buffer size 1); MAX_QID matches PSEQ_CTL
     * MAX_OUT = 0x12c as in the grate tests: (0x12c - 1) / (rows * 4) */
    PUSH(host1x_opcode_incr(REG_TGR3D_GLOBAL_PIX_ATTR, 1));
-   PUSH(TGR3D_GLOBAL_PIX_ATTR_MAX_QID((0x12c - 1) / 4) |
-        TGR3D_GLOBAL_PIX_ATTR_NUM_ROWS(0));
+   PUSH(TGR3D_GLOBAL_PIX_ATTR_MAX_QID((0x12c - 1) / (fp.info.num_rows * 4)) |
+        TGR3D_GLOBAL_PIX_ATTR_NUM_ROWS(fp.info.num_rows - 1));
 
    PUSH(host1x_opcode_imm(REG_TGR3D_PSEQ_QUAD_ID, 0));
    PUSH(host1x_opcode_imm(REG_TGR3D_GLOBAL_INST_OFFSET, 0));
@@ -303,6 +303,17 @@ grate_create_fs_state(struct pipe_context *pcontext,
    so->blob.num_commands = buf.size / sizeof(uint32_t);
    so->blob.commands = buf.data;
    so->info = fp.info;
+
+   /* machine code for gpu/tools/fpdis */
+   if (grate_debug & GRATE_DEBUG_TGSI) {
+      fprintf(stderr, "FPBLOB %u", so->blob.num_commands);
+      for (unsigned i = 0; i < so->blob.num_commands; i++)
+         fprintf(stderr, " %08x", so->blob.commands[i]);
+      fprintf(stderr, "\n");
+      for (int i = 0; i < GRATE_FP_NUM_CONSTS; i++)
+         if (fp.info.imm_mask & (1u << i))
+            fprintf(stderr, "FPCONST %d %05x\n", i, fp.info.consts[i]);
+   }
    return so;
 }
 

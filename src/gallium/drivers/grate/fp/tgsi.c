@@ -1,4 +1,5 @@
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "grate_common.h"
@@ -180,18 +181,49 @@ fp_batch_end(struct fp_batch *b)
    list_addtail(&b->inst->link, &fp->fp_instructions);
 }
 
-/* Temporaries live in the 8 global registers: TEMP[i].c -> g(i * 4 + c) */
+/*
+ * Temporaries: by default in the 8 global registers, TEMP[i].c -> g(i*4+c).
+ * EXPERIMENT GRATE_FP_TEMPS=rows: in the pixel packet rows instead,
+ * TEMP[i].c -> r(4 + i*4 + c), growing the packet by one row per TEMP.
+ */
+static bool
+fp_temps_in_rows(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *e = getenv("GRATE_FP_TEMPS");
+      v = e && !strcmp(e, "rows");
+   }
+   return v;
+}
+
 static int
-fp_temp_reg(int index, int comp)
+fp_temp_reg(struct grate_fp_shader *fp, int index, int comp)
 {
    int reg = index * 4 + comp;
 
+   if (fp_temps_in_rows()) {
+      if (index > 2) {
+         fprintf(stderr, "GRATE FRAG: out of temporaries (TEMP[%d])\n", index);
+         assert(0);
+         index = 2;
+      }
+      fp->info.num_rows = MAX2(fp->info.num_rows, index + 2);
+      return 4 + index * 4 + comp;
+   }
    if (reg >= 8) {
       fprintf(stderr, "GRATE FRAG: out of temporaries (TEMP[%d])\n", index);
       assert(0);
       reg = 7;
    }
-   return reg;
+   return 16 + reg;
+}
+
+static struct fp_alu_src_operand
+fp_src_temp(struct grate_fp_shader *fp, int index, int comp)
+{
+   struct fp_alu_src_operand ret = { .index = fp_temp_reg(fp, index, comp) };
+   return ret;
 }
 
 static struct fp_alu_src_operand
@@ -237,7 +269,7 @@ fp_src(struct fp_batch *b, const struct tgsi_src_register *src, int chan)
       break;
 
    case TGSI_FILE_TEMPORARY:
-      ret = fp_alu_src_reg(fp_temp_reg(src->Index, comp));
+      ret = fp_src_temp(fp, src->Index, comp);
       break;
 
    default:
@@ -273,7 +305,7 @@ fp_dst(struct fp_batch *b, const struct tgsi_dst_register *dst, int chan,
    }
 
    case TGSI_FILE_TEMPORARY:
-      ret.index = 16 + fp_temp_reg(dst->Index, chan);
+      ret.index = fp_temp_reg(b->fp, dst->Index, chan);
       /* fp20 write: both halves */
       ret.write_low_sub_reg = true;
       ret.write_high_sub_reg = true;
@@ -290,7 +322,7 @@ fp_dst(struct fp_batch *b, const struct tgsi_dst_register *dst, int chan,
 
 /* Source operand reading back what fp_dst() wrote for "chan" */
 static struct fp_alu_src_operand
-fp_src_of_dst(const struct tgsi_dst_register *dst, int chan)
+fp_src_of_dst(struct grate_fp_shader *fp, const struct tgsi_dst_register *dst, int chan)
 {
    struct fp_alu_src_operand ret = { 0 };
 
@@ -300,7 +332,7 @@ fp_src_of_dst(const struct tgsi_dst_register *dst, int chan)
       ret.datatype = FP_DATATYPE_FIXED10;
       ret.sub_reg_select_high = (o % 2) != 0;
    } else
-      ret = fp_alu_src_reg(fp_temp_reg(dst->Index, chan));
+      ret = fp_src_temp(fp, dst->Index, chan);
    return ret;
 }
 
@@ -334,20 +366,25 @@ emit_componentwise(struct grate_fp_shader *fp,
 
       struct fp_alu_dst_operand d = fp_dst(&b, dst, i, sat);
       struct fp_alu_src_operand s0 = fp_src(&b, &inst->Src[0].Register, i);
+      /* the lowp 0/1 of r31 is fixed10; an fp20 result needs fp20 operands */
+      struct fp_alu_src_operand one = dst->File == TGSI_FILE_OUTPUT ?
+         fp_alu_src_one() : fp_alu_src_uniform(fp_const_slot(fp, 1.0f));
+      struct fp_alu_src_operand zero = dst->File == TGSI_FILE_OUTPUT ?
+         fp_alu_src_zero() : fp_alu_src_uniform(fp_const_slot(fp, 0.0f));
       struct fp_alu_src_operand s1, s2;
       struct fp_alu_instr *slot = &b.alu->slots[i];
 
       switch (inst->Instruction.Opcode) {
       case TGSI_OPCODE_MOV:
-         *slot = fp_alu(FP_ALU_OP_MAD, d, s0, fp_alu_src_one(), fp_alu_src_zero());
+         *slot = fp_alu(FP_ALU_OP_MAD, d, s0, one, zero);
          break;
       case TGSI_OPCODE_MUL:
          s1 = fp_src(&b, &inst->Src[1].Register, i);
-         *slot = fp_alu(FP_ALU_OP_MAD, d, s0, s1, fp_alu_src_zero());
+         *slot = fp_alu(FP_ALU_OP_MAD, d, s0, s1, zero);
          break;
       case TGSI_OPCODE_ADD:
          s1 = fp_src(&b, &inst->Src[1].Register, i);
-         *slot = fp_alu(FP_ALU_OP_MAD, d, s0, fp_alu_src_one(), s1);
+         *slot = fp_alu(FP_ALU_OP_MAD, d, s0, one, s1);
          break;
       case TGSI_OPCODE_MAD:
          s1 = fp_src(&b, &inst->Src[1].Register, i);
@@ -359,7 +396,7 @@ emit_componentwise(struct grate_fp_shader *fp,
          s1 = fp_src(&b, &inst->Src[1].Register, i);
          *slot = fp_alu(inst->Instruction.Opcode == TGSI_OPCODE_MIN ?
                         FP_ALU_OP_MIN : FP_ALU_OP_MAX,
-                        d, s0, fp_alu_src_one(), s1);
+                        d, s0, one, s1);
          break;
       case TGSI_OPCODE_CMP:
          /* dst = src0 < 0 ? src1 : src2 */
@@ -413,7 +450,7 @@ emit_dot(struct grate_fp_shader *fp, const struct tgsi_full_instruction *inst,
       if (!(dst->WriteMask & (1 << i)))
          continue;
       b.alu->slots[i] = fp_alu(FP_ALU_OP_MAD, fp_dst(&b, dst, i, false),
-                               fp_src_of_dst(dst, first), fp_alu_src_one(),
+                               fp_src_of_dst(fp, dst, first), fp_alu_src_one(),
                                fp_alu_src_zero());
    }
    fp_batch_end(&b);
@@ -496,6 +533,9 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
    fp->info.num_inputs = 0;
    fp->info.color_input = -1;
    fp->info.max_tram_row = 1;
+   fp->info.num_rows = 1;
+   if (getenv("GRATE_FP_ROWS"))   /* EXPERIMENT: force pixel packet rows */
+      fp->info.num_rows = atoi(getenv("GRATE_FP_ROWS"));
    fp->info.used_mask = 0;
    fp->info.imm_mask = 0;
    fp->num_immediates = 0;
