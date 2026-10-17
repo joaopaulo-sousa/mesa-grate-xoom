@@ -473,6 +473,46 @@ emit_componentwise(struct fp_compiler *c,
 }
 
 /*
+ * SLT/SGE/SEQ/SNE: d = a - b, then CMP (d < 0 ? x : y) on d, or on -|d| for
+ * the equality tests, selecting 1.0 or 0.0.
+ */
+static void
+emit_setcc(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
+{
+   const struct tgsi_dst_register *dst = &inst->Dst[0].Register;
+   unsigned opcode = inst->Instruction.Opcode;
+   bool output = dst->File == TGSI_FILE_OUTPUT;
+   struct fp_opnd s[4][2];
+
+   for (int i = 0; i < 4; i++) {
+      if (!(dst->WriteMask & (1 << i)))
+         continue;
+      s[i][0] = fp_src(c, &inst->Src[0].Register, i);
+      s[i][1] = fp_src(c, &inst->Src[1].Register, i);
+   }
+
+   for (int i = 0; i < 4; i++) {
+      if (!(dst->WriteMask & (1 << i)))
+         continue;
+
+      struct fp_unit *d = fp_new_unit(c);
+      fp_unit_op(&d->slots[0], FP_ALU_OP_MAD, s[i][0], fp_opnd_one(c, false),
+                 fp_opnd_modify(s[i][1], true, false));
+
+      bool eq = opcode == TGSI_OPCODE_SEQ || opcode == TGSI_OPCODE_SNE;
+      bool lt_one = opcode == TGSI_OPCODE_SLT || opcode == TGSI_OPCODE_SNE;
+      struct fp_opnd cond = fp_opnd_modify(fp_opnd_value(c, d), eq, eq);
+      struct fp_opnd one = fp_opnd_one(c, output), zero = fp_opnd_zero(c, output);
+
+      struct fp_unit *u = fp_new_unit(c);
+      u->saturate = inst->Instruction.Saturate != 0;
+      fp_unit_op(&u->slots[0], FP_ALU_OP_CSEL, cond, lt_one ? one : zero,
+                 lt_one ? zero : one);
+      fp_dst(c, u, dst, i);
+   }
+}
+
+/*
  * DP2/DP3/DP4 in slots 0..n-1 of one packet, slot k computing a[k] * b[k].
  * Measured on Tegra20: "send" on slot 1 and 2 adds their products to slot 0,
  * "recv" on slot 0 adds slot 3's product. Slot 0 then holds the sum; whether
@@ -596,6 +636,13 @@ emit_tgsi_instr(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
 
    case TGSI_OPCODE_TEX:
       emit_tex(c, inst);
+      break;
+
+   case TGSI_OPCODE_SLT:
+   case TGSI_OPCODE_SGE:
+   case TGSI_OPCODE_SEQ:
+   case TGSI_OPCODE_SNE:
+      emit_setcc(c, inst);
       break;
 
    default:
