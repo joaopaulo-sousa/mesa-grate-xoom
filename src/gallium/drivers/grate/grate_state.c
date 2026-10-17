@@ -1,5 +1,6 @@
 #include <assert.h>
 #include <stdio.h>
+#include <string.h>
 #include <math.h>
 
 #include "util/format/u_format.h"
@@ -632,18 +633,32 @@ emit_vs_uniforms(struct grate_context *context, uint32_t **ptrp)
 {
    struct grate_stream *stream = &context->gr3d->stream;
    struct pipe_constant_buffer *constbuf = &context->constant_buffer[MESA_SHADER_VERTEX];
-   int len;
+   const struct grate_vertex_shader_state *vs = context->vshader;
+   uint32_t consts[GRATE_VP_NUM_CONSTS * 4] = { 0 };
+   int len = 0;
 
    if (constbuf->user_buffer != NULL) {
       assert(constbuf->buffer_size % sizeof(uint32_t) == 0);
-
       len = constbuf->buffer_size / 4;
-      assert(len < 256 * 4);
-
-      GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_imm(REG_TGR3D_VPE_CONST_OFFSET, 0));
-      GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_nonincr(REG_TGR3D_VPE_CONST_DATA, len));
-      grate_stream_push_words(stream, ptrp, constbuf->user_buffer, len, 0);
+      assert(len <= GRATE_VP_NUM_CONSTS * 4);
+      memcpy(consts, constbuf->user_buffer, len * 4);
    }
+
+   /* immediates are allocated from the top, see tgsi_src_to_vp() */
+   for (int i = 0; i < vs->num_immediates; i++) {
+      int slot = GRATE_VP_NUM_CONSTS - 1 - i;
+      assert(slot * 4 >= len);
+      memcpy(&consts[slot * 4], vs->immediates[i], sizeof(vs->immediates[i]));
+   }
+
+   if (len == 0 && vs->num_immediates == 0)
+      return;
+
+   /* upload the whole block from offset 0, as the blob does */
+   GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_imm(REG_TGR3D_VPE_CONST_OFFSET, 0));
+   GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_nonincr(REG_TGR3D_VPE_CONST_DATA,
+                                                   GRATE_VP_NUM_CONSTS * 4));
+   grate_stream_push_words(stream, ptrp, consts, GRATE_VP_NUM_CONSTS * 4, 0);
 }
 
 static void

@@ -15,6 +15,8 @@ struct grate_vertex_shader_state {
    struct pipe_shader_state base;
    struct grate_shader_blob blob;
    uint16_t output_mask;
+   float immediates[GRATE_VP_MAX_IMMEDIATES][4];
+   int num_immediates;
 };
 
 struct grate_fragment_shader_state {

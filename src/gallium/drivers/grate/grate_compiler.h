@@ -7,9 +7,16 @@
 
 struct tgsi_parse_context;
 
+/* VPE constant memory uploaded by the driver: c[0..255] (as the blob does).
+ * TGSI immediates are allocated from the top of it. */
+#define GRATE_VP_NUM_CONSTS 256
+#define GRATE_VP_MAX_IMMEDIATES 32
+
 struct grate_vp_shader {
    struct list_head instructions;
    uint16_t output_mask;
+   float immediates[GRATE_VP_MAX_IMMEDIATES][4];
+   int num_immediates;
 };
 
 struct grate_fp_info {

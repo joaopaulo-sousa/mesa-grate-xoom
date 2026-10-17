@@ -248,8 +248,8 @@ tgsi_src_to_vp(struct grate_vp_shader *vp, const struct tgsi_src_register *src)
       return src_temp(src->Index, swizzle, negate, absolute);
 
    case TGSI_FILE_IMMEDIATE:
-      /* HACK: allocate uniforms from the top for immediates; need to actually record these */
-      return uniform(1023 - src->Index, swizzle, negate, absolute);
+      /* immediates live at the top of the constant memory, see emit_vs_uniforms() */
+      return uniform(GRATE_VP_NUM_CONSTS - 1 - src->Index, swizzle, negate, absolute);
 
    default:
       UNREACHABLE("unsupported input!");
@@ -331,10 +331,20 @@ grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi)
 {
    list_inithead(&vp->instructions);
    vp->output_mask = 0;
+   vp->num_immediates = 0;
 
    while (!tgsi_parse_end_of_tokens(tgsi)) {
       tgsi_parse_token(tgsi);
       switch (tgsi->FullToken.Token.Type) {
+      case TGSI_TOKEN_TYPE_IMMEDIATE: {
+         const struct tgsi_full_immediate *imm = &tgsi->FullToken.FullImmediate;
+         unsigned n = MIN2(imm->Immediate.NrTokens - 1, 4);
+         assert(vp->num_immediates < GRATE_VP_MAX_IMMEDIATES);
+         for (unsigned i = 0; i < 4; i++)
+            vp->immediates[vp->num_immediates][i] = i < n ? imm->u[i].Float : 0.0f;
+         vp->num_immediates++;
+         break;
+      }
       case TGSI_TOKEN_TYPE_INSTRUCTION:
          if (tgsi->FullToken.FullInstruction.Instruction.Opcode != TGSI_OPCODE_END) {
             struct vp_instr *instr = tgsi_to_vp(vp, &tgsi->FullToken.FullInstruction);

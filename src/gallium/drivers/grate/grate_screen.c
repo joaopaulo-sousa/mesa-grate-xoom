@@ -382,7 +382,11 @@ grate_screen_is_format_supported(struct pipe_screen *pscreen,
                                  unsigned storage_sample_count,
                                  unsigned usage)
 {
-   if (usage & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_DEPTH_STENCIL)) {
+   /* resources other than buffers need a TGR3D surface format */
+   if (target != PIPE_BUFFER &&
+       (usage & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_DEPTH_STENCIL |
+                 PIPE_BIND_SAMPLER_VIEW | PIPE_BIND_DISPLAY_TARGET |
+                 PIPE_BIND_SCANOUT | PIPE_BIND_SHARED))) {
       if (grate_pixel_format(format) < 0)
          return false;
    }

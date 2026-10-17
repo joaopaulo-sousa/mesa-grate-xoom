@@ -119,6 +119,9 @@ grate_create_vs_state(struct pipe_context *pcontext,
    struct grate_vp_shader vp;
    grate_tgsi_to_vp(&vp, &parser);
 
+   memcpy(so->immediates, vp.immediates, sizeof(vp.immediates));
+   so->num_immediates = vp.num_immediates;
+
    int num_instructions = list_length(&vp.instructions);
    assert(num_instructions < 256);
    int num_commands = 2 + num_instructions * 4;
