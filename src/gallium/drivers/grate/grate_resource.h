@@ -4,12 +4,18 @@
 #include "pipe/p_screen.h"
 #include "util/u_transfer.h"
 
+#define GRATE_MAX_MIP_LEVELS 13
+
 struct grate_resource {
    struct pipe_resource b;
    struct grate_bo *bo;
    unsigned int pitch;
    unsigned int tiled : 1;
    unsigned int format : 5;
+
+   /* byte offset and row pitch of each mip level inside the object */
+   unsigned int level_offset[GRATE_MAX_MIP_LEVELS];
+   unsigned int level_pitch[GRATE_MAX_MIP_LEVELS];
 };
 
 static inline struct grate_resource *

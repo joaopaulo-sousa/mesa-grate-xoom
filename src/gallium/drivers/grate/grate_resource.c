@@ -4,6 +4,7 @@
 #include "util/u_inlines.h"
 #include "util/u_memory.h"
 #include "util/u_pack_color.h"
+#include "util/u_surface.h"
 #include "util/u_transfer.h"
 #include "util/u_inlines.h"
 
@@ -20,6 +21,8 @@
  * of some abstraction to handle handles in a Tegra-specific winsys
  * implementation.
  */
+#include "drm-uapi/drm_fourcc.h"
+
 #include "frontend/drm_driver.h"
 
 
@@ -58,7 +61,64 @@ grate_resource_get_handle(struct pipe_screen *pscreen,
    }
 
    handle->stride = resource->pitch;
+   handle->offset = 0;
+   handle->modifier = DRM_FORMAT_MOD_LINEAR;
    return true;
+}
+
+/*
+ * DRI3 and the dmabuf export path ask for the layout through this rather than
+ * through get_handle, and without it they end up passing DRM_FORMAT_MOD_INVALID
+ * to the X server, which answers BadAlloc. We only ever hand out single plane
+ * linear buffers, so the answers are all short.
+ * (from libre-tegra/mesa grate-tmp, Ion Agorria)
+ */
+static bool
+grate_resource_get_param(struct pipe_screen *pscreen,
+                         struct pipe_context *pcontext,
+                         struct pipe_resource *presource,
+                         unsigned plane, unsigned layer, unsigned level,
+                         enum pipe_resource_param param,
+                         unsigned usage, uint64_t *value)
+{
+   struct grate_resource *resource = grate_resource(presource);
+   struct winsys_handle handle;
+
+   switch (param) {
+   case PIPE_RESOURCE_PARAM_NPLANES:
+      *value = 1;
+      return true;
+   case PIPE_RESOURCE_PARAM_STRIDE:
+      *value = resource->pitch;
+      return true;
+   case PIPE_RESOURCE_PARAM_OFFSET:
+      *value = 0;
+      return true;
+   case PIPE_RESOURCE_PARAM_MODIFIER:
+      *value = DRM_FORMAT_MOD_LINEAR;
+      return true;
+   case PIPE_RESOURCE_PARAM_LAYER_STRIDE:
+      *value = (uint64_t)resource->pitch * presource->height0;
+      return true;
+   case PIPE_RESOURCE_PARAM_HANDLE_TYPE_SHARED:
+   case PIPE_RESOURCE_PARAM_HANDLE_TYPE_KMS:
+   case PIPE_RESOURCE_PARAM_HANDLE_TYPE_FD:
+      memset(&handle, 0, sizeof(handle));
+      if (param == PIPE_RESOURCE_PARAM_HANDLE_TYPE_FD)
+         handle.type = WINSYS_HANDLE_TYPE_FD;
+      else if (param == PIPE_RESOURCE_PARAM_HANDLE_TYPE_KMS)
+         handle.type = WINSYS_HANDLE_TYPE_KMS;
+      else
+         handle.type = WINSYS_HANDLE_TYPE_SHARED;
+
+      if (!grate_resource_get_handle(pscreen, pcontext, presource, &handle, usage))
+         return false;
+
+      *value = handle.handle;
+      return true;
+   default:
+      return false;
+   }
 }
 
 static void
@@ -109,12 +169,16 @@ grate_resource_transfer_map(struct pipe_context *pcontext,
    ptrans->level = level;
    ptrans->usage = usage;
    ptrans->box = *box;
-   ptrans->stride = resource->pitch;
+   unsigned lvl = MIN2(level, (unsigned)(GRATE_MAX_MIP_LEVELS - 1));
+   unsigned lpitch = resource->level_pitch[lvl] ? resource->level_pitch[lvl]
+                                                : resource->pitch;
+
+   ptrans->stride = lpitch;
    ptrans->layer_stride = ptrans->stride;
    *transfer = ptrans;
 
-   return (uint8_t *)ret +
-          box->y * resource->pitch +
+   return (uint8_t *)ret + resource->level_offset[lvl] +
+          box->y * lpitch +
           box->x * util_format_get_blocksize(presource->format);
 }
 
@@ -205,6 +269,16 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
                                  util_is_power_of_two_nonzero(template->width0) ?
                                  16 : 64);
 
+      /*
+       * The sampler addresses rows within the power-of-two extent enclosing
+       * the height, and reading past the end of the object faults the SMMU
+       * (tegra-mc texsrd2 page faults): back those rows with memory.
+       * (from libre-tegra/mesa grate-tmp)
+       */
+      if ((template->bind & PIPE_BIND_SAMPLER_VIEW) &&
+          !(template->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET)))
+         height = util_next_power_of_two(height);
+
       flags = DRM_TEGRA_GEM_CREATE_BOTTOM_UP;
    }
 
@@ -215,7 +289,31 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
       resource->format = format;
    }
 
-   size = resource->pitch * height;
+   /*
+    * Every mip level gets storage of its own: sized for level 0 only, the
+    * uploads of the other levels would overwrite level 0 and a sampler
+    * reading them would fault (from libre-tegra/mesa grate-tmp).
+    */
+   unsigned levels = MIN2(template->last_level + 1, GRATE_MAX_MIP_LEVELS);
+   unsigned lw = template->width0, lh = height;
+   unsigned blocksize = util_format_get_blocksize(template->format);
+
+   size = 0;
+   for (unsigned l = 0; l < levels; ++l) {
+      unsigned lpitch = lw * blocksize;
+
+      if (l == 0)
+         lpitch = resource->pitch;
+      else
+         lpitch = align(lpitch, util_is_power_of_two_nonzero(lw) ? 16 : 64);
+
+      resource->level_offset[l] = size;
+      resource->level_pitch[l] = lpitch;
+      size += lpitch * MAX2(lh, 1u);
+
+      lw = MAX2(lw >> 1, 1u);
+      lh = MAX2(lh >> 1, 1u);
+   }
 
    resource->bo = grate_bo_alloc(screen->drm, size, flags);
    if (!resource->bo) {
@@ -224,6 +322,25 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
    }
 
    return &resource->b;
+}
+
+/* Only linear buffers exist: take any list that allows them (GBM surfaces,
+ * DRI3) */
+static struct pipe_resource *
+grate_screen_resource_create_with_modifiers(struct pipe_screen *pscreen,
+                                            const struct pipe_resource *template,
+                                            const uint64_t *modifiers,
+                                            int count)
+{
+   bool linear = count == 0;
+
+   for (int i = 0; i < count; i++)
+      linear |= modifiers[i] == DRM_FORMAT_MOD_LINEAR ||
+                modifiers[i] == DRM_FORMAT_MOD_INVALID;
+   if (!linear)
+      return NULL;
+
+   return grate_screen_resource_create(pscreen, template);
 }
 
 static struct pipe_resource *
@@ -279,6 +396,8 @@ grate_screen_resource_init(struct pipe_screen *pscreen)
    pscreen->resource_create = grate_screen_resource_create;
    pscreen->resource_from_handle = grate_screen_resource_from_handle;
    pscreen->resource_get_handle = grate_resource_get_handle;
+   pscreen->resource_get_param = grate_resource_get_param;
+   pscreen->resource_create_with_modifiers = grate_screen_resource_create_with_modifiers;
    pscreen->resource_destroy = grate_resource_destroy;
 }
 
@@ -292,7 +411,10 @@ grate_resource_copy_region(struct pipe_context *pcontext,
                            unsigned int src_level,
                            const struct pipe_box *box)
 {
-   grate_unimplemented();
+   /* through the CPU: mapping waits for the GPU, so it is correct if slow
+    * (from libre-tegra/mesa grate-tmp) */
+   util_resource_copy_region(pcontext, dst, dst_level, dstx, dsty, dstz,
+                             src, src_level, box);
 }
 
 static void
@@ -405,9 +527,11 @@ fill(struct grate_stream *stream, uint32_t **ptrp,
    switch (blocksize) {
    case 1:
       value |= 0 << 16;
+      fill_value = (fill_value & 0xff) * 0x01010101u;
       break;
    case 2:
       value |= 1 << 16;
+      fill_value = (fill_value & 0xffff) * 0x00010001u;
       break;
    case 4:
       value |= 2 << 16;
@@ -415,6 +539,12 @@ fill(struct grate_stream *stream, uint32_t **ptrp,
    default:
       UNREACHABLE("invalid blocksize");
    }
+   /*
+    * srcfgc is a 32 bit pattern whatever the pixel size, so a narrower fill
+    * has to be replicated across the word: a bare 16 bit value left every
+    * second pixel zero, e.g. a depth buffer cleared to 1.0 came out as
+    * alternating 1.0 and 0.0 (from libre-tegra/mesa grate-tmp).
+    */
    GRATE_PUSHBUF_WORD(ptr, value);           /* 0x01f - controlmain */
 
    GRATE_PUSHBUF_WORD(ptr, 0x000000cc);      /* 0x020 - ropfade */

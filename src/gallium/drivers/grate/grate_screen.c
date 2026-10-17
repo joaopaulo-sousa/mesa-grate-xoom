@@ -16,6 +16,7 @@
 #include "grate_context.h"
 #include "grate_resource.h"
 #include "grate_screen.h"
+#include "grate_compiler.h"
 
 static const struct debug_named_value debug_options[] = {
    { "unimplemented", GRATE_DEBUG_UNIMPLEMENTED,
@@ -76,6 +77,11 @@ grate_screen_init_caps(struct grate_screen *screen)
    grate_trace();
 
    u_init_pipe_screen_caps(&screen->base, 1);
+
+   /* gl_FragCoord conventions (the frontend lowers the others); without one
+    * of each nir_lower_wpos_ytransform asserts */
+   caps->fs_coord_origin_upper_left = true;
+   caps->fs_coord_pixel_center_half_integer = true;
 
    /*
    // NV30 reference values, check and uncomment them
@@ -340,7 +346,8 @@ grate_screen_init_shader_caps(struct grate_screen *screen)
    caps->max_tex_indirections = 128;
    caps->max_inputs = 16;
    caps->max_outputs = 16;
-   caps->max_const_buffer0_size = 32;
+   /* 32 fp20 uniform registers, shared with the immediates */
+   caps->max_const_buffer0_size = GRATE_FP_NUM_CONSTS * sizeof(float);
    caps->max_const_buffers = 1;
    caps->max_temps = 16; // scalars
    caps->max_texture_samplers = 16;
@@ -399,7 +406,9 @@ grate_screen_fence_reference(struct pipe_screen *pscreen,
                              struct pipe_fence_handle **ptr,
                              struct pipe_fence_handle *fence)
 {
-   grate_unimplemented();
+   /* no fence objects: flushes are synchronous */
+   if (ptr)
+      *ptr = fence;
 }
 
 static bool
@@ -408,8 +417,8 @@ grate_screen_fence_finish(struct pipe_screen *screen,
                           struct pipe_fence_handle *fence,
                           uint64_t timeout)
 {
-   grate_unimplemented();
-   return false;
+   /* flushes are synchronous, so anything fenced has already landed */
+   return true;
 }
 
 static const uint64_t grate_available_modifiers[] = {
