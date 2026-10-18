@@ -3,15 +3,14 @@
 #include <string.h>
 
 #include "grate_common.h"
-#include "grate_compiler.h"
-#include "fpir.h"
+#include "fp_compiler.h"
 
 #include "tgsi/tgsi_parse.h"
 
 #include "util/blend.h"
 #include "util/u_memory.h"
 
-static struct fp_alu_src_operand
+struct fp_alu_src_operand
 fp_alu_src_row(int index)
 {
    assert(index >= 0 && index < 16);
@@ -31,7 +30,7 @@ fp_alu_src_reg(int index)
    return src;
 }
 
-static struct fp_alu_src_operand
+struct fp_alu_src_operand
 fp_alu_src_uniform(int index)
 {
    assert(index >= 0 && index < GRATE_FP_NUM_CONSTS);
@@ -97,8 +96,8 @@ fp_uniform_slot(struct grate_fp_shader *fp, int index, int comp)
    return slot;
 }
 
-static struct fp_alu_src_operand
-fp_alu_src_zero()
+struct fp_alu_src_operand
+fp_alu_src_zero(void)
 {
    struct fp_alu_src_operand src = {
       .index = 31,
@@ -108,8 +107,8 @@ fp_alu_src_zero()
    return src;
 }
 
-static struct fp_alu_src_operand
-fp_alu_src_one()
+struct fp_alu_src_operand
+fp_alu_src_one(void)
 {
    struct fp_alu_src_operand src = {
       .index = 31,
@@ -120,7 +119,7 @@ fp_alu_src_one()
 }
 
 /* An ALU slot that does nothing: writes vec2(0, 1) to the read-only r31 */
-static struct fp_alu_instr
+struct fp_alu_instr
 fp_alu_nop(void)
 {
    struct fp_alu_instr ret = {
@@ -136,120 +135,7 @@ fp_alu_nop(void)
    return ret;
 }
 
-/*
- * Fragment program layout (measured on Tegra20, see gpu/tools/asmtri):
- *
- * - The program is N "EXECs" (N <= 4) and the pixel packet has N rows, row k
- *   being the registers r4k..r4k+3. Each EXEC has an optional MFU instruction,
- *   up to 3 ALU packets of 4 scalar slots and, in the first EXEC, the DW
- *   store, which runs after the last EXEC.
- * - The MFU of EXEC k interpolates varying component c into r(4k+c); the ALU
- *   can read it from EXEC k on.
- * - A register written by ALU packet P can be read from packet P+2 on (the
- *   packets are counted across EXECs). Packet P+1 reads the result of slot s
- *   of packet P as "alu<s>" instead.
- * - The PSEQ of EXEC k loads the render target pixel (the destination colour)
- *   as fixed10 halves into a register pair of row k before that EXEC's ALU:
- *   blending is done in the shader (Tegra20 has no blend unit).
- * - The TEX of EXEC k samples with the coordinates in a register pair of row
- *   k, r(4k)/r(4k+1) or r(4k+2)/r(4k+3), and writes the texel as four fixed10
- *   halves to the other pair, readable by the ALU from EXEC k on. Only
- *   coordinates that are a varying are supported (the NVIDIA compiler uses
- *   one-row programs for dependent reads).
- *
- * TGSI is lowered to scalar units (one slot, or slots 0..n-1 of a packet for
- * a DPn) in SSA form, the units are list-scheduled into packets and EXECs
- * honouring the latencies above, and the values that have to outlive the next
- * packet get a register. The colour is written as fixed10 to r2/r3.
- */
-
-#define FP_MAX_UNITS 128
-#define FP_MAX_TEMPS 32
-#define FP_MAX_INPUTS 16
-#define FP_MAX_EXECS 4
-#define FP_MAX_PACKETS_PER_EXEC 3
-#define FP_MAX_PACKETS 32
-#define FP_MAX_TEXTURES FP_MAX_EXECS
-
-#define FP_ALU_RESULT_REG(s) (24 + (s))
-
-enum fp_opnd_kind {
-   FP_OPND_UNIFORM = 0,   /* ALU uniform register (constants, immediates) */
-   FP_OPND_VALUE,         /* result of a unit */
-   FP_OPND_INPUT,         /* interpolated varying component */
-   FP_OPND_TEXEL,         /* texture sample channel */
-   FP_OPND_DST,           /* destination colour channel (PSEQ load) */
-   FP_OPND_ZERO,          /* fixed10 0 and 1 of r31, for fixed10 results */
-   FP_OPND_ONE,
-};
-
-struct fp_opnd {
-   enum fp_opnd_kind kind;
-   int index;      /* uniform slot, unit, TGSI input or texture fetch */
-   int comp;       /* input component, texel channel */
-   bool negate;
-   bool absolute;
-};
-
-struct fp_unit_slot {
-   enum fp_alu_op op;
-   struct fp_opnd src[3];
-   bool accumulate_this;
-   bool accumulate_other;
-};
-
-struct fp_unit {
-   int num_slots;          /* 1, or a DPn taking slots 0..n-1 */
-   struct fp_unit_slot slots[4];
-   bool saturate;
-   int output_chan;        /* colour channel written, or -1: defines a value */
-   bool forward;           /* the next packet may read the result as aluN */
-   bool live;
-
-   /* scheduling */
-   int packet;
-   int slot;
-   int reg;                /* register holding the value, -1 if none */
-};
-
-struct fp_compiler {
-   struct grate_fp_shader *fp;
-   struct fp_unit units[FP_MAX_UNITS];
-   int num_units;
-   struct fp_opnd temps[FP_MAX_TEMPS][4];
-   bool temp_written[FP_MAX_TEMPS][4];
-   struct fp_dw_instr dw;
-   bool failed;
-
-   /* EXEC whose MFU fetches TGSI input i component c, and the reverse */
-   int fetch_exec[FP_MAX_INPUTS][4];
-   int exec_input[FP_MAX_EXECS][4];
-
-   /* blending: colour writes become outv[] values, combined with the
-    * destination (PSEQ load into a register pair of EXEC dst_exec) */
-   const struct grate_fp_key *key;
-   bool redirect_output;
-   struct fp_opnd outv[4];
-   bool outv_written[4];
-   bool dst_used;
-   int dst_exec, dst_pair;
-
-   /* texture fetches: coordinates = TGSI input components 2*pair, +1 */
-   struct {
-      int input;
-      int pair;
-      int sampler;
-      int exec;
-      bool live;
-   } tex[FP_MAX_TEXTURES];
-   int num_tex;
-
-   int packet_exec[FP_MAX_PACKETS];
-   int num_packets;
-   int num_execs;
-};
-
-static void
+void
 fp_fail(struct fp_compiler *c, const char *msg)
 {
    if (!c->failed)
@@ -257,7 +143,7 @@ fp_fail(struct fp_compiler *c, const char *msg)
    c->failed = true;
 }
 
-static struct fp_unit *
+struct fp_unit *
 fp_new_unit(struct fp_compiler *c)
 {
    if (c->num_units == FP_MAX_UNITS) {
@@ -281,7 +167,7 @@ fp_opnd_uniform(int slot)
    return o;
 }
 
-static struct fp_opnd
+struct fp_opnd
 fp_opnd_value(struct fp_compiler *c, struct fp_unit *u)
 {
    struct fp_opnd o = { .kind = FP_OPND_VALUE, .index = u - c->units };
@@ -302,7 +188,7 @@ fp_opnd_modify(struct fp_opnd o, bool negate, bool absolute)
 
 /* 0 and 1 operands: fixed10 r31 for a colour write, fp20 uniforms otherwise
  * (the fixed10 constants give wrong fp20 results) */
-static struct fp_opnd
+struct fp_opnd
 fp_opnd_zero(struct fp_compiler *c, bool output)
 {
    if (output) {
@@ -312,7 +198,7 @@ fp_opnd_zero(struct fp_compiler *c, bool output)
    return fp_opnd_uniform(fp_const_slot(c->fp, 0.0f));
 }
 
-static struct fp_opnd
+struct fp_opnd
 fp_opnd_one(struct fp_compiler *c, bool output)
 {
    if (output) {
@@ -445,7 +331,7 @@ fp_set_dst_opnd(struct fp_compiler *c, const struct tgsi_dst_register *dst,
    return false;
 }
 
-static void
+void
 fp_unit_op(struct fp_unit_slot *s, enum fp_alu_op op, struct fp_opnd a,
            struct fp_opnd b, struct fp_opnd cc)
 {
@@ -604,6 +490,16 @@ emit_dot(struct fp_compiler *c, const struct tgsi_full_instruction *inst,
    }
 }
 
+/* value unit op(a * b, c) */
+static struct fp_opnd
+fp_val(struct fp_compiler *c, enum fp_alu_op op, struct fp_opnd a,
+       struct fp_opnd b, struct fp_opnd cc)
+{
+   struct fp_unit *u = fp_new_unit(c);
+   fp_unit_op(&u->slots[0], op, a, b, cc);
+   return fp_opnd_value(c, u);
+}
+
 /*
  * TEX with varying coordinates: one texture fetch per EXEC, the texel
  * channels become fixed10 operands. A colour destination gets copies.
@@ -620,21 +516,38 @@ emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
       fp_fail(c, "only 2D textures are supported");
       return;
    }
-   if (s.kind != FP_OPND_INPUT || t.kind != FP_OPND_INPUT ||
-       s.index != t.index || s.negate || s.absolute || t.negate ||
-       t.absolute || (s.comp & 1) || t.comp != s.comp + 1) {
-      fp_fail(c, "texture coordinates must be a varying .xy or .zw "
-                 "(dependent texture reads are not supported)");
-      return;
-   }
    if (c->num_tex == FP_MAX_TEXTURES) {
       fp_fail(c, "too many texture fetches");
       return;
    }
 
+   /* coordinates other than a varying .xy/.zw (a dependent read) need a
+    * sequential program: the ALU computes them in an earlier pass */
+   bool varying = s.kind == FP_OPND_INPUT && t.kind == FP_OPND_INPUT &&
+                  s.index == t.index && !s.negate && !s.absolute &&
+                  !t.negate && !t.absolute && !(s.comp & 1) &&
+                  t.comp == s.comp + 1;
+   if (!varying) {
+      /* the TEX reads fp20 coordinates from a register pair: anything but
+       * a plain varying component or a value of its own gets copied */
+      c->seq = true;
+      for (int k = 0; k < 2; k++) {
+         struct fp_opnd *o = k ? &t : &s;
+         bool plain = !o->negate && !o->absolute &&
+                      (o->kind == FP_OPND_INPUT || o->kind == FP_OPND_VALUE);
+         if (plain && !(k == 1 && t.kind == s.kind && t.index == s.index &&
+                        t.comp == s.comp))
+            continue;
+         *o = fp_val(c, FP_ALU_OP_MAD, *o, fp_opnd_one(c, false),
+                     fp_opnd_zero(c, false));
+      }
+   }
+
    int n = c->num_tex++;
-   c->tex[n].input = s.index;
-   c->tex[n].pair = s.comp / 2;
+   c->tex[n].coord[0] = s;
+   c->tex[n].coord[1] = t;
+   c->tex[n].input = varying ? s.index : -1;
+   c->tex[n].pair = varying ? s.comp / 2 : 0;
    c->tex[n].sampler = inst->Src[1].Register.Index;
    c->tex[n].exec = -1;
    c->tex[n].live = false;
@@ -651,6 +564,151 @@ emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
       fp_unit_op(&m->slots[0], FP_ALU_OP_MAD, texel, fp_opnd_one(c, output),
                  fp_opnd_zero(c, output));
       fp_dst(c, m, dst, i);
+   }
+}
+
+
+/*
+ * Special function on a scalar. The SFU works in place on a register, so
+ * the operand gets a value of its own first (fp_fold_sfu_copies drops the
+ * copy when nothing else reads the operand). ex2/sin/cos take a pre-op in
+ * the EXEC before. SFU units force a sequential program.
+ */
+static struct fp_opnd
+fp_sfu_inplace(struct fp_compiler *c, enum fp_sfu_op op, struct fp_opnd x)
+{
+   struct fp_unit *u = fp_new_unit(c);
+
+   u->num_slots = 0;
+   u->sfu = op;
+   u->forward = false;
+   u->slots[0].src[0] = x;
+   c->seq = true;
+   return fp_opnd_value(c, u);
+}
+
+static struct fp_opnd
+fp_sfu(struct fp_compiler *c, enum fp_sfu_op op, struct fp_opnd x)
+{
+   struct fp_unit *m = fp_new_unit(c);
+
+   m->sfu_copy = true;
+   fp_unit_op(&m->slots[0], FP_ALU_OP_MAD, x, fp_opnd_one(c, false),
+              fp_opnd_zero(c, false));
+   x = fp_opnd_value(c, m);
+
+   switch (op) {
+   case FP_SFU_OP_EX2:
+      x = fp_sfu_inplace(c, FP_SFU_OP_PREEX2, x);
+      break;
+   case FP_SFU_OP_SIN:
+      x = fp_sfu_inplace(c, FP_SFU_OP_PRESIN, x);
+      break;
+   case FP_SFU_OP_COS:
+      x = fp_sfu_inplace(c, FP_SFU_OP_PRECOS, x);
+      break;
+   default:
+      break;
+   }
+   return fp_sfu_inplace(c, op, x);
+}
+
+/* Write a value to the channels of a TGSI destination */
+static void
+fp_write_value(struct fp_compiler *c, const struct tgsi_full_instruction *inst,
+               int chan, struct fp_opnd v)
+{
+   const struct tgsi_dst_register *dst = &inst->Dst[0].Register;
+   bool sat = inst->Instruction.Saturate != 0;
+
+   if (!sat && fp_set_dst_opnd(c, dst, chan, v))
+      return;
+   bool output = fp_color_write(c, dst);
+   struct fp_unit *m = fp_new_unit(c);
+   m->saturate = sat;
+   fp_unit_op(&m->slots[0], FP_ALU_OP_MAD, v, fp_opnd_one(c, output),
+              fp_opnd_zero(c, output));
+   fp_dst(c, m, dst, chan);
+}
+
+static void
+emit_sfu(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
+{
+   const struct tgsi_dst_register *dst = &inst->Dst[0].Register;
+   unsigned opcode = inst->Instruction.Opcode;
+   struct fp_opnd s[4][2], r = { 0 };
+   bool scalar = opcode != TGSI_OPCODE_FRC && opcode != TGSI_OPCODE_FLR;
+
+   for (int i = 0; i < 4; i++) {
+      if (!(dst->WriteMask & (1 << i)))
+         continue;
+      for (unsigned k = 0; k < inst->Instruction.NumSrcRegs; k++)
+         s[i][k] = fp_src(c, &inst->Src[k].Register, scalar ? 0 : i);
+   }
+
+   for (int i = 0; i < 4; i++) {
+      if (!(dst->WriteMask & (1 << i)))
+         continue;
+      /* scalar functions compute once (TGSI .x) and replicate */
+      if (!scalar || r.kind != FP_OPND_VALUE) {
+         switch (opcode) {
+         case TGSI_OPCODE_RCP:  r = fp_sfu(c, FP_SFU_OP_RCP, s[i][0]); break;
+         case TGSI_OPCODE_RSQ:  r = fp_sfu(c, FP_SFU_OP_RSQ, s[i][0]); break;
+         case TGSI_OPCODE_SQRT: r = fp_sfu(c, FP_SFU_OP_SQRT, s[i][0]); break;
+         case TGSI_OPCODE_EX2:  r = fp_sfu(c, FP_SFU_OP_EX2, s[i][0]); break;
+         case TGSI_OPCODE_LG2:  r = fp_sfu(c, FP_SFU_OP_LG2, s[i][0]); break;
+         case TGSI_OPCODE_SIN:  r = fp_sfu(c, FP_SFU_OP_SIN, s[i][0]); break;
+         case TGSI_OPCODE_COS:  r = fp_sfu(c, FP_SFU_OP_COS, s[i][0]); break;
+         case TGSI_OPCODE_FRC:  r = fp_sfu(c, FP_SFU_OP_FRC, s[i][0]); break;
+         case TGSI_OPCODE_FLR:
+            /* floor(x) = x - fract(x) */
+            r = fp_val(c, FP_ALU_OP_MAD, s[i][0], fp_opnd_one(c, false),
+                       fp_opnd_modify(fp_sfu(c, FP_SFU_OP_FRC, s[i][0]), true, false));
+            break;
+         case TGSI_OPCODE_POW: {
+            /* x^y = 2^(y * log2(x)) */
+            struct fp_opnd l = fp_sfu(c, FP_SFU_OP_LG2, s[i][0]);
+            r = fp_sfu(c, FP_SFU_OP_EX2,
+                       fp_val(c, FP_ALU_OP_MAD, l, s[i][1], fp_opnd_zero(c, false)));
+            break;
+         }
+         default:
+            UNREACHABLE("not an SFU opcode");
+         }
+      }
+      fp_write_value(c, inst, i, r);
+   }
+}
+
+/* An SFU operand copy is unnecessary when it copies a plain value nothing
+ * else reads: the SFU can then work on that value's register directly */
+static void
+fp_fold_sfu_copies(struct fp_compiler *c)
+{
+   int readers[FP_MAX_UNITS] = { 0 };
+
+   for (int i = 0; i < c->num_units; i++) {
+      struct fp_unit *u = &c->units[i];
+      if (!u->live)
+         continue;
+      fp_unit_foreach_src(u, k, j)
+         if (u->slots[k].src[j].kind == FP_OPND_VALUE)
+            readers[u->slots[k].src[j].index]++;
+   }
+
+   for (int i = 0; i < c->num_units; i++) {
+      struct fp_unit *u = &c->units[i];
+      struct fp_opnd *x = &u->slots[0].src[0];
+      if (!u->live || !u->sfu || x->kind != FP_OPND_VALUE)
+         continue;
+      struct fp_unit *m = &c->units[x->index];
+      struct fp_opnd *y = &m->slots[0].src[0];
+      if (!m->sfu_copy || readers[x->index] != 1 || y->kind != FP_OPND_VALUE ||
+          y->negate || y->absolute || readers[y->index] != 1 ||
+          c->units[y->index].output_chan >= 0)
+         continue;
+      *x = *y;
+      m->live = false;
    }
 }
 
@@ -682,6 +740,19 @@ emit_tgsi_instr(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
       emit_tex(c, inst);
       break;
 
+   case TGSI_OPCODE_RCP:
+   case TGSI_OPCODE_RSQ:
+   case TGSI_OPCODE_SQRT:
+   case TGSI_OPCODE_EX2:
+   case TGSI_OPCODE_LG2:
+   case TGSI_OPCODE_SIN:
+   case TGSI_OPCODE_COS:
+   case TGSI_OPCODE_FRC:
+   case TGSI_OPCODE_FLR:
+   case TGSI_OPCODE_POW:
+      emit_sfu(c, inst);
+      break;
+
    case TGSI_OPCODE_SLT:
    case TGSI_OPCODE_SGE:
    case TGSI_OPCODE_SEQ:
@@ -695,15 +766,37 @@ emit_tgsi_instr(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
    }
 }
 
-/* value unit op(a * b, c) */
-static struct fp_opnd
-fp_val(struct fp_compiler *c, enum fp_alu_op op, struct fp_opnd a,
-       struct fp_opnd b, struct fp_opnd cc)
+/* MFU barycentric interpolation setup: the SFU computes 1/w (r4) */
+void
+fp_mfu_bary_setup(struct fp_mfu_instr *mfu)
 {
-   struct fp_unit *u = fp_new_unit(c);
-   fp_unit_op(&u->slots[0], op, a, b, cc);
-   return fp_opnd_value(c, u);
+   mfu->sfu.op = FP_SFU_OP_RCP;
+   mfu->sfu.reg = 4;
+   mfu->mul[0].dst = FP_MFU_MUL_DST_BARYCENTRIC_WEIGHT;
+   mfu->mul[0].src[0] = FP_MFU_MUL_SRC_SFU_RESULT;
+   mfu->mul[0].src[1] = FP_MFU_MUL_SRC_BARYCENTRIC_COEF_0;
+   mfu->mul[1].dst = FP_MFU_MUL_DST_BARYCENTRIC_WEIGHT;
+   mfu->mul[1].src[0] = FP_MFU_MUL_SRC_SFU_RESULT;
+   mfu->mul[1].src[1] = FP_MFU_MUL_SRC_BARYCENTRIC_COEF_1;
 }
+
+/* PSEQ load of the colour render target into a register pair of the row:
+ * OP LD (bit 23), surface (16..19), ARGS bit 3, bit 1 = r2/r3 */
+uint32_t
+fp_pseq_word(const struct fp_compiler *c, int pair)
+{
+   return 1u << 23 | (c->dw.index & 0xf) << 16 | 1 << 3 | pair << 1;
+}
+
+/* TEX: sampler, coordinates in r2/r3 (bit 4), texel to the other pair
+ * (bit 5: r2/r3), enable (bit 10) */
+uint32_t
+fp_tex_word(const struct fp_compiler *c, int n, int coord_pair)
+{
+   return (c->tex[n].sampler & 0xf) | coord_pair << 4 |
+          (1 - coord_pair) << 5 | 1 << 10;
+}
+
 
 /*
  * x * blend factor for channel ch; *zero when the term vanishes. s/d are the
@@ -736,6 +829,29 @@ fp_blend_term(struct fp_compiler *c, struct fp_opnd x, enum pipe_blendfactor fac
    return fp_val(c, FP_ALU_OP_MAD, x, y, fp_opnd_zero(c, false));
 }
 
+/* The operand y of a blend factor (y or 1 - y when *inv); ONE and ZERO
+ * are y = 1 and y = 0 */
+static struct fp_opnd
+fp_blend_factor(struct fp_compiler *c, enum pipe_blendfactor factor, int ch,
+                const struct fp_opnd *s, const struct fp_opnd *d, bool *inv)
+{
+   *inv = util_blendfactor_is_inverted(factor);
+   switch (util_blendfactor_without_invert(factor)) {
+   case PIPE_BLENDFACTOR_ONE:
+      *inv = false;
+      return util_blendfactor_is_inverted(factor) ? fp_opnd_zero(c, false) :
+                                                    fp_opnd_one(c, false);
+   case PIPE_BLENDFACTOR_SRC_COLOR: return s[ch];
+   case PIPE_BLENDFACTOR_SRC_ALPHA: return s[3];
+   case PIPE_BLENDFACTOR_DST_COLOR: return d[ch];
+   case PIPE_BLENDFACTOR_DST_ALPHA: return d[3];
+   default:
+      fprintf(stderr, "GRATE FRAG: blend factor %u unsupported, using ONE\n", factor);
+      *inv = false;
+      return fp_opnd_one(c, false);
+   }
+}
+
 /*
  * Blending and the colour write mask in the shader: the destination colour
  * comes from a PSEQ load, each channel is combined per the blend equation
@@ -757,6 +873,15 @@ emit_blend(struct fp_compiler *c)
                       (s[ch].kind == FP_OPND_VALUE && !s[ch].negate &&
                        c->units[s[ch].index].saturate);
       if (key->blend && c->outv_written[ch] && !in_range) {
+         /* one clamp per distinct operand (scalar results are replicated) */
+         int same = -1;
+         for (int k = 0; k < ch; k++)
+            if (c->outv_written[k] && !memcmp(&c->outv[k], &c->outv[ch], sizeof(c->outv[ch])))
+               same = k;
+         if (same >= 0) {
+            s[ch] = s[same];
+            continue;
+         }
          struct fp_unit *u = fp_new_unit(c);
          u->saturate = true;
          fp_unit_op(&u->slots[0], FP_ALU_OP_MAD, s[ch], fp_opnd_one(c, false),
@@ -788,30 +913,88 @@ emit_blend(struct fp_compiler *c)
          fp_unit_op(&u->slots[0], func == PIPE_BLEND_MIN ? FP_ALU_OP_MIN :
                     FP_ALU_OP_MAX, s[ch], one, d[ch]);
       } else {
-         bool zs, zd;
+         /*
+          * out = ts +/- d * DF, one MAD reading the source term ts (the
+          * previous packet can forward it): d * y directly, d * (1 - y)
+          * as d - d * y with the d added to ts first.
+          */
+         bool zs, inv;
          c->dst_used = true;
          struct fp_opnd ts = fp_blend_term(c, s[ch], sf, ch, s, d, &zs);
-         struct fp_opnd td = fp_blend_term(c, d[ch], df, ch, s, d, &zd);
-         struct fp_opnd a = zero, b = zero;
-         if (!zs)
-            a = ts;
-         if (!zd)
-            b = td;
-         if (func == PIPE_BLEND_SUBTRACT)
-            b = fp_opnd_modify(b, true, false);
-         else if (func == PIPE_BLEND_REVERSE_SUBTRACT)
-            a = fp_opnd_modify(a, true, false);
+         if (zs)
+            ts = fp_opnd_zero(c, false);
+         bool sub = func == PIPE_BLEND_SUBTRACT;        /* ts - d * DF */
+         bool rsub = func == PIPE_BLEND_REVERSE_SUBTRACT;  /* d * DF - ts */
+         if (rsub)
+            ts = fp_opnd_modify(ts, true, false);
+         struct fp_opnd dd = fp_opnd_modify(d[ch], sub, false);
+         struct fp_opnd y = fp_blend_factor(c, df, ch, s, d, &inv);
+         /* (units are in dependency order: the operand first) */
+         if (inv) {
+            ts = fp_val(c, FP_ALU_OP_MAD, dd, fp_opnd_one(c, false), ts);
+            dd = fp_opnd_modify(dd, true, false);
+         }
          u = fp_new_unit(c);
          u->saturate = true;
-         fp_unit_op(&u->slots[0], FP_ALU_OP_MAD, a, one, b);
+         fp_unit_op(&u->slots[0], FP_ALU_OP_MAD, dd, y, ts);
       }
       u->output_chan = ch;
    }
 }
 
-#define fp_unit_foreach_src(u, k, j) \
-   for (int k = 0; k < (u)->num_slots; k++) \
-      for (int j = 0; j < 3; j++)
+
+static bool
+fp_opnd_equal(const struct fp_opnd *a, const struct fp_opnd *b)
+{
+   return a->kind == b->kind && a->index == b->index && a->comp == b->comp &&
+          a->negate == b->negate && a->absolute == b->absolute;
+}
+
+/*
+ * Common subexpressions: a plain value unit identical to an earlier one
+ * (TGSI repeats the same operation per channel for replicated scalars)
+ * hands its readers to the earlier one. In unit order, so whole chains
+ * collapse; fp_dead_code then drops the copies.
+ */
+static void
+fp_cse(struct fp_compiler *c)
+{
+   int remap[FP_MAX_UNITS];
+
+   for (int i = 0; i < c->num_units; i++) {
+      struct fp_unit *u = &c->units[i];
+
+      remap[i] = i;
+      fp_unit_foreach_src(u, k, j) {
+         struct fp_opnd *o = &u->slots[k].src[j];
+         if (o->kind == FP_OPND_VALUE)
+            o->index = remap[o->index];
+      }
+      if (u->output_chan >= 0 || u->num_slots != 1 || u->sfu || u->sfu_copy)
+         continue;
+      for (int p = 0; p < i; p++) {
+         struct fp_unit *q = &c->units[p];
+         if (remap[p] != p || q->output_chan >= 0 || q->num_slots != 1 ||
+             q->sfu || q->sfu_copy || q->saturate != u->saturate ||
+             q->slots[0].op != u->slots[0].op ||
+             q->slots[0].accumulate_this || q->slots[0].accumulate_other ||
+             u->slots[0].accumulate_this || u->slots[0].accumulate_other)
+            continue;
+         bool same = true;
+         for (int j = 0; j < 3; j++)
+            same &= fp_opnd_equal(&q->slots[0].src[j], &u->slots[0].src[j]);
+         if (same) {
+            remap[i] = p;
+            break;
+         }
+      }
+   }
+
+   for (int n = 0; n < c->num_tex; n++)
+      for (int k = 0; k < 2; k++)
+         if (c->tex[n].coord[k].kind == FP_OPND_VALUE)
+            c->tex[n].coord[k].index = remap[c->tex[n].coord[k].index];
+}
 
 /* Drop units whose value is never used */
 static void
@@ -827,551 +1010,15 @@ fp_dead_code(struct fp_compiler *c)
          struct fp_opnd *o = &u->slots[k].src[j];
          if (o->kind == FP_OPND_VALUE)
             c->units[o->index].live = true;
-         else if (o->kind == FP_OPND_TEXEL)
+         else if (o->kind == FP_OPND_TEXEL) {
             c->tex[o->index].live = true;
-      }
-   }
-}
-
-/* Give every varying component read an MFU of the earliest EXEC that has its
- * component slot free, in order of first use */
-static void
-fp_assign_inputs(struct fp_compiler *c)
-{
-   memset(c->fetch_exec, -1, sizeof(c->fetch_exec));
-   memset(c->exec_input, -1, sizeof(c->exec_input));
-
-   /*
-    * Texture fetches first, one EXEC each: the coordinate pair is fetched by
-    * that EXEC's MFU, the other pair receives the texel (-2: no varying).
-    */
-   int e = 0;
-   for (int n = 0; n < c->num_tex; n++) {
-      if (!c->tex[n].live)
-         continue;
-      int p = c->tex[n].pair, in = c->tex[n].input;
-      c->tex[n].exec = e;
-      for (int k = 0; k < 2; k++) {
-         c->exec_input[e][2 * p + k] = in;
-         if (c->fetch_exec[in][2 * p + k] < 0)
-            c->fetch_exec[in][2 * p + k] = e;
-         c->exec_input[e][2 * (1 - p) + k] = -2;
-      }
-      e++;
-   }
-
-   for (int i = 0; i < c->num_units; i++) {
-      struct fp_unit *u = &c->units[i];
-      if (!u->live)
-         continue;
-      fp_unit_foreach_src(u, k, j) {
-         struct fp_opnd *o = &u->slots[k].src[j];
-         if (o->kind != FP_OPND_INPUT || c->fetch_exec[o->index][o->comp] >= 0)
-            continue;
-         for (e = 0; e < FP_MAX_EXECS; e++)
-            if (c->exec_input[e][o->comp] == -1)
-               break;
-         if (e == FP_MAX_EXECS) {
-            fp_fail(c, "too many varyings");
-            return;
-         }
-         c->exec_input[e][o->comp] = o->index;
-         c->fetch_exec[o->index][o->comp] = e;
-      }
-   }
-
-   /* the destination colour: a free register pair of the earliest EXEC */
-   if (c->dst_used) {
-      for (e = 0; e < FP_MAX_EXECS; e++)
-         for (int p = 0; p < 2; p++)
-            if (c->exec_input[e][2 * p] == -1 && c->exec_input[e][2 * p + 1] == -1) {
-               c->dst_exec = e;
-               c->dst_pair = p;
-               c->exec_input[e][2 * p] = c->exec_input[e][2 * p + 1] = -2;
-               return;
-            }
-      fp_fail(c, "no registers left for the destination colour");
-   }
-}
-
-/* fixed10 colour channel -> r2/r3 half, BGRA (also the texel layout) */
-static int
-fp_output_half(int chan)
-{
-   return chan < 3 ? (2 - chan) : 3;
-}
-
-/* EXEC from which an input or texel operand can be read */
-static int
-fp_opnd_exec(struct fp_compiler *c, const struct fp_opnd *o)
-{
-   if (o->kind == FP_OPND_INPUT)
-      return c->fetch_exec[o->index][o->comp];
-   if (o->kind == FP_OPND_TEXEL)
-      return c->tex[o->index].exec;
-   if (o->kind == FP_OPND_DST)
-      return c->dst_exec;
-   return 0;
-}
-
-/* Row register holding an input component or a texel channel */
-static int
-fp_opnd_reg(struct fp_compiler *c, const struct fp_opnd *o)
-{
-   if (o->kind == FP_OPND_INPUT)
-      return 4 * c->fetch_exec[o->index][o->comp] + o->comp;
-   if (o->kind == FP_OPND_DST)
-      return 4 * c->dst_exec + 2 * c->dst_pair + fp_output_half(o->comp) / 2;
-   assert(o->kind == FP_OPND_TEXEL);
-   int base = c->tex[o->index].pair ? 0 : 2;
-   return 4 * c->tex[o->index].exec + base + fp_output_half(o->comp) / 2;
-}
-
-static bool
-fp_unit_ready(struct fp_compiler *c, int index, int packet, int exec)
-{
-   struct fp_unit *u = &c->units[index];
-
-   fp_unit_foreach_src(u, k, j) {
-      struct fp_opnd *o = &u->slots[k].src[j];
-      if (o->kind == FP_OPND_VALUE) {
-         struct fp_unit *d = &c->units[o->index];
-         if (d->packet < 0 || d->packet >= packet)
-            return false;
-         if (!d->forward && d->packet == packet - 1)
-            return false;
-      } else if (o->kind == FP_OPND_INPUT || o->kind == FP_OPND_TEXEL ||
-                 o->kind == FP_OPND_DST) {
-         if (fp_opnd_exec(c, o) > exec)
-            return false;
-      }
-   }
-
-   if (u->output_chan < 0)
-      return true;
-
-   /*
-    * A colour write overwrites r2 or r3: the varyings or texels the first
-    * EXEC put there must have been read, and earlier writes of the channel
-    * done.
-    */
-   int half = fp_output_half(u->output_chan);
-   int reg = 2 + half / 2;
-   for (int i = 0; i < c->num_units; i++) {
-      struct fp_unit *r = &c->units[i];
-      if (!r->live || i == index)
-         continue;
-      if (i < index && r->output_chan == u->output_chan &&
-          (r->packet < 0 || r->packet >= packet))
-         return false;
-      if (r->packet >= 0)
-         continue;
-      fp_unit_foreach_src(r, k, j) {
-         struct fp_opnd *o = &r->slots[k].src[j];
-         /* an fp20 varying uses the whole register, a texel one half */
-         if (o->kind == FP_OPND_INPUT && fp_opnd_reg(c, o) == reg)
-            return false;
-         if ((o->kind == FP_OPND_TEXEL || o->kind == FP_OPND_DST) &&
-             fp_opnd_reg(c, o) == reg &&
-             fp_output_half(o->comp) % 2 == half % 2)
-            return false;
-      }
-   }
-   return true;
-}
-
-static bool
-fp_any_ready(struct fp_compiler *c, int packet, int exec)
-{
-   for (int i = 0; i < c->num_units; i++)
-      if (c->units[i].live && c->units[i].packet < 0 &&
-          fp_unit_ready(c, i, packet, exec))
-         return true;
-   return false;
-}
-
-/* Distinct values a unit reads */
-static int
-fp_unit_values(struct fp_compiler *c, struct fp_unit *u, int *vals)
-{
-   int n = 0;
-
-   fp_unit_foreach_src(u, k, j) {
-      struct fp_opnd *o = &u->slots[k].src[j];
-      if (o->kind != FP_OPND_VALUE)
-         continue;
-      int i;
-      for (i = 0; i < n && vals[i] != o->index; i++)
-         ;
-      if (i == n)
-         vals[n++] = o->index;
-   }
-   return n;
-}
-
-/* Change of the number of open values (scheduled, with readers left) */
-static int
-fp_unit_pressure(struct fp_compiler *c, struct fp_unit *u, const int *uses_left)
-{
-   int vals[12], n = fp_unit_values(c, u, vals);
-   int delta = u->output_chan < 0 ? 1 : 0;
-
-   for (int i = 0; i < n; i++)
-      delta -= uses_left[vals[i]] == 1;
-   return delta;
-}
-
-/*
- * List scheduling into packets, 3 packets per EXEC. Among the ready units
- * the ones closing values go first, then program order; at most "limit"
- * values are open at a time, which bounds the registers needed.
- */
-static bool
-fp_schedule(struct fp_compiler *c, int limit)
-{
-   int uses_left[FP_MAX_UNITS] = { 0 };
-   int remaining = 0, packet = 0, exec = 0, in_exec = 0, stalls = 0, open = 0;
-
-   for (int i = 0; i < c->num_units; i++) {
-      struct fp_unit *u = &c->units[i];
-      u->packet = -1;
-      if (!u->live)
-         continue;
-      remaining++;
-      int vals[12], n = fp_unit_values(c, u, vals);
-      for (int k = 0; k < n; k++)
-         uses_left[vals[k]]++;
-   }
-
-   while (remaining) {
-      unsigned mask = 0;
-      bool limited = false;
-
-      while (mask != 0xf) {
-         int best = -1, best_delta = 0;
-
-         for (int i = 0; i < c->num_units; i++) {
-            struct fp_unit *u = &c->units[i];
-            if (!u->live || u->packet >= 0)
-               continue;
-            if (u->num_slots > 1 ? (mask & ((1u << u->num_slots) - 1)) != 0 :
-                                   mask == 0xf)
-               continue;
-            if (!fp_unit_ready(c, i, packet, exec))
-               continue;
-            int delta = fp_unit_pressure(c, u, uses_left);
-            if (delta > 0 && open + delta > limit) {
-               limited = true;
-               continue;
-            }
-            if (best < 0 || delta < best_delta) {
-               best = i;
-               best_delta = delta;
-            }
-         }
-         if (best < 0)
-            break;
-
-         struct fp_unit *u = &c->units[best];
-         int vals[12], n = fp_unit_values(c, u, vals);
-         u->packet = packet;
-         u->slot = u->num_slots > 1 ? 0 : ffs(~mask & 0xf) - 1;
-         mask |= ((1u << u->num_slots) - 1) << u->slot;
-         open += best_delta;
-         for (int k = 0; k < n; k++)
-            uses_left[vals[k]]--;
-         remaining--;
-      }
-
-      if (!mask) {
-         if (limited)
-            return false;
-         /* waiting for a varying of a later EXEC: start it */
-         if (exec + 1 < FP_MAX_EXECS && fp_any_ready(c, packet, exec + 1)) {
-            if (!in_exec)
-               c->packet_exec[packet++] = exec;
-            exec++;
-            in_exec = 0;
-            continue;
-         }
-         /* otherwise a latency stall: empty packet */
-         if (++stalls > 16)
-            return false;
-      }
-
-      if (packet == FP_MAX_PACKETS)
-         return false;
-      c->packet_exec[packet++] = exec;
-      if (++in_exec == FP_MAX_PACKETS_PER_EXEC && remaining) {
-         exec++;
-         in_exec = 0;
-      }
-      if (exec == FP_MAX_EXECS)
-         return false;
-   }
-
-   if (!packet)   /* no ALU work at all: one empty packet */
-      c->packet_exec[packet++] = 0;
-   c->num_packets = packet;
-   c->num_execs = c->packet_exec[packet - 1] + 1;
-   return true;
-}
-
-/* Pad the program with one-packet EXECs up to "rows" */
-static void
-fp_pad_execs(struct fp_compiler *c, int rows)
-{
-   while (c->num_execs < rows && c->num_packets < FP_MAX_PACKETS)
-      c->packet_exec[c->num_packets++] = c->num_execs++;
-}
-
-/*
- * Register allocation over the schedule. A value needs a register when it
- * is read 2 or more packets after it was produced (or cannot be forwarded);
- * r2/r3 are the colour, r(4k+c) hold varyings until their last read, only
- * r0..r(4 * rows - 1) exist.
- */
-static bool
-fp_alloc_regs(struct fp_compiler *c)
-{
-   int last_read[FP_MAX_UNITS];
-   int busy_until[16];
-   int rows = c->num_execs;
-
-   for (int r = 0; r < 16; r++)
-      busy_until[r] = r < 4 * rows && r != 2 && r != 3 ? -1 : INT_MAX;
-
-   for (int i = 0; i < c->num_units; i++) {
-      last_read[i] = -1;
-      c->units[i].reg = -1;
-   }
-
-   for (int i = 0; i < c->num_units; i++) {
-      struct fp_unit *u = &c->units[i];
-      if (!u->live)
-         continue;
-      fp_unit_foreach_src(u, k, j) {
-         struct fp_opnd *o = &u->slots[k].src[j];
-         if (o->kind == FP_OPND_VALUE) {
-            struct fp_unit *d = &c->units[o->index];
-            if (u->packet >= d->packet + 2 || !d->forward)
-               last_read[o->index] = MAX2(last_read[o->index], u->packet);
-         } else if (o->kind == FP_OPND_INPUT) {
-            int r = fp_opnd_reg(c, o);
-            if (r != 2 && r != 3)
-               busy_until[r] = MAX2(busy_until[r], u->packet);
-         } else if (o->kind == FP_OPND_TEXEL || o->kind == FP_OPND_DST) {
-            int r = fp_opnd_reg(c, o);
-            if (r != 2 && r != 3)
-               busy_until[r] = MAX2(busy_until[r], u->packet);
+            /* computed coordinates (sequential programs) */
+            for (int k = 0; k < 2; k++)
+               if (c->tex[o->index].coord[k].kind == FP_OPND_VALUE)
+                  c->units[c->tex[o->index].coord[k].index].live = true;
          }
       }
    }
-
-   /* the TEX of EXEC e reads and writes row e during that EXEC */
-   for (int n = 0; n < c->num_tex; n++) {
-      if (!c->tex[n].live)
-         continue;
-      int e = c->tex[n].exec, last = 0;
-      for (int p = 0; p < c->num_packets; p++)
-         if (c->packet_exec[p] == e)
-            last = p;
-      for (int r = 4 * e; r < 4 * e + 4; r++)
-         if (r != 2 && r != 3)
-            busy_until[r] = MAX2(busy_until[r], last);
-   }
-
-   for (int p = 0; p < c->num_packets; p++) {
-      for (int i = 0; i < c->num_units; i++) {
-         struct fp_unit *u = &c->units[i];
-         if (!u->live || u->packet != p || last_read[i] < 0)
-            continue;
-         int r;
-         for (r = 0; r < 16; r++)
-            if (busy_until[r] <= p)
-               break;
-         if (r == 16)
-            return false;
-         u->reg = r;
-         busy_until[r] = last_read[i];
-      }
-   }
-   return true;
-}
-
-static struct fp_alu_src_operand
-fp_resolve(struct fp_compiler *c, const struct fp_opnd *o, int packet)
-{
-   struct fp_alu_src_operand ret = { 0 };
-
-   switch (o->kind) {
-   case FP_OPND_ZERO:
-      ret = fp_alu_src_zero();
-      break;
-   case FP_OPND_ONE:
-      ret = fp_alu_src_one();
-      break;
-   case FP_OPND_UNIFORM:
-      ret = fp_alu_src_uniform(o->index);
-      break;
-   case FP_OPND_INPUT:
-      ret = fp_alu_src_row(fp_opnd_reg(c, o));
-      break;
-   case FP_OPND_TEXEL:
-   case FP_OPND_DST:
-      ret = fp_alu_src_row(fp_opnd_reg(c, o));
-      ret.datatype = FP_DATATYPE_FIXED10;
-      ret.sub_reg_select_high = fp_output_half(o->comp) % 2;
-      break;
-   case FP_OPND_VALUE: {
-      struct fp_unit *d = &c->units[o->index];
-      if (d->forward && d->packet == packet - 1)
-         ret.index = FP_ALU_RESULT_REG(d->slot);
-      else {
-         assert(d->reg >= 0);
-         ret.index = d->reg;
-      }
-      break;
-   }
-   }
-
-   ret.negate = o->negate;
-   ret.absolute_value = o->absolute;
-   return ret;
-}
-
-static void
-fp_emit_unit(struct fp_compiler *c, struct fp_unit *u,
-             struct fp_alu_instr_packet *pkt)
-{
-   for (int k = 0; k < u->num_slots; k++) {
-      struct fp_unit_slot *s = &u->slots[k];
-      struct fp_alu_instr *a = &pkt->slots[u->slot + k];
-      struct fp_alu_src_operand c2 = fp_resolve(c, &s->src[2], u->packet);
-
-      /* rD is left disabled: result = op(rA * rB, rC) */
-      *a = (struct fp_alu_instr) {
-         .op = s->op,
-         .accumulate_this = s->accumulate_this,
-         .accumulate_other = s->accumulate_other,
-         .src = {
-            fp_resolve(c, &s->src[0], u->packet),
-            fp_resolve(c, &s->src[1], u->packet),
-            c2, c2
-         },
-      };
-
-      if (k > 0) {
-         a->dst.index = 31;     /* DP partial product, added to slot 0 */
-         continue;
-      }
-
-      a->dst.saturate = u->saturate;
-      if (u->output_chan >= 0) {
-         int o = fp_output_half(u->output_chan);
-         a->dst.index = 2 + o / 2;
-         a->dst.write_low_sub_reg = (o % 2) == 0;
-         a->dst.write_high_sub_reg = (o % 2) != 0;
-      } else {
-         /* fp20 value: both halves; only forwarded ones go to r31 */
-         a->dst.index = u->reg >= 0 ? u->reg : 31;
-         a->dst.write_low_sub_reg = true;
-         a->dst.write_high_sub_reg = true;
-      }
-   }
-}
-
-static void
-fp_emit(struct fp_compiler *c)
-{
-   struct grate_fp_shader *fp = c->fp;
-   int packet = 0;
-
-   for (int e = 0; e < c->num_execs; e++) {
-      struct fp_instr *inst = CALLOC_STRUCT(fp_instr);
-      list_inithead(&inst->link);
-
-      bool fetch = false;
-      for (int k = 0; k < 4; k++)
-         fetch |= c->exec_input[e][k] >= 0;
-      if (fetch) {
-         struct fp_mfu_instr *mfu = CALLOC_STRUCT(fp_mfu_instr);
-         list_inithead(&mfu->link);
-         for (int k = 0; k < 4; k++) {
-            if (c->exec_input[e][k] < 0)
-               continue;
-            mfu->var[k].op = FP_VAR_OP_FP20;
-            mfu->var[k].tram_row = c->exec_input[e][k];
-         }
-         if (e == 0) {
-            /* barycentric interpolation setup */
-            mfu->sfu.op = FP_SFU_OP_RCP;
-            mfu->sfu.reg = 4;
-            mfu->mul[0].dst = FP_MFU_MUL_DST_BARYCENTRIC_WEIGHT;
-            mfu->mul[0].src[0] = FP_MFU_MUL_SRC_SFU_RESULT;
-            mfu->mul[0].src[1] = FP_MFU_MUL_SRC_BARYCENTRIC_COEF_0;
-            mfu->mul[1].dst = FP_MFU_MUL_DST_BARYCENTRIC_WEIGHT;
-            mfu->mul[1].src[0] = FP_MFU_MUL_SRC_SFU_RESULT;
-            mfu->mul[1].src[1] = FP_MFU_MUL_SRC_BARYCENTRIC_COEF_1;
-         }
-         inst->mfu_sched.num_instructions = 1;
-         inst->mfu_sched.address = list_length(&fp->mfu_instructions);
-         list_addtail(&mfu->link, &fp->mfu_instructions);
-      }
-
-      /* PSEQ load of the render target: OP LD (bit 23), surface (16..19),
-       * ARGS bit 3, bit 1 = into r2/r3 (measured, gpu/tools/asmtri) */
-      if (c->dst_used && c->dst_exec == e)
-         inst->pseq = 1u << 23 | (c->dw.index & 0xf) << 16 | 1 << 3 |
-                      c->dst_pair << 1;
-
-      /* TEX word: sampler, coordinates r2/r3 (bit 4), texel to r2/r3 (bit 5),
-       * enable (bit 10) */
-      for (int n = 0; n < c->num_tex; n++) {
-         if (!c->tex[n].live || c->tex[n].exec != e)
-            continue;
-         inst->tex = (c->tex[n].sampler & 0xf) | c->tex[n].pair << 4 |
-                     (1 - c->tex[n].pair) << 5 | 1 << 10;
-         fp->info.sampler_mask |= 1u << c->tex[n].sampler;
-      }
-
-      inst->alu_sched.address = list_length(&fp->alu_instructions);
-      for (; packet < c->num_packets && c->packet_exec[packet] == e; packet++) {
-         struct fp_alu_instr_packet *pkt = CALLOC_STRUCT(fp_alu_instr_packet);
-         list_inithead(&pkt->link);
-         for (int k = 0; k < 4; k++)
-            pkt->slots[k] = fp_alu_nop();
-         for (int i = 0; i < c->num_units; i++)
-            if (c->units[i].live && c->units[i].packet == packet)
-               fp_emit_unit(c, &c->units[i], pkt);
-         list_addtail(&pkt->link, &fp->alu_instructions);
-         inst->alu_sched.num_instructions++;
-      }
-
-      /* the store of the first EXEC runs after the last one */
-      if (e == 0)
-         inst->dw = c->dw;
-
-      list_addtail(&inst->link, &fp->fp_instructions);
-   }
-}
-
-static void
-fp_dump(struct fp_compiler *c)
-{
-   fprintf(stderr, "GRATE FRAG: %d EXECs, %d packets:", c->num_execs,
-           c->num_packets);
-   for (int p = 0; p < c->num_packets; p++) {
-      fprintf(stderr, " [e%d", c->packet_exec[p]);
-      for (int i = 0; i < c->num_units; i++) {
-         struct fp_unit *u = &c->units[i];
-         if (u->live && u->packet == p)
-            fprintf(stderr, " u%d%s", i, u->output_chan >= 0 ? "o" :
-                    u->reg >= 0 ? "r" : "");
-      }
-      fprintf(stderr, "]");
-   }
-   fprintf(stderr, "\n");
 }
 
 #define LINK_SRC(index) ((index) << 3)
@@ -1468,30 +1115,15 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    if (c->redirect_output && !c->failed)
       emit_blend(c);
 
+   fp_cse(c);
    fp_dead_code(c);
-   fp_assign_inputs(c);
+   fp_fold_sfu_copies(c);
 
-   /*
-    * Schedule for parallelism first, then with fewer values open at a time
-    * until the registers suffice. More rows give more registers;
-    * GRATE_FP_ROWS forces a minimum.
-    */
-   int min_rows = 1;
-   if (getenv("GRATE_FP_ROWS"))
-      min_rows = CLAMP(atoi(getenv("GRATE_FP_ROWS")), 1, FP_MAX_EXECS);
-   bool done = c->failed;
-   for (int limit = 16; limit > 0 && !done; limit--) {
-      if (!fp_schedule(c, limit))
-         continue;
-      fp_pad_execs(c, min_rows);
-      while (!(done = fp_alloc_regs(c)) && c->num_execs < FP_MAX_EXECS)
-         fp_pad_execs(c, c->num_execs + 1);
-   }
-   if (!done)
+   if (!c->failed && !(c->seq ? fp_sched_seq(c) : fp_sched_rows(c)))
       fp_fail(c, "shader too big (out of ALU packets or registers)");
 
-   if (grate_debug & GRATE_DEBUG_TGSI)
-      fp_dump(c);
+   if ((grate_debug & GRATE_DEBUG_TGSI) && !c->seq)
+      fp_dump_rows(c);
 
    if (c->failed) {
       /* still emit something sane: magenta, one packet */
@@ -1499,6 +1131,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
       c->num_units = 0;
       c->num_tex = 0;
       c->dst_used = false;
+      c->seq = false;
       for (int i = 0; i < 4; i++) {
          struct fp_unit *u = fp_new_unit(c);
          struct fp_opnd one = fp_opnd_one(c, true);
@@ -1516,7 +1149,10 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
       c->packet_exec[0] = 0;
    }
 
-   fp_emit(c);
-   fp->info.num_rows = c->num_execs;
+   if (c->seq)
+      fp_emit_seq(c);
+   else
+      fp_emit_rows(c);
+   fp->info.num_rows = c->seq ? 1 : c->num_execs;
    FREE(c);
 }
