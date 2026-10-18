@@ -398,6 +398,17 @@ grate_screen_is_format_supported(struct pipe_screen *pscreen,
          return false;
    }
 
+   /*
+    * The fragment compiler reads texels with the half layout measured for
+    * 8888 textures (B G | R A); other formats unpack differently (RGB565
+    * came out with red and blue swapped in RetroArch). Sample only those,
+    * the frontend converts the rest on upload.
+    */
+   if ((usage & PIPE_BIND_SAMPLER_VIEW) &&
+       format != PIPE_FORMAT_B8G8R8A8_UNORM &&
+       format != PIPE_FORMAT_B8G8R8X8_UNORM)
+      return false;
+
    return true;
 }
 
