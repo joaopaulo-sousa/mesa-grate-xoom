@@ -57,16 +57,27 @@ struct grate_fp_pre {
    struct grate_fp_pre_opnd a[4], b[4], c;
 };
 
+/* linker (SU) instructions: up to 32 */
+#define GRATE_FP_MAX_LINKS 32
+
+/*
+ * Linker instruction: copies components of one VS export (found at draw time
+ * by semantic) to columns of a TRAM row, which the fragment MFU interpolates
+ * into registers: column k into r(k) (of its row of the pixel packet). The
+ * compiler chooses the TRAM layout (fp/linker.c).
+ */
+struct grate_fp_link {
+   uint32_t dst;           /* per export component: TRAM column and type */
+   uint16_t semantic;
+   uint8_t tram_row;
+   uint8_t input;          /* TGSI input */
+};
+
 struct grate_fp_info {
-   struct {
-      uint32_t src;       /* filled in at draw time from the VS outputs */
-      uint32_t dst;
-      uint16_t semantic;
-      uint8_t tram_row;   /* TRAM row = TGSI input index, read by the MFU */
-   } inputs[16];
-   int num_inputs;
+   struct grate_fp_link links[GRATE_FP_MAX_LINKS];
+   int num_links;
    int color_input;
-   int max_tram_row;
+   int max_tram_row;       /* TRAM rows used */
    int num_rows;            /* pixel packet rows (r0-r3, r4-r7, ...) */
    /* ALU uniform registers: user uniforms at index * 4 + component from the
     * bottom, immediates (fp20, already converted) allocated from the top */

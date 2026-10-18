@@ -8,7 +8,10 @@
  *   (either interpolation of varying components c into r(c), with the
  *   barycentric setup, or one SFU op working in place on a register), TEX
  *   (coordinates in a register pair, texel as fixed10 halves into the other
- *   pair), up to 3 ALU packets, and in the last EXEC the DW store of r2/r3.
+ *   pair), up to 3 ALU packets, and in the last EXEC the DW store.
+ * - The colour is written as fixed10 halves to r2/r3 or, when the registers
+ *   are tight, to r0/r1, as the NVIDIA compiler does: the DW store takes
+ *   either pair.
  * - Within an EXEC the ALU sees what that EXEC's PSEQ/MFU/TEX loaded, and a
  *   packet reads the previous packet's results as alu0..3; its own register
  *   writes are only seen by the following EXECs.
@@ -39,6 +42,7 @@
 
 struct seq_state {
    int fetch_exec[FP_MAX_INPUTS][4];   /* EXEC interpolating input i comp c */
+   int fetch_reg[FP_MAX_INPUTS][4];    /* ... into this register */
    int num_execs;
    int num_packets;
    int dst_exec;
@@ -254,8 +258,39 @@ seq_others_ready(struct fp_compiler *c, struct seq_state *s,
    return true;
 }
 
+/* Whether input i component comp is a texture coordinate: those must be
+ * fetched into r(comp), the register pair the TEX reads */
+static bool
+seq_is_coord(struct fp_compiler *c, int i, int comp)
+{
+   for (int n = 0; n < c->num_tex; n++)
+      for (int k = 0; k < 2; k++)
+         if (c->tex[n].live && seq_opnd_is(&c->tex[n].coord[k], SEQ_INPUT, i, comp))
+            return true;
+   return false;
+}
+
+/* A register the MFU of this EXEC can interpolate input i component comp
+ * into, -1 if none: r(comp) preferably, the column the linker would give it
+ * anyway, else any free one (the TRAM layout follows, fp/linker.c) */
+static int
+seq_fetch_reg(struct fp_compiler *c, const struct seq_owner *owner,
+              const struct fp_seq_exec *x, int i, int comp, int e)
+{
+   bool coord = seq_is_coord(c, i, comp);
+
+   for (int k = 0; k < SEQ_REGS; k++) {
+      int r = (comp + k) % SEQ_REGS;
+      if (coord && r != comp)
+         break;
+      if (x->ipl_input[r] < 0 && seq_fixed_free(c, &owner[r], e))
+         return r;
+   }
+   return -1;
+}
+
 /* MFU interpolation: the varying components of the next units in program
- * order whose other operands are there, into their fixed registers */
+ * order whose other operands are there, each into a free register */
 static bool
 seq_fetch_inputs(struct fp_compiler *c, struct seq_state *s,
                  struct seq_owner *owner, struct fp_seq_exec *x, int e,
@@ -296,12 +331,16 @@ seq_fetch_inputs(struct fp_compiler *c, struct seq_state *s,
          struct fp_opnd *o = ops[k];
          int comp = o->comp;
          if (o->kind != FP_OPND_INPUT || s->fetch_exec[o->index][comp] >= 0 ||
-             x->ipl_input[comp] >= 0 || !seq_fixed_free(c, &owner[comp], e) ||
              live + 1 > limit)
             continue;
-         x->ipl_input[comp] = o->index;
+         int r = seq_fetch_reg(c, owner, x, o->index, comp, e);
+         if (r < 0)
+            continue;
+         x->ipl_input[r] = o->index;
+         x->ipl_comp[r] = comp;
          s->fetch_exec[o->index][comp] = e;
-         owner[comp] = (struct seq_owner) { SEQ_INPUT, o->index, comp };
+         s->fetch_reg[o->index][comp] = r;
+         owner[r] = (struct seq_owner) { SEQ_INPUT, o->index, comp };
          live++;
          any = true;
       }
@@ -336,7 +375,7 @@ seq_unit_ready(struct fp_compiler *c, struct seq_state *s,
             return false;
 
    int half = fp_output_half(u->output_chan);
-   int reg = 2 + half / 2;
+   int reg = 2 * c->out_pair + half / 2;
    switch (owner[reg].kind) {
    case SEQ_NONE:
    case SEQ_OUT:
@@ -371,7 +410,8 @@ seq_unit_ready(struct fp_compiler *c, struct seq_state *s,
       fp_unit_foreach_src(r, k, j) {
          struct fp_opnd *o = &r->slots[k].src[j];
          if (o->kind == FP_OPND_INPUT && o->comp == reg &&
-             s->fetch_exec[o->index][o->comp] < 0)
+             s->fetch_exec[o->index][o->comp] < 0 &&
+             seq_is_coord(c, o->index, o->comp))
             return false;
       }
    }
@@ -433,6 +473,7 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
    int remaining = 0, packet = 0, idle = 0;
 
    memset(s->fetch_exec, -1, sizeof(s->fetch_exec));
+   memset(s->fetch_reg, -1, sizeof(s->fetch_reg));
    s->dst_exec = -1;
    for (int i = 0; i < c->num_units; i++) {
       c->units[i].exec = c->units[i].packet = -1;
@@ -560,7 +601,7 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
             mask |= ((1u << u->num_slots) - 1) << u->slot;
             remaining--;
             if (u->output_chan >= 0)
-               owner[2 + fp_output_half(u->output_chan) / 2] =
+               owner[2 * c->out_pair + fp_output_half(u->output_chan) / 2] =
                   (struct seq_owner) { SEQ_OUT, 0, 0 };
          }
          if (!mask)
@@ -643,7 +684,7 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
    for (int i = 0; i < FP_MAX_INPUTS; i++)
       for (int k = 0; k < 4; k++)
          if (s->fetch_exec[i][k] >= 0) {
-            items[num] = (struct seq_item) { .def = SEQ_T(s->fetch_exec[i][k], T_MFU), .last = -1, .reg = k, .pair_tex = -1 };
+            items[num] = (struct seq_item) { .def = SEQ_T(s->fetch_exec[i][k], T_MFU), .last = -1, .reg = s->fetch_reg[i][k], .pair_tex = -1 };
             input_item[i][k] = num++;
          }
    for (int n = 0; n < c->num_tex; n++) {
@@ -706,7 +747,7 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
    }
 #undef SEQ_READ
 
-   /* colour writes own r2/r3 from the first one on */
+   /* colour writes own their pair from the first one on */
    for (int i = 0; i < c->num_units; i++) {
       struct fp_unit *u = &c->units[i];
       if (!u->live || u->output_chan < 0)
@@ -714,7 +755,7 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
       int r = fp_output_half(u->output_chan) / 2;
       int t = SEQ_T(u->exec, T_ALU_WRITE);
       if (out_item[r] < 0) {
-         items[num] = (struct seq_item) { .def = t, .last = SEQ_FOREVER, .reg = 2 + r, .halves = true, .pair_tex = -1 };
+         items[num] = (struct seq_item) { .def = t, .last = SEQ_FOREVER, .reg = 2 * c->out_pair + r, .halves = true, .pair_tex = -1 };
          out_item[r] = num++;
       }
       items[out_item[r]].def = MIN2(items[out_item[r]].def, t);
@@ -795,6 +836,7 @@ fp_sched_seq(struct fp_compiler *c)
 {
    struct seq_state s;
 
+   for (c->out_pair = 1; c->out_pair >= 0; c->out_pair--)
    for (int limit = SEQ_REGS; limit > 0; limit--) {
       if (!seq_schedule(c, &s, limit)) {
          if (grate_debug & GRATE_DEBUG_TGSI)
@@ -802,13 +844,16 @@ fp_sched_seq(struct fp_compiler *c)
          continue;
       }
       if (grate_debug & GRATE_DEBUG_TGSI)
-         fprintf(stderr, "GRATE FRAG: sequential schedule ok (limit %d, %d EXECs), "
-                 "allocating\n", limit, s.num_execs);
+         fprintf(stderr, "GRATE FRAG: sequential schedule ok (limit %d, %d EXECs, "
+                 "colour in r%d/r%d), allocating\n", limit, s.num_execs,
+                 2 * c->out_pair, 2 * c->out_pair + 1);
       if (seq_alloc(c, &s)) {
          c->num_execs = s.num_execs;
          c->num_packets = s.num_packets;
          memcpy(c->fetch_exec, s.fetch_exec, sizeof(s.fetch_exec));
+         memcpy(c->fetch_reg, s.fetch_reg, sizeof(s.fetch_reg));
          c->dst_exec = s.dst_exec;
+         c->dw.src_regs = c->out_pair ? FP_DW_REGS_R2_R3 : FP_DW_REGS_R0_R1;
          return true;
       }
       if (grate_debug & GRATE_DEBUG_TGSI)
@@ -834,7 +879,7 @@ seq_resolve(struct fp_compiler *c, const struct fp_opnd *o, int e, int p)
       ret = fp_alu_src_uniform(o->index);
       break;
    case FP_OPND_INPUT:
-      ret = fp_alu_src_row(o->comp);
+      ret = fp_alu_src_row(c->fetch_reg[o->index][o->comp]);
       break;
    case FP_OPND_TEXEL:
    case FP_OPND_DST: {
@@ -889,7 +934,7 @@ seq_emit_unit(struct fp_compiler *c, struct fp_unit *u,
       a->dst.saturate = u->saturate;
       if (u->output_chan >= 0) {
          int o = fp_output_half(u->output_chan);
-         a->dst.index = 2 + o / 2;
+         a->dst.index = 2 * c->out_pair + o / 2;
          a->dst.write_low_sub_reg = (o % 2) == 0;
          a->dst.write_high_sub_reg = (o % 2) != 0;
       } else {
@@ -927,7 +972,8 @@ fp_emit_seq(struct fp_compiler *c)
                if (x->ipl_input[k] < 0)
                   continue;
                mfu->var[k].op = FP_VAR_OP_FP20;
-               mfu->var[k].tram_row = x->ipl_input[k];
+               mfu->var[k].tram_row = fp_tram_row(c, x->ipl_input[k],
+                                                  x->ipl_comp[k], k);
             }
          } else {
             struct fp_unit *u = &c->units[x->sfu_unit];

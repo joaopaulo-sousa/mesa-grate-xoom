@@ -28,6 +28,7 @@
 #define FP_MAX_PACKETS_PER_EXEC 3
 #define FP_MAX_PACKETS 64
 #define FP_MAX_TEXTURES 4
+#define FP_TRAM_ROWS 16
 
 #define FP_ALU_RESULT_REG(s) (24 + (s))
 #define FP_KILL_REG 76           /* non-zero written discards the fragment */
@@ -78,7 +79,8 @@ struct fp_unit {
 /* What one EXEC of a sequential program does (sched_seq.c) */
 struct fp_seq_exec {
    int sfu_unit;           /* SFU unit run by the MFU, -1 if none */
-   int ipl_input[4];       /* TGSI input interpolated into r(c), -1 if none */
+   int ipl_input[4];       /* TGSI input interpolated into r(k), -1 if none */
+   int ipl_comp[4];        /* ... its component */
    int tex;                /* texture fetch, -1 if none */
    bool pseq;              /* destination colour load */
    int first_packet;
@@ -94,9 +96,15 @@ struct fp_compiler {
    struct fp_dw_instr dw;
    bool failed;
 
+   /* TGSI inputs: semantic; TRAM layout, input * 4 + component per row and
+    * column (-1: free) */
+   uint16_t input_semantic[FP_MAX_INPUTS];
+   int tram[FP_TRAM_ROWS][4];
+
    /* EXEC whose MFU fetches TGSI input i component c, and the reverse */
    int fetch_exec[FP_MAX_INPUTS][4];
    int exec_input[FP_MAX_EXECS][4];
+   int fetch_reg[FP_MAX_INPUTS][4];   /* sequential: register it goes to */
 
    /* blending: colour writes become outv[] values, combined with the
     * destination (PSEQ load into a register pair of EXEC dst_exec) */
@@ -121,6 +129,7 @@ struct fp_compiler {
 
    /* SFU units or dependent texture reads: a sequential program */
    bool seq;
+   int out_pair;           /* colour register pair: 1 = r2/r3, 0 = r0/r1 */
    struct fp_seq_exec seq_exec[FP_SEQ_MAX_EXECS];
 
    int packet_exec[FP_MAX_PACKETS];
@@ -166,6 +175,10 @@ uint32_t fp_tex_word(const struct fp_compiler *c, int n, int coord_pair);
 
 /* preshader.c */
 void fp_preshade(struct fp_compiler *c);
+
+/* linker.c */
+int fp_tram_row(struct fp_compiler *c, int input, int comp, int column);
+void fp_build_links(struct fp_compiler *c);
 
 /* sched_rows.c */
 bool fp_sched_rows(struct fp_compiler *c);

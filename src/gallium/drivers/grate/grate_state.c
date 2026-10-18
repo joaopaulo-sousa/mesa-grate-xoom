@@ -734,36 +734,35 @@ emit_program(struct grate_context *context, uint32_t **ptrp)
 
    /* depends on linking */
    struct grate_fp_info *info = &context->fshader->info;
-   cull_face_linker_setup |= TGR3D_SU_PARAM_LAST_INST(0 < info->num_inputs ?
-                                                      (info->num_inputs - 1) : 0);
+   cull_face_linker_setup |= TGR3D_SU_PARAM_LAST_INST(0 < info->num_links ?
+                                                      (info->num_links - 1) : 0);
 
-   uint32_t linker_insts[3 + info->num_inputs * 2];
+   uint32_t linker_insts[3 + info->num_links * 2];
    linker_insts[0] = host1x_opcode_incr(REG_TGR3D_SU_PARAM, 1);
    linker_insts[1] = cull_face_linker_setup;
-   linker_insts[2] = host1x_opcode_incr(REG_TGR3D_SU_INST_EVEN(0), info->num_inputs * 2);
+   linker_insts[2] = host1x_opcode_incr(REG_TGR3D_SU_INST_EVEN(0), info->num_links * 2);
 
-   for (int i = 0; i < info->num_inputs; ++i) {
+   for (int i = 0; i < info->num_links; ++i) {
       /*
        * Source: the VS output with the same semantic, numbered among the
        * enabled outputs (the hardware squeezes the export mask: exports
-       * 2, 7, 9 are seen as 0, 1, 2). Bits 9..14: the TRAM row written,
-       * which the fragment MFU reads (it was always row 0, so a second
-       * varying overwrote the first).
+       * 2, 7, 9 are seen as 0, 1, 2), export 1 if there is none. Bits
+       * 9..14: the TRAM row written, which the fragment MFU reads.
        */
-      uint32_t src = info->inputs[i].src;
+      uint32_t src = 1 << 3;
       for (int o = 0; context->vshader && o < 16; o++)
-         if (context->vshader->output_semantic[o] == info->inputs[i].semantic) {
+         if (context->vshader->output_semantic[o] == info->links[i].semantic) {
             unsigned squeezed = util_bitcount(context->vshader->output_mask &
                                               BITFIELD_MASK(o));
             src = squeezed << 3;
          }
-      src |= (uint32_t)info->inputs[i].tram_row << 9;
+      src |= (uint32_t)info->links[i].tram_row << 9;
       linker_insts[3 + i * 2] = src;
-      linker_insts[3 + i * 2 + 1] = info->inputs[i].dst;
+      linker_insts[3 + i * 2 + 1] = info->links[i].dst;
+      /* flat shading: no interpolation of the colour */
+      if (context->rast->base.flatshade && info->links[i].input == info->color_input)
+         linker_insts[3 + i * 2 + 1] |= 0xf << 16;
    }
-
-   if (context->rast->base.flatshade && info->color_input >= 0)
-      linker_insts[3 + info->color_input * 2 + 1] |= 0xf << 16;
 
    grate_stream_push_words(stream, ptrp, linker_insts, ARRAY_SIZE(linker_insts), 0);
 }

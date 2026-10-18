@@ -496,7 +496,7 @@ fp_emit_rows(struct fp_compiler *c)
             if (c->exec_input[e][k] < 0)
                continue;
             mfu->var[k].op = FP_VAR_OP_FP20;
-            mfu->var[k].tram_row = c->exec_input[e][k];
+            mfu->var[k].tram_row = fp_tram_row(c, c->exec_input[e][k], k, k);
          }
          if (e == 0)
             fp_mfu_bary_setup(mfu);

@@ -227,9 +227,6 @@ fp_src(struct fp_compiler *c, const struct tgsi_src_register *src, int chan)
       o.kind = FP_OPND_INPUT;
       o.index = src->Index;
       o.comp = comp;
-      /* rows stored per triangle: index + 1 (only one row was kept with two
-       * varyings, the second read garbage) */
-      fp->info.max_tram_row = MAX2(fp->info.max_tram_row, src->Index + 1);
       break;
 
    case TGSI_FILE_IMMEDIATE: {
@@ -1149,44 +1146,30 @@ fp_dead_code(struct fp_compiler *c)
    }
 }
 
-#define LINK_SRC(index) ((index) << 3)
-#define LINK_DST(index, comp, type) (((comp) | (type) << 2) << ((index) * 4))
-#define LINK_DST_NONE      0
-#define LINK_DST_FX10_LOW  1
-#define LINK_DST_FX10_HIGH 2
-#define LINK_DST_FP20      3
-
 static void
-emit_tgsi_input(struct grate_fp_shader *fp, const struct tgsi_full_declaration *decl)
+emit_tgsi_input(struct fp_compiler *c, const struct tgsi_full_declaration *decl)
 {
+   int index = decl->Range.First;
+
    grate_trace();
    assert(decl->Range.First == decl->Range.Last);
+   if (index >= FP_MAX_INPUTS) {
+      fp_fail(c, "too many inputs");
+      return;
+   }
 
-   uint32_t dst = 0;
-   for (int i = 0; i < 4; ++i)
-      dst |= LINK_DST(i, i, LINK_DST_FP20);
-
-   /* the source VS export is chosen at draw time by semantic: it used to be
-    * export 1 for every input, so a second varying read the first one */
-   fp->info.inputs[fp->info.num_inputs].src = LINK_SRC(1);
-   fp->info.inputs[fp->info.num_inputs].dst = dst;
-   fp->info.max_tram_row = MAX2(fp->info.max_tram_row, (int)decl->Range.First + 1);
-   fp->info.inputs[fp->info.num_inputs].tram_row = decl->Range.First;
-   fp->info.inputs[fp->info.num_inputs].semantic =
-      GRATE_SEMANTIC(decl->Semantic.Name, decl->Semantic.Index);
-
+   c->input_semantic[index] = GRATE_SEMANTIC(decl->Semantic.Name,
+                                             decl->Semantic.Index);
    if (decl->Declaration.Semantic == TGSI_SEMANTIC_COLOR)
-      fp->info.color_input = decl->Range.First;
-
-   fp->info.num_inputs++;
+      c->fp->info.color_input = index;
 }
 
 static void
-emit_tgsi_declaration(struct grate_fp_shader *fp, const struct tgsi_full_declaration *decl)
+emit_tgsi_declaration(struct fp_compiler *c, const struct tgsi_full_declaration *decl)
 {
    switch (decl->Declaration.File) {
    case TGSI_FILE_INPUT:
-      emit_tgsi_input(fp, decl);
+      emit_tgsi_input(c, decl);
       break;
    }
 }
@@ -1199,13 +1182,14 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    struct fp_compiler *c = CALLOC_STRUCT(fp_compiler);
 
    c->key = key;
+   c->out_pair = 1;
    c->redirect_output = key && (key->blend || (key->colormask & 0xf) != 0xf);
 
    list_inithead(&fp->fp_instructions);
    list_inithead(&fp->alu_instructions);
    list_inithead(&fp->mfu_instructions);
 
-   fp->info.num_inputs = 0;
+   fp->info.num_links = 0;
    fp->info.color_input = -1;
    fp->info.max_tram_row = 1;
    fp->info.used_mask = 0;
@@ -1215,12 +1199,13 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    fp->num_immediates = 0;
 
    c->fp = fp;
+   memset(c->tram, -1, sizeof(c->tram));
 
    while (!tgsi_parse_end_of_tokens(tgsi)) {
       tgsi_parse_token(tgsi);
       switch (tgsi->FullToken.Token.Type) {
       case TGSI_TOKEN_TYPE_DECLARATION:
-         emit_tgsi_declaration(fp, &tgsi->FullToken.FullDeclaration);
+         emit_tgsi_declaration(c, &tgsi->FullToken.FullDeclaration);
          break;
 
       case TGSI_TOKEN_TYPE_IMMEDIATE: {
@@ -1266,6 +1251,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    if (c->failed) {
       /* still emit something sane: magenta, one packet */
       memset(c->exec_input, -1, sizeof(c->exec_input));
+      memset(c->tram, -1, sizeof(c->tram));
       c->num_units = 0;
       c->num_tex = 0;
       c->dst_used = false;
@@ -1291,6 +1277,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
       fp_emit_seq(c);
    else
       fp_emit_rows(c);
+   fp_build_links(c);
    fp->info.num_rows = c->seq ? 1 : c->num_execs;
    FREE(c);
 }
