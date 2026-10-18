@@ -1211,6 +1211,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    fp->info.used_mask = 0;
    fp->info.imm_mask = 0;
    fp->info.sampler_mask = 0;
+   fp->info.num_pre = 0;
    fp->num_immediates = 0;
 
    c->fp = fp;
@@ -1244,11 +1245,19 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
       emit_blend(c);
 
    fp_cse(c);
+   fp_preshade(c);
    fp_fuse_mad(c);
    fp_dead_code(c);
    fp_fold_sfu_copies(c);
 
-   if (!c->failed && !(c->seq ? fp_sched_seq(c) : fp_sched_rows(c)))
+   /*
+    * Multi-row programs have more registers, sequential ones room for more
+    * instructions (16 EXECs instead of 4): fall back to the latter when the
+    * former run out of packets.
+    */
+   if (!c->failed && !c->seq && !fp_sched_rows(c))
+      c->seq = true;
+   if (!c->failed && c->seq && !fp_sched_seq(c))
       fp_fail(c, "shader too big (out of ALU packets or registers)");
 
    if ((grate_debug & GRATE_DEBUG_TGSI) && !c->seq)

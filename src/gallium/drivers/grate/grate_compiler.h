@@ -28,6 +28,35 @@ struct grate_vp_shader {
 #define GRATE_FP_NUM_CONSTS 32
 #define GRATE_FP_MAX_IMMEDIATES 32
 
+/*
+ * Preshader (fp/preshader.c): values that depend on uniforms only, computed
+ * on the CPU at draw time instead of for every pixel. Entry i sets uniform
+ * slot dst to op(a[0] * b[0] + ... + a[n-1] * b[n-1], c), as the ALU would.
+ */
+#define GRATE_FP_MAX_PRE 24
+
+enum grate_fp_pre_kind {
+   GRATE_FP_PRE_USER,      /* user uniform slot "index" */
+   GRATE_FP_PRE_RESULT,    /* result of preshader entry "index" */
+   GRATE_FP_PRE_CONST,     /* "value" */
+};
+
+struct grate_fp_pre_opnd {
+   uint8_t kind;
+   uint8_t index;
+   bool negate;
+   bool absolute;
+   float value;
+};
+
+struct grate_fp_pre {
+   uint8_t op;             /* enum fp_alu_op */
+   uint8_t dst;
+   uint8_t num_products;
+   bool saturate;
+   struct grate_fp_pre_opnd a[4], b[4], c;
+};
+
 struct grate_fp_info {
    struct {
       uint32_t src;       /* filled in at draw time from the VS outputs */
@@ -45,10 +74,17 @@ struct grate_fp_info {
    uint32_t used_mask;      /* slots read by the shader */
    uint32_t imm_mask;       /* slots holding immediates */
    uint32_t sampler_mask;   /* samplers read */
+   struct grate_fp_pre pre[GRATE_FP_MAX_PRE];
+   int num_pre;
 };
 
 uint32_t
 grate_float_to_fp20(float f);
+
+/* Fill in the preshader slots of consts[] (user: the user uniforms) */
+void
+grate_fp_eval_pre(const struct grate_fp_info *info, const float *user,
+                  unsigned user_len, uint32_t *consts);
 
 struct grate_fp_shader {
    struct list_head fp_instructions;

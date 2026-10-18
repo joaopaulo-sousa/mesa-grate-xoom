@@ -164,6 +164,9 @@ void fp_mfu_bary_setup(struct fp_mfu_instr *mfu);
 uint32_t fp_pseq_word(const struct fp_compiler *c, int pair);
 uint32_t fp_tex_word(const struct fp_compiler *c, int n, int coord_pair);
 
+/* preshader.c */
+void fp_preshade(struct fp_compiler *c);
+
 /* sched_rows.c */
 bool fp_sched_rows(struct fp_compiler *c);
 void fp_emit_rows(struct fp_compiler *c);

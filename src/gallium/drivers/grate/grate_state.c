@@ -717,6 +717,7 @@ emit_program(struct grate_context *context, uint32_t **ptrp)
          else
             consts[i] = 0;
       }
+      grate_fp_eval_pre(fpinfo, user, user_len, consts);
 
       GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_ALU_GLOBALS(0),
                                                    GRATE_FP_NUM_CONSTS));
