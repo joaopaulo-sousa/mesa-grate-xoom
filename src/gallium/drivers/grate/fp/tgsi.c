@@ -680,6 +680,21 @@ emit_sfu(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
    }
 }
 
+/* Whether o is the constant v (an fp20 immediate or the fixed10 0/1) */
+static bool
+fp_opnd_is_const(struct fp_compiler *c, const struct fp_opnd *o, float v)
+{
+   if (o->negate || o->absolute)
+      return false;
+   if (o->kind == FP_OPND_ZERO)
+      return v == 0.0f;
+   if (o->kind == FP_OPND_ONE)
+      return v == 1.0f;
+   return o->kind == FP_OPND_UNIFORM &&
+          (c->fp->info.imm_mask & (1u << o->index)) &&
+          c->fp->info.consts[o->index] == grate_float_to_fp20(v);
+}
+
 /* An SFU operand copy is unnecessary when it copies a plain value nothing
  * else reads: the SFU can then work on that value's register directly */
 static void
@@ -704,6 +719,8 @@ fp_fold_sfu_copies(struct fp_compiler *c)
       struct fp_unit *m = &c->units[x->index];
       struct fp_opnd *y = &m->slots[0].src[0];
       if (!m->sfu_copy || readers[x->index] != 1 || y->kind != FP_OPND_VALUE ||
+          !fp_opnd_is_const(c, &m->slots[0].src[1], 1.0f) ||
+          !fp_opnd_is_const(c, &m->slots[0].src[2], 0.0f) ||
           y->negate || y->absolute || readers[y->index] != 1 ||
           c->units[y->index].output_chan >= 0)
          continue;
@@ -1033,6 +1050,80 @@ fp_cse(struct fp_compiler *c)
             c->tex[n].coord[k].index = remap[c->tex[n].coord[k].index];
 }
 
+/* A plain multiply: MAD x, y, 0 */
+static bool
+fp_unit_is_mul(struct fp_compiler *c, const struct fp_unit *u)
+{
+   return fp_unit_has_value(u) && u->num_slots == 1 && !u->sfu &&
+          !u->sfu_copy && !u->saturate && u->slots[0].op == FP_ALU_OP_MAD &&
+          !u->slots[0].accumulate_this && !u->slots[0].accumulate_other &&
+          fp_opnd_is_const(c, &u->slots[0].src[2], 0.0f);
+}
+
+/*
+ * MUL + ADD -> MAD: an addition MAD p, 1, q (or MAD q, 1, p) where p is
+ * a plain multiply x * y nothing else reads becomes MAD x, y, q. A negated
+ * p carries its sign over to x.
+ */
+static void
+fp_fuse_mad(struct fp_compiler *c)
+{
+   int readers[FP_MAX_UNITS] = { 0 };
+
+   for (int i = 0; i < c->num_units; i++) {
+      struct fp_unit *u = &c->units[i];
+      fp_unit_foreach_src(u, k, j)
+         if (u->slots[k].src[j].kind == FP_OPND_VALUE)
+            readers[u->slots[k].src[j].index]++;
+   }
+   for (int n = 0; n < c->num_tex; n++)
+      for (int k = 0; k < 2; k++)
+         if (c->tex[n].coord[k].kind == FP_OPND_VALUE)
+            readers[c->tex[n].coord[k].index] += 2;   /* keep */
+
+   for (int i = 0; i < c->num_units; i++) {
+      struct fp_unit *u = &c->units[i];
+      struct fp_unit_slot *s = &u->slots[0];
+      /* SFU operand copies stay plain copies (fp_fold_sfu_copies) */
+      if (u->num_slots != 1 || u->sfu || u->sfu_copy || s->op != FP_ALU_OP_MAD ||
+          s->accumulate_this || s->accumulate_other)
+         continue;
+
+      /* addition: one of a/b is 1, the other and c are the addends */
+      int p_at = -1;
+      struct fp_opnd addend;
+      if (fp_opnd_is_const(c, &s->src[1], 1.0f)) {
+         if (s->src[0].kind == FP_OPND_VALUE) {
+            p_at = 0;
+            addend = s->src[2];
+         }
+         if ((p_at < 0 || !fp_unit_is_mul(c, &c->units[s->src[0].index])) &&
+             s->src[2].kind == FP_OPND_VALUE &&
+             fp_unit_is_mul(c, &c->units[s->src[2].index])) {
+            p_at = 2;
+            addend = s->src[0];
+         }
+      }
+      if (p_at < 0)
+         continue;
+
+      struct fp_opnd p = s->src[p_at];
+      struct fp_unit *m = &c->units[p.index];
+      if (!fp_unit_is_mul(c, m) || readers[p.index] != 1 || p.absolute)
+         continue;
+
+      struct fp_opnd x = m->slots[0].src[0], y = m->slots[0].src[1];
+      if (p.negate)
+         x.negate = !x.negate;
+      s->src[0] = x;
+      s->src[1] = y;
+      s->src[2] = addend;
+      readers[p.index] = 0;
+      m->live = false;
+      /* the multiply's operands are read here now */
+   }
+}
+
 /* Drop units whose value is never used */
 static void
 fp_dead_code(struct fp_compiler *c)
@@ -1153,6 +1244,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
       emit_blend(c);
 
    fp_cse(c);
+   fp_fuse_mad(c);
    fp_dead_code(c);
    fp_fold_sfu_copies(c);
 
