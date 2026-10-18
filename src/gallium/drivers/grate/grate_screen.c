@@ -8,6 +8,7 @@
 
 #include "util/hash_table.h"
 #include "util/macros.h"
+#include "util/u_inlines.h"
 #include "util/u_memory.h"
 #include "util/u_screen.h"
 
@@ -417,9 +418,9 @@ grate_screen_fence_reference(struct pipe_screen *pscreen,
                              struct pipe_fence_handle **ptr,
                              struct pipe_fence_handle *fence)
 {
-   /* no fence objects: flushes are synchronous */
-   if (ptr)
-      *ptr = fence;
+   if (pipe_reference(&(*ptr)->reference, &fence->reference))
+      FREE(*ptr);
+   *ptr = fence;
 }
 
 static bool
@@ -428,8 +429,25 @@ grate_screen_fence_finish(struct pipe_screen *screen,
                           struct pipe_fence_handle *fence,
                           uint64_t timeout)
 {
-   /* flushes are synchronous, so anything fenced has already landed */
-   return true;
+   bool done = true;
+
+   if (!fence)
+      return true;
+
+   /* PIPE_TIMEOUT_INFINITE included: a job taking longer is a hang */
+   timeout = MIN2(timeout, GRATE_JOB_TIMEOUT_NS);
+
+   for (unsigned i = 0; i < ARRAY_SIZE(fence->fence); i++) {
+      if (!fence->fence[i].drm)
+         continue;
+
+      if (drm_tegra_fence_wait(&fence->fence[i], timeout) == 0)
+         fence->fence[i].drm = NULL;
+      else
+         done = false;
+   }
+
+   return done;
 }
 
 static const uint64_t grate_available_modifiers[] = {

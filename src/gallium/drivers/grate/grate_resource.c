@@ -148,13 +148,12 @@ grate_resource_transfer_map(struct pipe_context *pcontext,
       return NULL;
 
    /*
-    * Nothing records which resource a submitted job touched, so the only safe
-    * thing is to let everything already submitted land before handing out a
-    * CPU pointer. Otherwise a readback races the GPU still writing the render
-    * target, which is what made large frames come back half drawn.
+    * Let the jobs that used the BO land before handing out a CPU pointer:
+    * a readback otherwise races the GPU still writing the render target, and
+    * an upload overwrites a texture a draw is still sampling.
     */
    if (!(usage & PIPE_MAP_UNSYNCHRONIZED))
-      grate_context_flush_streams(context);
+      grate_bo_wait(resource->bo);
 
    ptrans = slab_alloc(&context->transfer_pool);
    if (!ptrans)
@@ -483,11 +482,11 @@ grate_blit(struct pipe_context *pcontext, const struct pipe_blit_info *info)
    GRATE_PUSHBUF_WORD(ptr, value);                 /* 0x046 - tilemode */
 
    GRATE_PUSHBUF_WORD(ptr, host1x_opcode_mask(0x02b, 0xe149));
-   grate_stream_push_reloc(&gr2d->stream, &ptr, dst->bo, 0);      /* 0x02b - dstba */
+   grate_stream_push_reloc(&gr2d->stream, &ptr, dst->bo, 0, true); /* 0x02b - dstba */
 
    GRATE_PUSHBUF_WORD(ptr, dst->pitch);            /* 0x02e - dstst */
 
-   grate_stream_push_reloc(&gr2d->stream, &ptr, src->bo, 0);      /* 0x031 - srcba */
+   grate_stream_push_reloc(&gr2d->stream, &ptr, src->bo, 0, false); /* 0x031 - srcba */
 
    GRATE_PUSHBUF_WORD(ptr, src->pitch);            /* 0x033 - srcst */
 
@@ -502,7 +501,7 @@ grate_blit(struct pipe_context *pcontext, const struct pipe_blit_info *info)
 
    grate_stream_end(&gr2d->stream, &ptr);
 
-   grate_stream_flush(&gr2d->stream, true);
+   grate_stream_flush(&gr2d->stream, false);
 }
 
 static uint32_t
@@ -558,7 +557,7 @@ fill(struct grate_stream *stream, uint32_t **ptrp,
    GRATE_PUSHBUF_WORD(ptr, 0x000000cc);      /* 0x020 - ropfade */
 
    GRATE_PUSHBUF_WORD(ptr, host1x_opcode_mask(0x2b, 0x09));
-   grate_stream_push_reloc(stream, &ptr, dst->bo, 0);/* 0x02b - dstba */
+   grate_stream_push_reloc(stream, &ptr, dst->bo, 0, true); /* 0x02b - dstba */
    GRATE_PUSHBUF_WORD(ptr, dst->pitch);      /* 0x02e - dstst */
 
    GRATE_PUSHBUF_WORD(ptr, host1x_opcode_nonincr(0x35, 1));
@@ -622,7 +621,7 @@ grate_clear(struct pipe_context *pcontext, unsigned int buffers,
    }
    
    grate_stream_end(stream, &ptr);
-   grate_stream_flush(stream, true);
+   grate_stream_flush(stream, false);
 }
 
 static void
@@ -652,7 +651,7 @@ grate_clear_render_target(struct pipe_context *pipe,
         dstx, dsty, width, height);
    
    grate_stream_end(stream, &ptr);
-   grate_stream_flush(stream, true);
+   grate_stream_flush(stream, false);
 }
 
 static void
@@ -684,7 +683,7 @@ grate_clear_depth_stencil(struct pipe_context *pipe,
         dstx, dsty, width, height);
    
    grate_stream_end(stream, &ptr);
-   grate_stream_flush(stream, true);
+   grate_stream_flush(stream, false);
 }
 
 static void
@@ -692,11 +691,13 @@ grate_flush_resource(struct pipe_context *ctx, struct pipe_resource *resource)
 {
    /*
     * Called when a resource is about to be handed to the window system - for
-    * weston, the buffer it is about to scan out. Nothing else waits for the
-    * GPU on that path, so without this the compositor flips a frame that is
-    * still being drawn, and the display shows part of the previous one.
+    * weston, the buffer it is about to scan out. A kernel with implicit sync
+    * has the job fences on the BO, and the display waits for them; without
+    * it nothing else waits for the GPU on that path, and the compositor would
+    * flip a frame that is still being drawn.
     */
-   grate_context_flush_streams(grate_context(ctx));
+   if (grate_context(ctx)->drm->implicit_sync != 1)
+      grate_bo_wait(grate_resource(resource)->bo);
 }
 
 void

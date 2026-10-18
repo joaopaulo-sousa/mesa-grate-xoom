@@ -114,6 +114,7 @@ static int grate_device_wrap(struct grate_device **drmp, int fd, bool close)
     drm->close = close;
     drm->fd = fd;
     drm->soc_id = drm_tegra_get_soc_id();
+    drm->implicit_sync = -1;
     
 	grate_device_setup_debug(drm);
 	

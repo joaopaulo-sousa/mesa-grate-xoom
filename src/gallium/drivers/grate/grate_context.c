@@ -2,6 +2,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 
+#include "util/u_debug.h"
+#include "util/u_inlines.h"
 #include "util/u_memory.h"
 #include "util/u_upload_mgr.h"
 
@@ -38,6 +40,8 @@ grate_channel_create(struct grate_context *context,
    }
 
    channel->context = context;
+   channel->stream.slot = class == DRM_TEGRA_GR3D ? GRATE_STREAM_3D
+                                                   : GRATE_STREAM_2D;
 
    err = grate_stream_create(
       screen->drm,
@@ -85,12 +89,7 @@ grate_context_destroy(struct pipe_context *pcontext)
 void
 grate_context_flush_streams(struct grate_context *context)
 {
-   /*
-    * There are no fence objects yet, so a flush is synchronous: submit
-    * whatever is pending on both channels and wait for it. Without this
-    * nothing ever waits for the GPU - draws are submitted with wait=false -
-    * and a map handed out straight afterwards sees a half drawn frame.
-    */
+   /* submit whatever is pending on both channels and wait for it */
    if (context->gr3d)
       grate_stream_wait(&context->gr3d->stream);
    if (context->gr2d)
@@ -102,11 +101,34 @@ grate_context_flush(struct pipe_context *pcontext,
                     struct pipe_fence_handle **pfence,
                     enum pipe_flush_flags flags)
 {
-   grate_context_flush_streams(grate_context(pcontext));
+   struct grate_context *context = grate_context(pcontext);
 
-   /* the work is already done, so there is nothing to wait on */
-   if (pfence)
+   /*
+    * Jobs are submitted as they are built, so there is nothing left to send:
+    * a flush only hands out a fence. GRATE_SYNC=1 makes it wait as well, to
+    * tell synchronization bugs apart from others.
+    */
+   if (debug_get_bool_option("GRATE_SYNC", false))
+      grate_context_flush_streams(context);
+
+   if (!pfence)
+      return;
+
+   struct pipe_fence_handle *fence = CALLOC_STRUCT(pipe_fence_handle);
+   if (!fence) {
+      grate_context_flush_streams(context);
       *pfence = NULL;
+      return;
+   }
+
+   pipe_reference_init(&fence->reference, 1);
+   struct grate_stream *streams[] = { &context->gr2d->stream,
+                                      &context->gr3d->stream };
+   for (unsigned i = 0; i < ARRAY_SIZE(streams); i++)
+      if (streams[i]->fence_pending)
+         fence->fence[streams[i]->slot] = streams[i]->last_fence;
+
+   *pfence = fence;
 }
 
 struct pipe_context *
@@ -138,6 +160,9 @@ grate_screen_context_create(struct pipe_screen *pscreen,
       FREE(context);
       return NULL;
    }
+
+   context->gr2d->stream.peer = &context->gr3d->stream;
+   context->gr3d->stream.peer = &context->gr2d->stream;
 
    slab_create_child(&context->transfer_pool, &screen->transfer_pool);
 

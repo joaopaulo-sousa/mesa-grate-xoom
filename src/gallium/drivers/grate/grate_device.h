@@ -45,6 +45,10 @@ struct grate_device {
    
    // Identifies the SoC that this GPU belongs to
    enum drm_tegra_soc_id soc_id;
+
+   /* Whether the kernel attaches job fences to the BOs (DRM_TEGRA_SUBMIT_BUF_WRITE
+    * accepted): -1 not known yet, 0 no, 1 yes */
+   int implicit_sync;
 };
 
 int grate_device_new(int fd, struct grate_device **drmp);

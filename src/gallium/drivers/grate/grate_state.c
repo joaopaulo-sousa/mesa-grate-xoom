@@ -595,7 +595,7 @@ emit_attribs(struct grate_context *context, uint32_t **ptrp)
       attrib |= TGR3D_IDX_ATTRIBUTE_MODE_ATTR_STRIDE(e->stride);
 
       GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_IDX_ATTRIBUTE_BASE(i), 2));
-      grate_stream_push_reloc(stream, ptrp, r->bo, vb->buffer_offset + e->offset);
+      grate_stream_push_reloc(stream, ptrp, r->bo, vb->buffer_offset + e->offset, false);
       GRATE_PUSHBUF_WORD(*ptrp, attrib);
    }
 }
@@ -617,7 +617,7 @@ emit_render_targets(struct grate_context *context, uint32_t **ptrp)
 
    GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_GLOBAL_SURFADDR(0), fb->num_rts));
    for (i = 0; i < fb->num_rts; ++i) {
-      grate_stream_push_reloc(stream, ptrp, fb->rt_bos[i], 0);
+      grate_stream_push_reloc(stream, ptrp, fb->rt_bos[i], 0, true);
    }
 
    GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_DW_ST_ENABLE, 1));
@@ -824,7 +824,7 @@ emit_textures(struct grate_context *context, uint32_t **ptrp)
                TGR3D_TEX_TEXDESC_HI_HEIGHT(height);
 
       GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_TEX_TEXADDR(i), 1));
-      grate_stream_push_reloc(stream, ptrp, res->bo, 0);
+      grate_stream_push_reloc(stream, ptrp, res->bo, 0, false);
       GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_TEX_TEXDESC_LO(i), 2));
       GRATE_PUSHBUF_WORD(*ptrp, lo);
       GRATE_PUSHBUF_WORD(*ptrp, hi);

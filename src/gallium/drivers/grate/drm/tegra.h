@@ -30,6 +30,12 @@
 #include <stdlib.h>
 #include "drm-uapi/tegra_drm.h"
 
+/* drm_tegra_submit_buf flag: the job writes the buffer (kernel attaches its
+ * fence to the BO as a write fence). Newer than the bundled header. */
+#ifndef DRM_TEGRA_SUBMIT_BUF_WRITE
+#define DRM_TEGRA_SUBMIT_BUF_WRITE (1 << 1)
+#endif
+
 enum drm_tegra_class {
     DRM_TEGRA_HOST1X,
     DRM_TEGRA_GR2D,

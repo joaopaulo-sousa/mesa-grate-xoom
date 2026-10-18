@@ -73,6 +73,7 @@ grate_stream_create(struct grate_device *drm,
    stream->status    = GRATE_STREAM_FREE;
    stream->channel   = channel;
    stream->num_words = words_num;
+   util_dynarray_init(&stream->bos, NULL);
    
    ret = drm_tegra_syncpoint_new(stream->channel->drm, &stream->syncpt);
    if (ret < 0) {
@@ -81,6 +82,21 @@ grate_stream_create(struct grate_device *drm,
    }
 
    return ret;
+}
+
+/*
+ * Drop the BOs of the job just built; stamp them with its fence first if it
+ * was submitted.
+ */
+static void
+grate_stream_release_bos(struct grate_stream *stream, bool submitted)
+{
+   util_dynarray_foreach(&stream->bos, struct grate_bo *, bo) {
+      if (submitted)
+         (*bo)->fence[stream->slot] = stream->last_fence;
+      grate_bo_unref(*bo);
+   }
+   util_dynarray_clear(&stream->bos);
 }
 
 /*
@@ -96,6 +112,8 @@ grate_stream_destroy(struct grate_stream *stream)
       return;
 
    drm_tegra_job_free(stream->job);
+   grate_stream_release_bos(stream, false);
+   util_dynarray_fini(&stream->bos);
    drm_tegra_syncpoint_free(stream->syncpt);
 }
 
@@ -129,6 +147,7 @@ grate_stream_flush(struct grate_stream *stream, bool wait)
    result = drm_tegra_job_submit(stream->job, &stream->last_fence);
    if (result == 0)
       stream->fence_pending = true;
+   grate_stream_release_bos(stream, result == 0);
    if (result != 0) {
       grate_loge("drm_tegra_job_submit() failed %d\n", result);
       result = -1;
@@ -186,6 +205,20 @@ grate_stream_begin(struct grate_stream *stream, uint32_t **ptrp)
    if (ret != 0) {
       grate_loge("drm_tegra_job_new() failed %d\n", ret);
       return -1;
+   }
+
+   struct grate_stream *peer = stream->peer;
+   if (peer && peer->fence_pending &&
+       peer->last_fence.value != stream->peer_waited) {
+      struct drm_tegra_submit_cmd *cmd =
+         drm_tegra_job_add_command(stream->job, DRM_TEGRA_SUBMIT_CMD_WAIT_SYNCPT, 0);
+      if (!cmd) {
+         drm_tegra_job_free(stream->job);
+         return -1;
+      }
+      cmd->wait_syncpt.id = peer->last_fence.syncpt;
+      cmd->wait_syncpt.value = peer->last_fence.value;
+      stream->peer_waited = peer->last_fence.value;
    }
 
    ret = drm_tegra_job_get_pushbuf(stream->job, &stream->pushbuf);
@@ -257,7 +290,7 @@ __grate_stream_get_channel_mapping(struct grate_stream *stream,
 int
 grate_stream_push_reloc(struct grate_stream *stream, uint32_t **ptrp,
                         struct grate_bo *bo,
-                        unsigned offset)
+                        unsigned offset, bool write)
 {
    int ret;
    struct drm_tegra_mapping *mapping = NULL;
@@ -266,13 +299,15 @@ grate_stream_push_reloc(struct grate_stream *stream, uint32_t **ptrp,
    if (ret < 0)
       return ret;
 
-   ret = drm_tegra_pushbuf_relocate(stream->pushbuf, ptrp, mapping, 
-                                    offset, 0, 0);
+   ret = drm_tegra_pushbuf_relocate(stream->pushbuf, ptrp, mapping, offset, 0,
+                                    write ? DRM_TEGRA_SUBMIT_BUF_WRITE : 0);
    if (ret < 0) {
       stream->status = GRATE_STREAM_CONSTRUCTION_FAILED;
       grate_loge("drm_tegra_pushbuf_relocate() failed %d\n", ret);
       return ret;
    }
+
+   util_dynarray_append_typed(&stream->bos, struct grate_bo *, grate_bo_ref(bo));
 
    return ret;
 }

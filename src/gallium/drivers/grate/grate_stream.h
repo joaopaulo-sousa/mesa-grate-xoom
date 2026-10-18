@@ -31,6 +31,7 @@
 #include <stdint.h>
 
 #include "tegra.h"
+#include "util/u_dynarray.h"
 
 #define GRATE_PUSHBUF_WORD(ptr, value) *(ptr)++ = (value)
 
@@ -59,6 +60,26 @@ struct grate_stream {
     */
    struct drm_tegra_fence last_fence;
    bool fence_pending;
+
+   /* GRATE_STREAM_2D/3D: index into grate_bo.fence */
+   unsigned slot;
+
+   /*
+    * The other channel of the context. Its jobs run concurrently, so a job
+    * starts with a host1x wait for the last one the peer submitted (unless
+    * already waited for), which orders 2D clears/blits against draws.
+    */
+   struct grate_stream *peer;
+   uint32_t peer_waited;
+
+   /* BOs of the job under construction (referenced), stamped with its
+    * fence on submit */
+   struct util_dynarray bos;
+};
+
+enum {
+   GRATE_STREAM_2D,
+   GRATE_STREAM_3D,
 };
 
 int grate_stream_wait(struct grate_stream *stream);
@@ -90,7 +111,7 @@ grate_stream_flush(struct grate_stream *stream, bool wait);
 
 int
 grate_stream_push_reloc(struct grate_stream *stream, uint32_t **ptrp,
-                        struct grate_bo *bo, unsigned offset);
+                        struct grate_bo *bo, unsigned offset, bool write);
 
 int
 grate_stream_push_sync_cond(struct grate_stream *stream, uint32_t **ptrp,

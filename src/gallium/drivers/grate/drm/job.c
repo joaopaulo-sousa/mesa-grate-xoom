@@ -129,6 +129,28 @@ drm_tegra_job_get_pushbuf(struct drm_tegra_job *job,
     return 0;
 }
 
+static bool
+drm_tegra_job_has_buf_flags(struct drm_tegra_job *job)
+{
+    for (unsigned int i = 0; i < job->num_buffers; i++)
+        if (job->buffers[i].flags)
+            return true;
+
+    return false;
+}
+
+/* returns whether any flag was set */
+static bool
+drm_tegra_job_strip_buf_flags(struct drm_tegra_job *job)
+{
+    bool any = drm_tegra_job_has_buf_flags(job);
+
+    for (unsigned int i = 0; i < job->num_buffers; i++)
+        job->buffers[i].flags = 0;
+
+    return any;
+}
+
 int
 drm_tegra_job_submit(struct drm_tegra_job *job, struct drm_tegra_fence *fence)
 {
@@ -149,7 +171,25 @@ drm_tegra_job_submit(struct drm_tegra_job *job, struct drm_tegra_fence *fence)
     args.cmds_ptr = (uintptr_t)job->commands;
     args.gather_data_ptr = (uintptr_t)job->pushbuf->start;
 
+    /*
+     * DRM_TEGRA_SUBMIT_BUF_WRITE makes the kernel attach the job fence to the
+     * written BOs, so the display waits for the frame by itself. Kernels
+     * without it reject the flag: drop it and remember (the driver then
+     * waits for the GPU before handing buffers out, see grate_flush_resource).
+     */
+    if (drm->implicit_sync == 0)
+        drm_tegra_job_strip_buf_flags(job);
+
     err = ioctl(drm->fd, DRM_IOCTL_TEGRA_CHANNEL_SUBMIT, &args);
+    if (err < 0 && errno == EINVAL && drm->implicit_sync < 0 &&
+        drm_tegra_job_strip_buf_flags(job)) {
+        err = ioctl(drm->fd, DRM_IOCTL_TEGRA_CHANNEL_SUBMIT, &args);
+        if (err == 0)
+            drm->implicit_sync = 0;
+    } else if (err == 0 && drm->implicit_sync < 0 &&
+               drm_tegra_job_has_buf_flags(job)) {
+        drm->implicit_sync = 1;
+    }
     if (err < 0)
         return -errno;
 

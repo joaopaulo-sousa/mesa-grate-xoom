@@ -30,6 +30,8 @@
 #include <util/u_dynarray.h>
 #include <util/sparse_array.h>
 
+#include "tegra.h"
+
 struct grate_bo {
     struct grate_device *drm;
     uint32_t handle;
@@ -41,12 +43,17 @@ struct grate_bo {
     
     /* List of channel mappings where made for this BO, for cleanup */
     struct util_dynarray channel_maps;
+
+    /* Last job of each stream (GRATE_STREAM_2D/3D) that used this BO;
+     * drm is NULL once it is known to have completed */
+    struct drm_tegra_fence fence[2];
 };
 
 struct grate_device;
 
 struct grate_bo *grate_bo_alloc(struct grate_device *drm, uint32_t size, uint32_t flags);
 struct grate_bo *grate_bo_ref(struct grate_bo *bo);
+int grate_bo_wait(struct grate_bo *bo);
 void grate_bo_unref(struct grate_bo *bo);
 int grate_bo_get_handle(struct grate_bo *bo, uint32_t *handle);
 int grate_bo_map(struct grate_bo *bo, void **ptr);

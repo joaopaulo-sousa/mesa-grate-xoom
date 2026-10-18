@@ -365,7 +365,7 @@ grate_draw_vbo(struct pipe_context *pcontext,
 
       index_offset += draws->start * info->index_size;
       GRATE_PUSHBUF_WORD(ptr, host1x_opcode_incr(REG_TGR3D_IDX_INDEX_BASE, 1));
-      grate_stream_push_reloc(stream, &ptr, grate_resource(index_buffer)->bo, index_offset);
+      grate_stream_push_reloc(stream, &ptr, grate_resource(index_buffer)->bo, index_offset, false);
    } else
       offset = draws->start;
 

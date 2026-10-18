@@ -64,6 +64,12 @@ grate_context(struct pipe_context *context)
    return (struct grate_context *)context;
 }
 
+/* The last jobs of both channels at the time of a flush */
+struct pipe_fence_handle {
+   struct pipe_reference reference;
+   struct drm_tegra_fence fence[2];
+};
+
 void
 grate_context_flush_streams(struct grate_context *context);
 

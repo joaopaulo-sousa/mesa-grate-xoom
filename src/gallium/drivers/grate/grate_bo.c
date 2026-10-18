@@ -127,6 +127,31 @@ struct grate_bo *grate_bo_ref(struct grate_bo *bo)
     return bo;
 }
 
+/*
+ * Wait until the GPU is done with the BO: the jobs that used it are the
+ * fences stamped at submit time (grate_stream_flush).
+ */
+int grate_bo_wait(struct grate_bo *bo)
+{
+   int ret = 0;
+
+   for (unsigned i = 0; i < ARRAY_SIZE(bo->fence); i++) {
+      if (!bo->fence[i].drm)
+         continue;
+
+      int err = drm_tegra_fence_wait(&bo->fence[i], GRATE_JOB_TIMEOUT_NS);
+      if (err == 0)
+         bo->fence[i].drm = NULL;
+      else
+         ret = err;
+   }
+
+   if (ret)
+      fprintf(stderr, "grate: waiting for bo %u failed: %d\n", bo->handle, ret);
+
+   return ret;
+}
+
 void grate_bo_unref(struct grate_bo *bo)
 {
    if (!bo)
