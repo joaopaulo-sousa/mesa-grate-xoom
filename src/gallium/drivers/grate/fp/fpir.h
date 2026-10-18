@@ -153,6 +153,7 @@ struct fp_instr {
    struct list_head link;
    // TODO: PSEQ
    struct fp_sched mfu_sched;
+   uint32_t pseq;             /* PSEQ instruction word, 0: none */
    uint32_t tex;              /* TEX instruction word, 0: none */
    struct fp_sched alu_sched;
    struct fp_dw_instr dw;

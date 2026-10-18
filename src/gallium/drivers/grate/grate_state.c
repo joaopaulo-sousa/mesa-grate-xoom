@@ -248,7 +248,9 @@ grate_create_blend_state(struct pipe_context *pcontext,
 static void
 grate_bind_blend_state(struct pipe_context *pcontext, void *so)
 {
-   grate_unimplemented();
+   /* applied by the fragment program (grate_fs_update): Tegra20 has no
+    * blend unit */
+   grate_context(pcontext)->blend = so;
 }
 
 static void

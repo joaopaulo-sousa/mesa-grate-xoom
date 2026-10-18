@@ -8,6 +8,7 @@
 
 #include "tgsi/tgsi_parse.h"
 
+#include "util/blend.h"
 #include "util/u_memory.h"
 
 static struct fp_alu_src_operand
@@ -147,6 +148,9 @@ fp_alu_nop(void)
  * - A register written by ALU packet P can be read from packet P+2 on (the
  *   packets are counted across EXECs). Packet P+1 reads the result of slot s
  *   of packet P as "alu<s>" instead.
+ * - The PSEQ of EXEC k loads the render target pixel (the destination colour)
+ *   as fixed10 halves into a register pair of row k before that EXEC's ALU:
+ *   blending is done in the shader (Tegra20 has no blend unit).
  * - The TEX of EXEC k samples with the coordinates in a register pair of row
  *   k, r(4k)/r(4k+1) or r(4k+2)/r(4k+3), and writes the texel as four fixed10
  *   halves to the other pair, readable by the ALU from EXEC k on. Only
@@ -174,6 +178,7 @@ enum fp_opnd_kind {
    FP_OPND_VALUE,         /* result of a unit */
    FP_OPND_INPUT,         /* interpolated varying component */
    FP_OPND_TEXEL,         /* texture sample channel */
+   FP_OPND_DST,           /* destination colour channel (PSEQ load) */
    FP_OPND_ZERO,          /* fixed10 0 and 1 of r31, for fixed10 results */
    FP_OPND_ONE,
 };
@@ -219,6 +224,15 @@ struct fp_compiler {
    /* EXEC whose MFU fetches TGSI input i component c, and the reverse */
    int fetch_exec[FP_MAX_INPUTS][4];
    int exec_input[FP_MAX_EXECS][4];
+
+   /* blending: colour writes become outv[] values, combined with the
+    * destination (PSEQ load into a register pair of EXEC dst_exec) */
+   const struct grate_fp_key *key;
+   bool redirect_output;
+   struct fp_opnd outv[4];
+   bool outv_written[4];
+   bool dst_used;
+   int dst_exec, dst_pair;
 
    /* texture fetches: coordinates = TGSI input components 2*pair, +1 */
    struct {
@@ -373,11 +387,16 @@ fp_dst(struct fp_compiler *c, struct fp_unit *u,
 {
    switch (dst->File) {
    case TGSI_FILE_OUTPUT:
-      u->output_chan = chan;
       c->dw.enable = 1;
       c->dw.index = dst->Index;
       c->dw.stencil_write = 0;
       c->dw.src_regs = FP_DW_REGS_R2_R3;
+      if (c->redirect_output) {
+         c->outv[chan] = fp_opnd_value(c, u);
+         c->outv_written[chan] = true;
+         return false;
+      }
+      u->output_chan = chan;
       return true;
 
    case TGSI_FILE_TEMPORARY:
@@ -394,6 +413,36 @@ fp_dst(struct fp_compiler *c, struct fp_unit *u,
       c->failed = true;
       return false;
    }
+}
+
+/* Whether a destination is written to r2/r3 as fixed10 colour (not when the
+ * colour is blended: then it is a value like a temporary) */
+static bool
+fp_color_write(struct fp_compiler *c, const struct tgsi_dst_register *dst)
+{
+   return dst->File == TGSI_FILE_OUTPUT && !c->redirect_output;
+}
+
+/* A channel of a temporary or redirected output becomes an operand without
+ * code (plain copies); false if the destination can't take one */
+static bool
+fp_set_dst_opnd(struct fp_compiler *c, const struct tgsi_dst_register *dst,
+                int chan, struct fp_opnd o)
+{
+   if (dst->File == TGSI_FILE_TEMPORARY && dst->Index < FP_MAX_TEMPS) {
+      c->temps[dst->Index][chan] = o;
+      c->temp_written[dst->Index][chan] = true;
+      return true;
+   }
+   if (dst->File == TGSI_FILE_OUTPUT && c->redirect_output) {
+      c->dw.enable = 1;
+      c->dw.index = dst->Index;
+      c->dw.src_regs = FP_DW_REGS_R2_R3;
+      c->outv[chan] = o;
+      c->outv_written[chan] = true;
+      return true;
+   }
+   return false;
 }
 
 static void
@@ -415,7 +464,7 @@ emit_componentwise(struct fp_compiler *c,
    const struct tgsi_dst_register *dst = &inst->Dst[0].Register;
    unsigned opcode = inst->Instruction.Opcode;
    bool sat = inst->Instruction.Saturate != 0;
-   bool output = dst->File == TGSI_FILE_OUTPUT;
+   bool output = fp_color_write(c, dst);
    struct fp_opnd s[4][3];
 
    /* read every source before writing, the instruction may overwrite them */
@@ -432,12 +481,9 @@ emit_componentwise(struct fp_compiler *c,
 
       /* a plain copy into a temporary just renames the operand */
       if (opcode == TGSI_OPCODE_MOV && !sat && !output &&
-          dst->File == TGSI_FILE_TEMPORARY && dst->Index < FP_MAX_TEMPS &&
-          s[i][0].kind != FP_OPND_ZERO && s[i][0].kind != FP_OPND_ONE) {
-         c->temps[dst->Index][i] = s[i][0];
-         c->temp_written[dst->Index][i] = true;
+          s[i][0].kind != FP_OPND_ZERO && s[i][0].kind != FP_OPND_ONE &&
+          fp_set_dst_opnd(c, dst, i, s[i][0]))
          continue;
-      }
 
       struct fp_unit *u = fp_new_unit(c);
       struct fp_opnd one = fp_opnd_one(c, output);
@@ -483,7 +529,7 @@ emit_setcc(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
 {
    const struct tgsi_dst_register *dst = &inst->Dst[0].Register;
    unsigned opcode = inst->Instruction.Opcode;
-   bool output = dst->File == TGSI_FILE_OUTPUT;
+   bool output = fp_color_write(c, dst);
    struct fp_opnd s[4][2];
 
    for (int i = 0; i < 4; i++) {
@@ -538,7 +584,7 @@ emit_dot(struct fp_compiler *c, const struct tgsi_full_instruction *inst,
       s->accumulate_this = k == 0 && n == 4;
    }
 
-   if (dst->File != TGSI_FILE_OUTPUT) {
+   if (!fp_color_write(c, dst)) {
       u->saturate = inst->Instruction.Saturate != 0;
       for (int i = 0; i < 4; i++)
          if (dst->WriteMask & (1 << i))
@@ -597,13 +643,9 @@ emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
       if (!(dst->WriteMask & (1 << i)))
          continue;
       struct fp_opnd texel = { .kind = FP_OPND_TEXEL, .index = n, .comp = i };
-      if (dst->File == TGSI_FILE_TEMPORARY && !inst->Instruction.Saturate &&
-          dst->Index < FP_MAX_TEMPS) {
-         c->temps[dst->Index][i] = texel;
-         c->temp_written[dst->Index][i] = true;
+      if (!inst->Instruction.Saturate && fp_set_dst_opnd(c, dst, i, texel))
          continue;
-      }
-      bool output = dst->File == TGSI_FILE_OUTPUT;
+      bool output = fp_color_write(c, dst);
       struct fp_unit *m = fp_new_unit(c);
       m->saturate = inst->Instruction.Saturate != 0;
       fp_unit_op(&m->slots[0], FP_ALU_OP_MAD, texel, fp_opnd_one(c, output),
@@ -650,6 +692,120 @@ emit_tgsi_instr(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
    default:
       fprintf(stderr, "GRATE FRAG TGSI UNIMPLEMENTED: 0x%02x\n", inst->Instruction.Opcode);
       c->failed = true;
+   }
+}
+
+/* value unit op(a * b, c) */
+static struct fp_opnd
+fp_val(struct fp_compiler *c, enum fp_alu_op op, struct fp_opnd a,
+       struct fp_opnd b, struct fp_opnd cc)
+{
+   struct fp_unit *u = fp_new_unit(c);
+   fp_unit_op(&u->slots[0], op, a, b, cc);
+   return fp_opnd_value(c, u);
+}
+
+/*
+ * x * blend factor for channel ch; *zero when the term vanishes. s/d are the
+ * source and destination colour operands.
+ */
+static struct fp_opnd
+fp_blend_term(struct fp_compiler *c, struct fp_opnd x, enum pipe_blendfactor factor,
+              int ch, const struct fp_opnd *s, const struct fp_opnd *d, bool *zero)
+{
+   bool inv = util_blendfactor_is_inverted(factor);
+   struct fp_opnd y;
+
+   *zero = false;
+   switch (util_blendfactor_without_invert(factor)) {
+   case PIPE_BLENDFACTOR_ONE:
+      *zero = inv;               /* ZERO is the inverted ONE */
+      return x;
+   case PIPE_BLENDFACTOR_SRC_COLOR: y = s[ch]; break;
+   case PIPE_BLENDFACTOR_SRC_ALPHA: y = s[3]; break;
+   case PIPE_BLENDFACTOR_DST_COLOR: y = d[ch]; break;
+   case PIPE_BLENDFACTOR_DST_ALPHA: y = d[3]; break;
+   default:
+      /* constant colour, SRC1, SRC_ALPHA_SATURATE: not yet */
+      fprintf(stderr, "GRATE FRAG: blend factor %u unsupported, using ONE\n", factor);
+      return x;
+   }
+   /* x * (1 - y) = x - x * y */
+   if (inv)
+      return fp_val(c, FP_ALU_OP_MAD, x, fp_opnd_modify(y, true, false), x);
+   return fp_val(c, FP_ALU_OP_MAD, x, y, fp_opnd_zero(c, false));
+}
+
+/*
+ * Blending and the colour write mask in the shader: the destination colour
+ * comes from a PSEQ load, each channel is combined per the blend equation
+ * and written to r2/r3 as usual.
+ */
+static void
+emit_blend(struct fp_compiler *c)
+{
+   const struct grate_fp_key *key = c->key;
+   struct fp_opnd s[4], d[4];
+
+   for (int ch = 0; ch < 4; ch++) {
+      s[ch] = c->outv_written[ch] ? c->outv[ch] : fp_opnd_zero(c, false);
+      d[ch] = (struct fp_opnd) { .kind = FP_OPND_DST, .comp = ch };
+
+      /* blending sees the colour clamped to [0, 1] (unorm target); texels
+       * are, and an already saturated result too */
+      bool in_range = s[ch].kind == FP_OPND_TEXEL ||
+                      (s[ch].kind == FP_OPND_VALUE && !s[ch].negate &&
+                       c->units[s[ch].index].saturate);
+      if (key->blend && c->outv_written[ch] && !in_range) {
+         struct fp_unit *u = fp_new_unit(c);
+         u->saturate = true;
+         fp_unit_op(&u->slots[0], FP_ALU_OP_MAD, s[ch], fp_opnd_one(c, false),
+                    fp_opnd_zero(c, false));
+         s[ch] = fp_opnd_value(c, u);
+      }
+   }
+
+   for (int ch = 0; ch < 4; ch++) {
+      bool alpha = ch == 3;
+      unsigned func = alpha ? key->alpha_func : key->rgb_func;
+      unsigned sf = alpha ? key->alpha_src : key->rgb_src;
+      unsigned df = alpha ? key->alpha_dst : key->rgb_dst;
+      struct fp_opnd one = fp_opnd_one(c, true), zero = fp_opnd_zero(c, true);
+      struct fp_unit *u;
+
+      if (!(key->colormask & (1 << ch))) {
+         c->dst_used = true;
+         u = fp_new_unit(c);
+         fp_unit_op(&u->slots[0], FP_ALU_OP_MAD, d[ch], one, zero);
+      } else if (!key->blend) {
+         u = fp_new_unit(c);
+         u->saturate = true;
+         fp_unit_op(&u->slots[0], FP_ALU_OP_MAD, s[ch], one, zero);
+      } else if (func == PIPE_BLEND_MIN || func == PIPE_BLEND_MAX) {
+         c->dst_used = true;
+         u = fp_new_unit(c);
+         u->saturate = true;
+         fp_unit_op(&u->slots[0], func == PIPE_BLEND_MIN ? FP_ALU_OP_MIN :
+                    FP_ALU_OP_MAX, s[ch], one, d[ch]);
+      } else {
+         bool zs, zd;
+         c->dst_used = true;
+         struct fp_opnd ts = fp_blend_term(c, s[ch], sf, ch, s, d, &zs);
+         struct fp_opnd td = fp_blend_term(c, d[ch], df, ch, s, d, &zd);
+         struct fp_opnd a = zero, b = zero;
+         if (!zs)
+            a = ts;
+         if (!zd)
+            b = td;
+         if (func == PIPE_BLEND_SUBTRACT)
+            b = fp_opnd_modify(b, true, false);
+         else if (func == PIPE_BLEND_REVERSE_SUBTRACT)
+            a = fp_opnd_modify(a, true, false);
+         u = fp_new_unit(c);
+         u->saturate = true;
+         fp_unit_op(&u->slots[0], FP_ALU_OP_MAD, a, one, b);
+      }
+      u->output_chan = ch;
    }
 }
 
@@ -723,6 +879,19 @@ fp_assign_inputs(struct fp_compiler *c)
          c->fetch_exec[o->index][o->comp] = e;
       }
    }
+
+   /* the destination colour: a free register pair of the earliest EXEC */
+   if (c->dst_used) {
+      for (e = 0; e < FP_MAX_EXECS; e++)
+         for (int p = 0; p < 2; p++)
+            if (c->exec_input[e][2 * p] == -1 && c->exec_input[e][2 * p + 1] == -1) {
+               c->dst_exec = e;
+               c->dst_pair = p;
+               c->exec_input[e][2 * p] = c->exec_input[e][2 * p + 1] = -2;
+               return;
+            }
+      fp_fail(c, "no registers left for the destination colour");
+   }
 }
 
 /* fixed10 colour channel -> r2/r3 half, BGRA (also the texel layout) */
@@ -740,6 +909,8 @@ fp_opnd_exec(struct fp_compiler *c, const struct fp_opnd *o)
       return c->fetch_exec[o->index][o->comp];
    if (o->kind == FP_OPND_TEXEL)
       return c->tex[o->index].exec;
+   if (o->kind == FP_OPND_DST)
+      return c->dst_exec;
    return 0;
 }
 
@@ -749,6 +920,8 @@ fp_opnd_reg(struct fp_compiler *c, const struct fp_opnd *o)
 {
    if (o->kind == FP_OPND_INPUT)
       return 4 * c->fetch_exec[o->index][o->comp] + o->comp;
+   if (o->kind == FP_OPND_DST)
+      return 4 * c->dst_exec + 2 * c->dst_pair + fp_output_half(o->comp) / 2;
    assert(o->kind == FP_OPND_TEXEL);
    int base = c->tex[o->index].pair ? 0 : 2;
    return 4 * c->tex[o->index].exec + base + fp_output_half(o->comp) / 2;
@@ -767,7 +940,8 @@ fp_unit_ready(struct fp_compiler *c, int index, int packet, int exec)
             return false;
          if (!d->forward && d->packet == packet - 1)
             return false;
-      } else if (o->kind == FP_OPND_INPUT || o->kind == FP_OPND_TEXEL) {
+      } else if (o->kind == FP_OPND_INPUT || o->kind == FP_OPND_TEXEL ||
+                 o->kind == FP_OPND_DST) {
          if (fp_opnd_exec(c, o) > exec)
             return false;
       }
@@ -797,7 +971,8 @@ fp_unit_ready(struct fp_compiler *c, int index, int packet, int exec)
          /* an fp20 varying uses the whole register, a texel one half */
          if (o->kind == FP_OPND_INPUT && fp_opnd_reg(c, o) == reg)
             return false;
-         if (o->kind == FP_OPND_TEXEL && fp_opnd_reg(c, o) == reg &&
+         if ((o->kind == FP_OPND_TEXEL || o->kind == FP_OPND_DST) &&
+             fp_opnd_reg(c, o) == reg &&
              fp_output_half(o->comp) % 2 == half % 2)
             return false;
       }
@@ -985,7 +1160,7 @@ fp_alloc_regs(struct fp_compiler *c)
             int r = fp_opnd_reg(c, o);
             if (r != 2 && r != 3)
                busy_until[r] = MAX2(busy_until[r], u->packet);
-         } else if (o->kind == FP_OPND_TEXEL) {
+         } else if (o->kind == FP_OPND_TEXEL || o->kind == FP_OPND_DST) {
             int r = fp_opnd_reg(c, o);
             if (r != 2 && r != 3)
                busy_until[r] = MAX2(busy_until[r], u->packet);
@@ -1043,6 +1218,7 @@ fp_resolve(struct fp_compiler *c, const struct fp_opnd *o, int packet)
       ret = fp_alu_src_row(fp_opnd_reg(c, o));
       break;
    case FP_OPND_TEXEL:
+   case FP_OPND_DST:
       ret = fp_alu_src_row(fp_opnd_reg(c, o));
       ret.datatype = FP_DATATYPE_FIXED10;
       ret.sub_reg_select_high = fp_output_half(o->comp) % 2;
@@ -1143,6 +1319,12 @@ fp_emit(struct fp_compiler *c)
          list_addtail(&mfu->link, &fp->mfu_instructions);
       }
 
+      /* PSEQ load of the render target: OP LD (bit 23), surface (16..19),
+       * ARGS bit 3, bit 1 = into r2/r3 (measured, gpu/tools/asmtri) */
+      if (c->dst_used && c->dst_exec == e)
+         inst->pseq = 1u << 23 | (c->dw.index & 0xf) << 16 | 1 << 3 |
+                      c->dst_pair << 1;
+
       /* TEX word: sampler, coordinates r2/r3 (bit 4), texel to r2/r3 (bit 5),
        * enable (bit 10) */
       for (int n = 0; n < c->num_tex; n++) {
@@ -1236,9 +1418,13 @@ emit_tgsi_declaration(struct grate_fp_shader *fp, const struct tgsi_full_declara
 
 
 void
-grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
+grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
+                 const struct grate_fp_key *key)
 {
    struct fp_compiler *c = CALLOC_STRUCT(fp_compiler);
+
+   c->key = key;
+   c->redirect_output = key && (key->blend || (key->colormask & 0xf) != 0xf);
 
    list_inithead(&fp->fp_instructions);
    list_inithead(&fp->alu_instructions);
@@ -1279,6 +1465,9 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
       }
    }
 
+   if (c->redirect_output && !c->failed)
+      emit_blend(c);
+
    fp_dead_code(c);
    fp_assign_inputs(c);
 
@@ -1309,6 +1498,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi)
       memset(c->exec_input, -1, sizeof(c->exec_input));
       c->num_units = 0;
       c->num_tex = 0;
+      c->dst_used = false;
       for (int i = 0; i < 4; i++) {
          struct fp_unit *u = fp_new_unit(c);
          struct fp_opnd one = fp_opnd_one(c, true);

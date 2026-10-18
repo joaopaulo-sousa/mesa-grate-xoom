@@ -330,6 +330,9 @@ grate_draw_vbo(struct pipe_context *pcontext,
    if (!indirect && (!draws[0].count || !info->instance_count))
       return;
 
+   /* the fragment program variant for the bound blend state */
+   grate_fs_update(context);
+
    err = grate_stream_begin(stream, &ptr);
    if (err < 0) {
       grate_loge("grate_stream_begin() failed: %d\n", err);

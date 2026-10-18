@@ -165,39 +165,17 @@ grate_delete_vs_state(struct pipe_context *pcontext, void *so)
    FREE(so);
 }
 
-static void *
-grate_create_fs_state(struct pipe_context *pcontext,
-                      const struct pipe_shader_state *template)
+/* Compile a fragment program variant into its command stream */
+static void
+grate_fs_compile(enum drm_tegra_soc_id soc_id, const struct tgsi_token *tokens,
+                 const struct grate_fp_key *key, struct grate_fs_variant *v)
 {
-   grate_trace();
-   struct grate_context *context = grate_context(pcontext);
-   struct grate_fragment_shader_state *so = CALLOC_STRUCT(grate_fragment_shader_state);
-   enum drm_tegra_soc_id soc_id = context->drm->soc_id;
-
-   if (!so)
-      return NULL;
-
-   so->base = *template;
-
-   if (template->type == PIPE_SHADER_IR_NIR) {
-      so->base.tokens = nir_to_tgsi(template->ir.nir,
-                                    pcontext->screen);
-      so->base.type = PIPE_SHADER_IR_TGSI;
-   }
-
-
-   if (grate_debug & GRATE_DEBUG_TGSI) {
-      fprintf(stderr, "DEBUG: TGSI:\n");
-      tgsi_dump(so->base.tokens, 0);
-      fprintf(stderr, "\n");
-   }
-
    struct tgsi_parse_context parser;
-   unsigned ok = tgsi_parse_init(&parser, so->base.tokens);
+   unsigned ok = tgsi_parse_init(&parser, tokens);
    assert(ok == TGSI_PARSE_OK);
 
    struct grate_fp_shader fp;
-   grate_tgsi_to_fp(&fp, &parser);
+   grate_tgsi_to_fp(&fp, &parser, key);
 
    struct util_dynarray buf;
    util_dynarray_init(&buf, NULL);
@@ -242,7 +220,7 @@ grate_create_fs_state(struct pipe_context *pcontext,
 
    PUSH(host1x_opcode_nonincr(REG_TGR3D_PSEQ_INST_DATA, num_fp_instrs));
    list_for_each_entry(struct fp_instr, instr, &fp.fp_instructions, link)
-      PUSH(0x00000000);
+      PUSH(instr->pseq);
 
    PUSH(host1x_opcode_nonincr(REG_TGR3D_AT_REMAP_DATA, num_fp_instrs));
    list_for_each_entry(struct fp_instr, instr, &fp.fp_instructions, link)
@@ -300,21 +278,112 @@ grate_create_fs_state(struct pipe_context *pcontext,
 #undef PUSH
    util_dynarray_trim(&buf);
 
-   so->blob.num_commands = buf.size / sizeof(uint32_t);
-   so->blob.commands = buf.data;
-   so->info = fp.info;
+   v->blob.num_commands = buf.size / sizeof(uint32_t);
+   v->blob.commands = buf.data;
+   v->info = fp.info;
+   v->key = *key;
 
    /* machine code for gpu/tools/fpdis */
    if (grate_debug & GRATE_DEBUG_TGSI) {
-      fprintf(stderr, "FPBLOB %u", so->blob.num_commands);
-      for (unsigned i = 0; i < so->blob.num_commands; i++)
-         fprintf(stderr, " %08x", so->blob.commands[i]);
+      fprintf(stderr, "FPBLOB %u", v->blob.num_commands);
+      for (unsigned i = 0; i < v->blob.num_commands; i++)
+         fprintf(stderr, " %08x", v->blob.commands[i]);
       fprintf(stderr, "\n");
       for (int i = 0; i < GRATE_FP_NUM_CONSTS; i++)
          if (fp.info.imm_mask & (1u << i))
             fprintf(stderr, "FPCONST %d %05x\n", i, fp.info.consts[i]);
    }
+}
+
+static const struct grate_fp_key grate_fp_key_none = { .colormask = 0xf };
+
+static void *
+grate_create_fs_state(struct pipe_context *pcontext,
+                      const struct pipe_shader_state *template)
+{
+   grate_trace();
+   struct grate_context *context = grate_context(pcontext);
+   struct grate_fragment_shader_state *so = CALLOC_STRUCT(grate_fragment_shader_state);
+
+   if (!so)
+      return NULL;
+
+   so->base = *template;
+
+   /* variants are compiled later, from our own copy of the tokens */
+   if (template->type == PIPE_SHADER_IR_NIR) {
+      so->base.tokens = nir_to_tgsi(template->ir.nir, pcontext->screen);
+      so->base.type = PIPE_SHADER_IR_TGSI;
+   } else
+      so->base.tokens = tgsi_dup_tokens(template->tokens);
+
+   if (grate_debug & GRATE_DEBUG_TGSI) {
+      fprintf(stderr, "DEBUG: TGSI:\n");
+      tgsi_dump(so->base.tokens, 0);
+      fprintf(stderr, "\n");
+   }
+
+   /* the opaque variant, used without blending */
+   grate_fs_compile(context->drm->soc_id, so->base.tokens, &grate_fp_key_none,
+                    &so->variants[0]);
+   so->num_variants = 1;
+   so->blob = so->variants[0].blob;
+   so->info = so->variants[0].info;
    return so;
+}
+
+/* Variant key of the bound blend state (render target 0) */
+static struct grate_fp_key
+grate_fs_key(struct grate_context *context)
+{
+   const struct pipe_blend_state *blend = context->blend;
+   struct grate_fp_key key = grate_fp_key_none;
+
+   if (!blend)
+      return key;
+
+   const struct pipe_rt_blend_state *rt = &blend->rt[0];
+   key.colormask = rt->colormask & 0xf;
+   if (rt->blend_enable) {
+      key.blend = 1;
+      key.rgb_func = rt->rgb_func;
+      key.rgb_src = rt->rgb_src_factor;
+      key.rgb_dst = rt->rgb_dst_factor;
+      key.alpha_func = rt->alpha_func;
+      key.alpha_src = rt->alpha_src_factor;
+      key.alpha_dst = rt->alpha_dst_factor;
+   }
+   return key;
+}
+
+void
+grate_fs_update(struct grate_context *context)
+{
+   struct grate_fragment_shader_state *so = context->fshader;
+   struct grate_fp_key key = grate_fs_key(context);
+   unsigned i;
+
+   if (!so)
+      return;
+
+   for (i = 0; i < so->num_variants; i++)
+      if (!memcmp(&so->variants[i].key, &key, sizeof(key)))
+         break;
+
+   if (i == so->num_variants) {
+      if (so->num_variants < GRATE_FS_MAX_VARIANTS) {
+         i = so->num_variants++;
+      } else {
+         /* replace one, never the opaque variant 0 */
+         i = 1 + so->next_evict++ % (GRATE_FS_MAX_VARIANTS - 1);
+         FREE(so->variants[i].blob.commands);
+      }
+      grate_fs_compile(context->drm->soc_id, so->base.tokens, &key,
+                       &so->variants[i]);
+   }
+
+   so->blob = so->variants[i].blob;
+   so->info = so->variants[i].info;
 }
 
 static void
@@ -325,9 +394,14 @@ grate_bind_fs_state(struct pipe_context *pcontext, void *so)
 }
 
 static void
-grate_delete_fs_state(struct pipe_context *pcontext, void *so)
+grate_delete_fs_state(struct pipe_context *pcontext, void *hwcso)
 {
+   struct grate_fragment_shader_state *so = hwcso;
+
    grate_trace();
+   for (unsigned i = 0; i < so->num_variants; i++)
+      FREE(so->variants[i].blob.commands);
+   FREE((void *)so->base.tokens);
    FREE(so);
 }
 

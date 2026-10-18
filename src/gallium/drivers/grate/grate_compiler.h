@@ -62,7 +62,19 @@ struct grate_fp_shader {
 void
 grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi);
 
+/*
+ * Fragment program variant: blending and the colour write mask are done by
+ * the program (PSEQ loads the destination). Zeroed + colormask 0xf = none.
+ */
+struct grate_fp_key {
+   uint8_t blend;
+   uint8_t rgb_func, rgb_src, rgb_dst;       /* PIPE_BLEND_*, PIPE_BLENDFACTOR_* */
+   uint8_t alpha_func, alpha_src, alpha_dst;
+   uint8_t colormask;                        /* PIPE_MASK_R.. bits */
+};
+
 void
-grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi);
+grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
+                 const struct grate_fp_key *key);
 
 #endif
