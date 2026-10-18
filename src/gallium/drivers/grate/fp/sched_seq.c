@@ -119,14 +119,15 @@ seq_opnd_is(const struct fp_opnd *o, enum seq_item_kind kind, int a, int b)
 }
 
 /* Whether an item is still read in EXEC e or later (or not yet scheduled);
- * "except": a unit not to count */
+ * "except": a unit not to count, -2: no colour write counts */
 static bool
 seq_item_needed(struct fp_compiler *c, enum seq_item_kind kind, int a, int b,
                 int e, int except)
 {
    for (int i = 0; i < c->num_units; i++) {
       struct fp_unit *u = &c->units[i];
-      if (!u->live || i == except || (u->exec >= 0 && u->exec < e))
+      if (!u->live || i == except || (u->exec >= 0 && u->exec < e) ||
+          (except == -2 && u->output_chan >= 0))
          continue;
       fp_unit_foreach_src(u, k, j)
          if (seq_opnd_is(&u->slots[k].src[j], kind, a, b))
@@ -191,7 +192,7 @@ seq_live_items(struct fp_compiler *c, const struct seq_owner *owner, int e)
       n += !seq_fixed_free(c, &owner[r], e + 1);
    for (int i = 0; i < c->num_units; i++) {
       struct fp_unit *u = &c->units[i];
-      if (u->live && u->exec >= 0 && u->output_chan < 0 &&
+      if (u->live && u->exec >= 0 && fp_unit_has_value(u) &&
           seq_item_needed(c, SEQ_VALUE, i, 0, e + 1, -1))
          n++;
    }
@@ -203,7 +204,7 @@ static int
 seq_unit_delta(struct fp_compiler *c, int i, int e)
 {
    struct fp_unit *u = &c->units[i];
-   int delta = u->output_chan < 0 ? 1 : 0;
+   int delta = fp_unit_has_value(u) ? 1 : 0;
 
    fp_unit_foreach_src(u, k, j) {
       struct fp_opnd *o = &u->slots[k].src[j];
@@ -271,6 +272,16 @@ seq_fetch_inputs(struct fp_compiler *c, struct seq_state *s,
          struct fp_unit *u = &c->units[i];
          if (!u->live || u->exec >= 0 || !seq_others_ready(c, s, u, e, FP_OPND_INPUT))
             continue;
+         /* colour writes wait for the rest (seq_unit_ready): their
+          * varyings would only take registers meanwhile */
+         if (u->output_chan >= 0 && !c->redirect_output) {
+            bool pending = false;
+            for (int r = 0; r < c->num_units; r++)
+               pending |= c->units[r].live && c->units[r].output_chan < 0 &&
+                          c->units[r].exec < 0;
+            if (pending)
+               continue;
+         }
          fp_unit_foreach_src(u, k, j)
             ops[n++] = &u->slots[k].src[j];
       } else {
@@ -337,7 +348,9 @@ seq_unit_ready(struct fp_compiler *c, struct seq_state *s,
          return false;
       break;
    default:
-      if (seq_item_needed(c, owner[reg].kind, owner[reg].a, owner[reg].b, e + 1, -1))
+      /* other colour writes go in this EXEC too (they are ready together)
+       * and read the register before the writes take effect */
+      if (seq_item_needed(c, owner[reg].kind, owner[reg].a, owner[reg].b, e + 1, -2))
          return false;
    }
    if (c->dst_used && s->dst_exec < 0)
@@ -880,7 +893,7 @@ seq_emit_unit(struct fp_compiler *c, struct fp_unit *u,
          a->dst.write_low_sub_reg = (o % 2) == 0;
          a->dst.write_high_sub_reg = (o % 2) != 0;
       } else {
-         a->dst.index = u->reg >= 0 ? u->reg : 31;
+         a->dst.index = u->kill ? FP_KILL_REG : u->reg >= 0 ? u->reg : 31;
          a->dst.write_low_sub_reg = true;
          a->dst.write_high_sub_reg = true;
       }

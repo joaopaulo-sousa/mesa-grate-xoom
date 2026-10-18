@@ -712,6 +712,38 @@ fp_fold_sfu_copies(struct fp_compiler *c)
    }
 }
 
+/*
+ * Discard: a non-zero write to the kill register kills the fragment (zero
+ * leaves it alone). KILL_IF kills when any component is negative, one CMP
+ * per distinct component.
+ */
+static void
+emit_kill(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
+{
+   struct fp_opnd one = fp_opnd_one(c, false), zero = fp_opnd_zero(c, false);
+
+   if (inst->Instruction.Opcode == TGSI_OPCODE_KILL) {
+      struct fp_unit *u = fp_new_unit(c);
+      u->kill = true;
+      fp_unit_op(&u->slots[0], FP_ALU_OP_MAD, one, one, zero);
+      return;
+   }
+
+   struct fp_opnd x[4];
+   for (int i = 0; i < 4; i++) {
+      x[i] = fp_src(c, &inst->Src[0].Register, i);
+      bool dup = false;
+      for (int k = 0; k < i; k++)
+         dup |= !memcmp(&x[k], &x[i], sizeof(x[i]));
+      if (dup)
+         continue;
+      /* x < 0 ? 1 : 0 */
+      struct fp_unit *u = fp_new_unit(c);
+      u->kill = true;
+      fp_unit_op(&u->slots[0], FP_ALU_OP_CSEL, x[i], one, zero);
+   }
+}
+
 static void
 emit_tgsi_instr(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
 {
@@ -751,6 +783,11 @@ emit_tgsi_instr(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
    case TGSI_OPCODE_FLR:
    case TGSI_OPCODE_POW:
       emit_sfu(c, inst);
+      break;
+
+   case TGSI_OPCODE_KILL:
+   case TGSI_OPCODE_KILL_IF:
+      emit_kill(c, inst);
       break;
 
    case TGSI_OPCODE_SLT:
@@ -970,7 +1007,7 @@ fp_cse(struct fp_compiler *c)
          if (o->kind == FP_OPND_VALUE)
             o->index = remap[o->index];
       }
-      if (u->output_chan >= 0 || u->num_slots != 1 || u->sfu || u->sfu_copy)
+      if (!fp_unit_has_value(u) || u->num_slots != 1 || u->sfu || u->sfu_copy)
          continue;
       for (int p = 0; p < i; p++) {
          struct fp_unit *q = &c->units[p];
@@ -1002,7 +1039,7 @@ fp_dead_code(struct fp_compiler *c)
 {
    for (int i = c->num_units - 1; i >= 0; i--) {
       struct fp_unit *u = &c->units[i];
-      if (u->output_chan >= 0)
+      if (u->output_chan >= 0 || u->kill)
          u->live = true;
       if (!u->live)
          continue;

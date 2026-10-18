@@ -30,6 +30,7 @@
 #define FP_MAX_TEXTURES 4
 
 #define FP_ALU_RESULT_REG(s) (24 + (s))
+#define FP_KILL_REG 76           /* non-zero written discards the fragment */
 
 enum fp_opnd_kind {
    FP_OPND_UNIFORM = 0,   /* ALU uniform register (constants, immediates) */
@@ -61,6 +62,7 @@ struct fp_unit {
    struct fp_unit_slot slots[4];
    enum fp_sfu_op sfu;     /* SFU unit: op on slots[0].src[0], in place */
    bool sfu_copy;          /* MOV giving an SFU operand a register of its own */
+   bool kill;              /* writes the kill register: no value, always live */
    bool saturate;
    int output_chan;        /* colour channel written, or -1: defines a value */
    bool forward;           /* the next packet may read the result as aluN */
@@ -129,6 +131,13 @@ struct fp_compiler {
 #define fp_unit_foreach_src(u, k, j) \
    for (int k = 0; k < MAX2((u)->num_slots, 1); k++) \
       for (int j = 0; j < ((u)->num_slots ? 3 : 1); j++)
+
+/* Whether a unit defines a value (not a colour write or a discard) */
+static inline bool
+fp_unit_has_value(const struct fp_unit *u)
+{
+   return u->output_chan < 0 && !u->kill;
+}
 
 /* fixed10 colour channel -> r2/r3 half, BGRA (also the texel and the
  * destination colour layout) */

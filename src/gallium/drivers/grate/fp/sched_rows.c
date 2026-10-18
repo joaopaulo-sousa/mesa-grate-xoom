@@ -209,7 +209,7 @@ static int
 fp_unit_pressure(struct fp_compiler *c, struct fp_unit *u, const int *uses_left)
 {
    int vals[12], n = fp_unit_values(c, u, vals);
-   int delta = u->output_chan < 0 ? 1 : 0;
+   int delta = fp_unit_has_value(u) ? 1 : 0;
 
    for (int i = 0; i < n; i++)
       delta -= uses_left[vals[i]] == 1;
@@ -469,7 +469,7 @@ fp_emit_unit(struct fp_compiler *c, struct fp_unit *u,
          a->dst.write_high_sub_reg = (o % 2) != 0;
       } else {
          /* fp20 value: both halves; only forwarded ones go to r31 */
-         a->dst.index = u->reg >= 0 ? u->reg : 31;
+         a->dst.index = u->kill ? FP_KILL_REG : u->reg >= 0 ? u->reg : 31;
          a->dst.write_low_sub_reg = true;
          a->dst.write_high_sub_reg = true;
       }
