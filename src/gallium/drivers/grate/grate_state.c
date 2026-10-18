@@ -740,7 +740,22 @@ emit_program(struct grate_context *context, uint32_t **ptrp)
    linker_insts[2] = host1x_opcode_incr(REG_TGR3D_SU_INST_EVEN(0), info->num_inputs * 2);
 
    for (int i = 0; i < info->num_inputs; ++i) {
-      linker_insts[3 + i * 2] = info->inputs[i].src;
+      /*
+       * Source: the VS output with the same semantic, numbered among the
+       * enabled outputs (the hardware squeezes the export mask: exports
+       * 2, 7, 9 are seen as 0, 1, 2). Bits 9..14: the TRAM row written,
+       * which the fragment MFU reads (it was always row 0, so a second
+       * varying overwrote the first).
+       */
+      uint32_t src = info->inputs[i].src;
+      for (int o = 0; context->vshader && o < 16; o++)
+         if (context->vshader->output_semantic[o] == info->inputs[i].semantic) {
+            unsigned squeezed = util_bitcount(context->vshader->output_mask &
+                                              BITFIELD_MASK(o));
+            src = squeezed << 3;
+         }
+      src |= (uint32_t)info->inputs[i].tram_row << 9;
+      linker_insts[3 + i * 2] = src;
       linker_insts[3 + i * 2 + 1] = info->inputs[i].dst;
    }
 

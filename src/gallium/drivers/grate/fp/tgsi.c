@@ -327,7 +327,9 @@ fp_src(struct fp_compiler *c, const struct tgsi_src_register *src, int chan)
       o.kind = FP_OPND_INPUT;
       o.index = src->Index;
       o.comp = comp;
-      fp->info.max_tram_row = MAX2(fp->info.max_tram_row, src->Index);
+      /* rows stored per triangle: index + 1 (only one row was kept with two
+       * varyings, the second read garbage) */
+      fp->info.max_tram_row = MAX2(fp->info.max_tram_row, src->Index + 1);
       break;
 
    case TGSI_FILE_IMMEDIATE: {
@@ -1203,13 +1205,18 @@ emit_tgsi_input(struct grate_fp_shader *fp, const struct tgsi_full_declaration *
    grate_trace();
    assert(decl->Range.First == decl->Range.Last);
 
-   uint32_t src = LINK_SRC(1);
    uint32_t dst = 0;
    for (int i = 0; i < 4; ++i)
       dst |= LINK_DST(i, i, LINK_DST_FP20);
 
-   fp->info.inputs[fp->info.num_inputs].src = src;
+   /* the source VS export is chosen at draw time by semantic: it used to be
+    * export 1 for every input, so a second varying read the first one */
+   fp->info.inputs[fp->info.num_inputs].src = LINK_SRC(1);
    fp->info.inputs[fp->info.num_inputs].dst = dst;
+   fp->info.max_tram_row = MAX2(fp->info.max_tram_row, (int)decl->Range.First + 1);
+   fp->info.inputs[fp->info.num_inputs].tram_row = decl->Range.First;
+   fp->info.inputs[fp->info.num_inputs].semantic =
+      GRATE_SEMANTIC(decl->Semantic.Name, decl->Semantic.Index);
 
    if (decl->Declaration.Semantic == TGSI_SEMANTIC_COLOR)
       fp->info.color_input = decl->Range.First;

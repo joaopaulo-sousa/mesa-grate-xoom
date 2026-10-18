@@ -332,10 +332,21 @@ grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi)
    list_inithead(&vp->instructions);
    vp->output_mask = 0;
    vp->num_immediates = 0;
+   memset(vp->output_semantic, 0xff, sizeof(vp->output_semantic));
 
    while (!tgsi_parse_end_of_tokens(tgsi)) {
       tgsi_parse_token(tgsi);
       switch (tgsi->FullToken.Token.Type) {
+      case TGSI_TOKEN_TYPE_DECLARATION: {
+         const struct tgsi_full_declaration *decl = &tgsi->FullToken.FullDeclaration;
+         if (decl->Declaration.File != TGSI_FILE_OUTPUT)
+            break;
+         for (unsigned i = decl->Range.First; i <= decl->Range.Last && i < 16; i++)
+            vp->output_semantic[i] =
+               GRATE_SEMANTIC(decl->Semantic.Name,
+                              decl->Semantic.Index + i - decl->Range.First);
+         break;
+      }
       case TGSI_TOKEN_TYPE_IMMEDIATE: {
          const struct tgsi_full_immediate *imm = &tgsi->FullToken.FullImmediate;
          unsigned n = MIN2(imm->Immediate.NrTokens - 1, 4);

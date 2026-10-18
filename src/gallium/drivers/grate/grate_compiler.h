@@ -12,9 +12,14 @@ struct tgsi_parse_context;
 #define GRATE_VP_NUM_CONSTS 256
 #define GRATE_VP_MAX_IMMEDIATES 32
 
+/* TGSI semantic of a shader input/output, for linking VS outputs to FS
+ * inputs: name << 8 | index */
+#define GRATE_SEMANTIC(name, index) ((name) << 8 | (index))
+
 struct grate_vp_shader {
    struct list_head instructions;
    uint16_t output_mask;
+   uint16_t output_semantic[16];
    float immediates[GRATE_VP_MAX_IMMEDIATES][4];
    int num_immediates;
 };
@@ -25,8 +30,10 @@ struct grate_vp_shader {
 
 struct grate_fp_info {
    struct {
-      uint32_t src;
+      uint32_t src;       /* filled in at draw time from the VS outputs */
       uint32_t dst;
+      uint16_t semantic;
+      uint8_t tram_row;   /* TRAM row = TGSI input index, read by the MFU */
    } inputs[16];
    int num_inputs;
    int color_input;
