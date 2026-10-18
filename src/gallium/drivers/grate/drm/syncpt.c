@@ -1,3 +1,4 @@
+#include <time.h>
 /*
  * Copyright © 2021 NVIDIA Corporation
  *
@@ -87,10 +88,15 @@ drm_tegra_fence_wait(struct drm_tegra_fence *fence, unsigned long timeout)
 {
     struct drm_tegra_syncpoint_wait args;
     struct grate_device *drm = fence->drm;
+    struct timespec ts;
     int err;
 
+    /* timeout_ns is an absolute CLOCK_MONOTONIC deadline: 0 never waited
+     * and returned -EAGAIN whenever the GPU was still busy */
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+
     memset(&args, 0, sizeof(args));
-    args.timeout_ns = 0;
+    args.timeout_ns = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec + timeout;
     args.id = fence->syncpt;
     args.threshold = fence->value;
 

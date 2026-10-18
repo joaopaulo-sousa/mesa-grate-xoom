@@ -1,3 +1,4 @@
+#include <stdlib.h>
 #include <stdio.h>
 
 #include "util/format/u_format.h"
@@ -279,7 +280,14 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
           !(template->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET)))
          height = util_next_power_of_two(height);
 
-      flags = DRM_TEGRA_GEM_CREATE_BOTTOM_UP;
+      /*
+       * No DRM_TEGRA_GEM_CREATE_BOTTOM_UP: it makes the display controller
+       * scan the buffer out bottom up, but the frontend already flips window
+       * surfaces in the viewport, so with it a KMS client (mpv, RetroArch)
+       * was upside down on the panel. EXPERIMENT: GRATE_BOTTOM_UP=1.
+       */
+      if (getenv("GRATE_BOTTOM_UP"))
+         flags = DRM_TEGRA_GEM_CREATE_BOTTOM_UP;
    }
 
    if (template->target != PIPE_BUFFER) {

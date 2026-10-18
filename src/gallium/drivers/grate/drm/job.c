@@ -176,7 +176,7 @@ drm_tegra_job_wait(struct drm_tegra_job *job, unsigned long timeout)
     clock_gettime(CLOCK_MONOTONIC, &ts);
 
     memset(&args, 0, sizeof(args));
-    args.timeout_ns = ts.tv_sec * 1000000000 + ts.tv_nsec + timeout;
+    args.timeout_ns = (uint64_t)ts.tv_sec * 1000000000ull + ts.tv_nsec + timeout;
     args.id = job->syncpt.id;
     args.threshold = job->syncpt.fence;
 
