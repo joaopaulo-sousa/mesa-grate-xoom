@@ -93,6 +93,7 @@ struct grate_fp_info {
    uint32_t sampler_mask;   /* samplers read */
    struct grate_fp_pre pre[GRATE_FP_MAX_PRE];
    int num_pre;
+   bool failed;             /* did not fit: the program draws magenta */
 };
 
 uint32_t

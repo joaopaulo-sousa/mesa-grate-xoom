@@ -354,6 +354,10 @@ fp_unit_op(struct fp_unit_slot *s, enum fp_alu_op op, struct fp_opnd a,
 }
 
 /* Component-wise instruction: one unit per written channel */
+static struct fp_opnd
+fp_val(struct fp_compiler *c, enum fp_alu_op op, struct fp_opnd a,
+       struct fp_opnd b, struct fp_opnd cc);
+
 static void
 emit_componentwise(struct fp_compiler *c,
                    const struct tgsi_full_instruction *inst)
@@ -382,6 +386,16 @@ emit_componentwise(struct fp_compiler *c,
           fp_set_dst_opnd(c, dst, i, s[i][0]))
          continue;
 
+      /* LRP: dst = src0 * src1 + (1 - src0) * src2
+       *         = src0 * (src1 - src2) + src2; the difference first, the
+       * units stay in topological order */
+      struct fp_opnd lrp = { 0 };
+      if (opcode == TGSI_OPCODE_LRP) {
+         struct fp_opnd neg2 = s[i][2];
+         neg2.negate = !neg2.negate;
+         lrp = fp_val(c, FP_ALU_OP_MAD, s[i][1], fp_opnd_one(c, false), neg2);
+      }
+
       struct fp_unit *u = fp_new_unit(c);
       struct fp_opnd one = fp_opnd_one(c, output);
       struct fp_opnd zero = fp_opnd_zero(c, output);
@@ -409,6 +423,9 @@ emit_componentwise(struct fp_compiler *c,
       case TGSI_OPCODE_CMP:
          /* dst = src0 < 0 ? src1 : src2 */
          fp_unit_op(&u->slots[0], FP_ALU_OP_CSEL, s[i][0], s[i][1], s[i][2]);
+         break;
+      case TGSI_OPCODE_LRP:
+         fp_unit_op(&u->slots[0], FP_ALU_OP_MAD, s[i][0], lrp, s[i][2]);
          break;
       default:
          UNREACHABLE("not a component-wise opcode");
@@ -783,6 +800,7 @@ emit_tgsi_instr(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
    case TGSI_OPCODE_MIN:
    case TGSI_OPCODE_MAX:
    case TGSI_OPCODE_CMP:
+   case TGSI_OPCODE_LRP:
       emit_componentwise(c, inst);
       break;
 
@@ -1294,5 +1312,6 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
       fp_emit_rows(c);
    fp_build_links(c);
    fp->info.num_rows = c->seq ? 1 : c->num_execs;
+   fp->info.failed = c->failed;
    FREE(c);
 }

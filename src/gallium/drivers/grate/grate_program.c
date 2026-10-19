@@ -177,6 +177,17 @@ grate_fs_compile(enum drm_tegra_soc_id soc_id, const struct tgsi_token *tokens,
    struct grate_fp_shader fp;
    grate_tgsi_to_fp(&fp, &parser, key);
 
+   /* say which shader draws magenta, to have something to work from */
+   if (fp.info.failed) {
+      fprintf(stderr, "GRATE FRAG: failed shader (blend %d: rgb %d %d %d, "
+              "alpha %d %d %d, colormask 0x%x):\n",
+              key ? key->blend : 0, key ? key->rgb_func : 0,
+              key ? key->rgb_src : 0, key ? key->rgb_dst : 0,
+              key ? key->alpha_func : 0, key ? key->alpha_src : 0,
+              key ? key->alpha_dst : 0, key ? key->colormask : 0xf);
+      tgsi_dump_to_file(tokens, 0, stderr);
+   }
+
    struct util_dynarray buf;
    util_dynarray_init(&buf, NULL);
 
