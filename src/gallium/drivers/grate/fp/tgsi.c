@@ -64,8 +64,9 @@ grate_float_to_fp20(float f)
 
 /* Allocate (or reuse) an ALU uniform register holding an fp20 immediate */
 static int
-fp_const_slot(struct grate_fp_shader *fp, float value)
+fp_const_slot(struct fp_compiler *c, float value)
 {
+   struct grate_fp_shader *fp = c->fp;
    uint32_t fp20 = grate_float_to_fp20(value);
    int i;
 
@@ -76,7 +77,10 @@ fp_const_slot(struct grate_fp_shader *fp, float value)
    for (i = GRATE_FP_NUM_CONSTS - 1; i >= 0; i--)
       if (!(fp->info.used_mask & (1u << i)))
          break;
-   assert(i >= 0);
+   if (i < 0) {
+      fp_fail(c, "too many uniforms");
+      return 0;
+   }
 
    fp->info.consts[i] = fp20;
    fp->info.imm_mask |= 1u << i;
@@ -84,16 +88,26 @@ fp_const_slot(struct grate_fp_shader *fp, float value)
    return i;
 }
 
-/* ALU uniform register of a user uniform component */
+/* ALU uniform register of a user uniform component: the components read
+ * get one each, in order of first use */
 static int
-fp_uniform_slot(struct grate_fp_shader *fp, int index, int comp)
+fp_uniform_slot(struct fp_compiler *c, int index, int comp)
 {
-   int slot = index * 4 + comp;
+   struct grate_fp_info *info = &c->fp->info;
+   int user = index * 4 + comp;
 
-   assert(slot < GRATE_FP_NUM_CONSTS);
-   assert(!(fp->info.imm_mask & (1u << slot)));
-   fp->info.used_mask |= 1u << slot;
-   return slot;
+   for (int i = 0; i < GRATE_FP_NUM_CONSTS; i++)
+      if ((info->user_mask & (1u << i)) && info->user_index[i] == user)
+         return i;
+   for (int i = 0; i < GRATE_FP_NUM_CONSTS; i++)
+      if (!(info->used_mask & (1u << i))) {
+         info->user_index[i] = user;
+         info->user_mask |= 1u << i;
+         info->used_mask |= 1u << i;
+         return i;
+      }
+   fp_fail(c, "too many uniforms");
+   return 0;
 }
 
 struct fp_alu_src_operand
@@ -195,7 +209,7 @@ fp_opnd_zero(struct fp_compiler *c, bool output)
       struct fp_opnd o = { .kind = FP_OPND_ZERO };
       return o;
    }
-   return fp_opnd_uniform(fp_const_slot(c->fp, 0.0f));
+   return fp_opnd_uniform(fp_const_slot(c, 0.0f));
 }
 
 struct fp_opnd
@@ -205,7 +219,7 @@ fp_opnd_one(struct fp_compiler *c, bool output)
       struct fp_opnd o = { .kind = FP_OPND_ONE };
       return o;
    }
-   return fp_opnd_uniform(fp_const_slot(c->fp, 1.0f));
+   return fp_opnd_uniform(fp_const_slot(c, 1.0f));
 }
 
 static struct fp_opnd
@@ -236,11 +250,11 @@ fp_src(struct fp_compiler *c, const struct tgsi_src_register *src, int chan)
          value = fabsf(value);
       if (src->Negate)
          value = -value;
-      return fp_opnd_uniform(fp_const_slot(fp, value));
+      return fp_opnd_uniform(fp_const_slot(c, value));
    }
 
    case TGSI_FILE_CONSTANT:
-      o = fp_opnd_uniform(fp_uniform_slot(fp, src->Index, comp));
+      o = fp_opnd_uniform(fp_uniform_slot(c, src->Index, comp));
       break;
 
    case TGSI_FILE_TEMPORARY:
@@ -1194,6 +1208,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    fp->info.max_tram_row = 1;
    fp->info.used_mask = 0;
    fp->info.imm_mask = 0;
+   fp->info.user_mask = 0;
    fp->info.sampler_mask = 0;
    fp->info.num_pre = 0;
    fp->num_immediates = 0;

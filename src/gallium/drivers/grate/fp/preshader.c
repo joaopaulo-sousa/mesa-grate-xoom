@@ -54,7 +54,7 @@ fp_pre_opnd(struct fp_compiler *c, const struct fp_opnd *o, const int *pre_of,
          p->value = fp20_to_float(info->consts[o->index]);
       } else {
          p->kind = GRATE_FP_PRE_USER;
-         p->index = o->index;
+         p->index = info->user_index[o->index];
       }
       return true;
    case FP_OPND_VALUE:

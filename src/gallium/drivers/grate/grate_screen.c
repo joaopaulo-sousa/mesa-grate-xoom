@@ -347,8 +347,9 @@ grate_screen_init_shader_caps(struct grate_screen *screen)
    caps->max_tex_indirections = 128;
    caps->max_inputs = 16;
    caps->max_outputs = 16;
-   /* 32 fp20 uniform registers, shared with the immediates */
-   caps->max_const_buffer0_size = GRATE_FP_NUM_CONSTS * sizeof(float);
+   /* 32 fp20 uniform registers, shared with the immediates: only the user
+    * uniform components a shader reads take one */
+   caps->max_const_buffer0_size = GRATE_FP_USER_CONSTS * sizeof(float);
    caps->max_const_buffers = 1;
    caps->max_temps = 16; // scalars
    caps->max_texture_samplers = 16;

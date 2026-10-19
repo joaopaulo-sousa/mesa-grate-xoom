@@ -710,10 +710,11 @@ emit_program(struct grate_context *context, uint32_t **ptrp)
       uint32_t consts[GRATE_FP_NUM_CONSTS];
 
       for (int i = 0; i < GRATE_FP_NUM_CONSTS; i++) {
+         unsigned u = fpinfo->user_index[i];
          if (fpinfo->imm_mask & (1u << i))
             consts[i] = fpinfo->consts[i];
-         else if (i < (int)user_len)
-            consts[i] = grate_float_to_fp20(user[i]);
+         else if ((fpinfo->user_mask & (1u << i)) && u < user_len)
+            consts[i] = grate_float_to_fp20(user[u]);
          else
             consts[i] = 0;
       }

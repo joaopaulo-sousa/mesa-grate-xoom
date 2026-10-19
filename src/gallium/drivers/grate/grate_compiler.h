@@ -26,6 +26,9 @@ struct grate_vp_shader {
 
 /* ALU uniform registers 32..63, loaded from TGR3D_ALU_GLOBALS(0..31) */
 #define GRATE_FP_NUM_CONSTS 32
+/* user uniform components a shader may declare (16 vec4, the GLES2
+ * minimum); only those it reads take a register */
+#define GRATE_FP_USER_CONSTS 64
 #define GRATE_FP_MAX_IMMEDIATES 32
 
 /*
@@ -36,7 +39,7 @@ struct grate_vp_shader {
 #define GRATE_FP_MAX_PRE 24
 
 enum grate_fp_pre_kind {
-   GRATE_FP_PRE_USER,      /* user uniform slot "index" */
+   GRATE_FP_PRE_USER,      /* user uniform "index" (index * 4 + comp) */
    GRATE_FP_PRE_RESULT,    /* result of preshader entry "index" */
    GRATE_FP_PRE_CONST,     /* "value" */
 };
@@ -79,11 +82,14 @@ struct grate_fp_info {
    int color_input;
    int max_tram_row;       /* TRAM rows used */
    int num_rows;            /* pixel packet rows (r0-r3, r4-r7, ...) */
-   /* ALU uniform registers: user uniforms at index * 4 + component from the
-    * bottom, immediates (fp20, already converted) allocated from the top */
+   /* ALU uniform registers: the user uniform components read, from the
+    * bottom, immediates (fp20, already converted) and preshader results
+    * from the top */
    uint32_t consts[GRATE_FP_NUM_CONSTS];
+   uint8_t user_index[GRATE_FP_NUM_CONSTS]; /* user slot: index * 4 + comp */
    uint32_t used_mask;      /* slots read by the shader */
    uint32_t imm_mask;       /* slots holding immediates */
+   uint32_t user_mask;      /* slots holding user uniforms */
    uint32_t sampler_mask;   /* samplers read */
    struct grate_fp_pre pre[GRATE_FP_MAX_PRE];
    int num_pre;
