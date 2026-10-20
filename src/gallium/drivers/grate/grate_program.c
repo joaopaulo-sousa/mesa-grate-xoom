@@ -177,8 +177,9 @@ grate_fs_compile(enum drm_tegra_soc_id soc_id, const struct tgsi_token *tokens,
    struct grate_fp_shader fp;
    grate_tgsi_to_fp(&fp, &parser, key);
 
-   /* say which shader draws magenta, to have something to work from */
-   if (fp.info.failed) {
+   /* say which shader draws magenta, to have something to work from (not
+    * the generic version of one that gets specialized at draw time) */
+   if (fp.info.failed && (!fp.info.num_spec || (key && key->spec))) {
       fprintf(stderr, "GRATE FRAG: failed shader (blend %d: rgb %d %d %d, "
               "alpha %d %d %d, colormask 0x%x):\n",
               key ? key->blend : 0, key ? key->rgb_func : 0,
@@ -301,7 +302,7 @@ grate_fs_compile(enum drm_tegra_soc_id soc_id, const struct tgsi_token *tokens,
          fprintf(stderr, " %08x", v->blob.commands[i]);
       fprintf(stderr, "\n");
       for (int i = 0; i < GRATE_FP_NUM_CONSTS; i++)
-         if (fp.info.imm_mask & (1u << i))
+         if (BITSET_TEST(fp.info.imm_mask, i))
             fprintf(stderr, "FPCONST %d %05x\n", i, fp.info.consts[i]);
    }
 }
@@ -348,7 +349,10 @@ static struct grate_fp_key
 grate_fs_key(struct grate_context *context)
 {
    const struct pipe_blend_state *blend = context->blend;
-   struct grate_fp_key key = grate_fp_key_none;
+   struct grate_fp_key key;
+
+   memset(&key, 0, sizeof(key));
+   key.colormask = 0xf;
 
    if (!blend)
       return key;
@@ -367,34 +371,56 @@ grate_fs_key(struct grate_context *context)
    return key;
 }
 
+static struct grate_fs_variant *
+grate_fs_variant(struct grate_context *context,
+                 struct grate_fragment_shader_state *so,
+                 const struct grate_fp_key *key)
+{
+   unsigned i;
+
+   for (i = 0; i < so->num_variants; i++)
+      if (!memcmp(&so->variants[i].key, key, sizeof(*key)))
+         return &so->variants[i];
+
+   if (so->num_variants < GRATE_FS_MAX_VARIANTS) {
+      i = so->num_variants++;
+   } else {
+      /* replace one, never the opaque variant 0 */
+      i = 1 + so->next_evict++ % (GRATE_FS_MAX_VARIANTS - 1);
+      FREE(so->variants[i].blob.commands);
+   }
+   grate_fs_compile(context->drm->soc_id, so->base.tokens, key,
+                    &so->variants[i]);
+   return &so->variants[i];
+}
+
+/*
+ * The variant for the bound blend state and, when the program branches on
+ * uniforms (grate_fp_spec), for the values they have at this draw
+ */
 void
 grate_fs_update(struct grate_context *context)
 {
    struct grate_fragment_shader_state *so = context->fshader;
    struct grate_fp_key key = grate_fs_key(context);
-   unsigned i;
 
    if (!so)
       return;
 
-   for (i = 0; i < so->num_variants; i++)
-      if (!memcmp(&so->variants[i].key, &key, sizeof(key)))
-         break;
+   struct grate_fs_variant *v = grate_fs_variant(context, so, &key);
+   if (v->info.num_spec) {
+      const struct pipe_constant_buffer *cb =
+         &context->constant_buffer[MESA_SHADER_FRAGMENT];
+      const float *user = cb->user_buffer;
+      unsigned user_len = user ? cb->buffer_size / sizeof(float) : 0;
 
-   if (i == so->num_variants) {
-      if (so->num_variants < GRATE_FS_MAX_VARIANTS) {
-         i = so->num_variants++;
-      } else {
-         /* replace one, never the opaque variant 0 */
-         i = 1 + so->next_evict++ % (GRATE_FS_MAX_VARIANTS - 1);
-         FREE(so->variants[i].blob.commands);
-      }
-      grate_fs_compile(context->drm->soc_id, so->base.tokens, &key,
-                       &so->variants[i]);
+      key.spec = 1;
+      key.spec_bits = grate_fp_eval_spec(&v->info, user, user_len);
+      v = grate_fs_variant(context, so, &key);
    }
 
-   so->blob = so->variants[i].blob;
-   so->info = so->variants[i].info;
+   so->blob = v->blob;
+   so->info = v->info;
 }
 
 static void

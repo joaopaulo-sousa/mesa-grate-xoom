@@ -20,7 +20,7 @@
 #include "grate_compiler.h"
 #include "fpir.h"
 
-#define FP_MAX_UNITS 128
+#define FP_MAX_UNITS 512
 #define FP_MAX_TEMPS 32
 #define FP_MAX_INPUTS 16
 #define FP_MAX_EXECS 4           /* multi-row programs */
@@ -162,6 +162,7 @@ struct fp_unit *fp_new_unit(struct fp_compiler *c);
 struct fp_opnd fp_opnd_value(struct fp_compiler *c, struct fp_unit *u);
 struct fp_opnd fp_opnd_zero(struct fp_compiler *c, bool output);
 struct fp_opnd fp_opnd_one(struct fp_compiler *c, bool output);
+struct fp_opnd fp_opnd_const(struct fp_compiler *c, float value);
 void fp_unit_op(struct fp_unit_slot *s, enum fp_alu_op op, struct fp_opnd a,
                 struct fp_opnd b, struct fp_opnd cc);
 struct fp_alu_src_operand fp_alu_src_row(int index);
@@ -175,6 +176,7 @@ uint32_t fp_tex_word(const struct fp_compiler *c, int n, int coord_pair);
 
 /* preshader.c */
 void fp_preshade(struct fp_compiler *c);
+void fp_specialize(struct fp_compiler *c);
 
 /* linker.c */
 int fp_tram_row(struct fp_compiler *c, int input, int comp, int column);

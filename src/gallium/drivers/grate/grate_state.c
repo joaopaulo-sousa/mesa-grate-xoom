@@ -702,7 +702,7 @@ emit_program(struct grate_context *context, uint32_t **ptrp)
 
    /* fragment shader constants: ALU uniform registers 32.. */
    const struct grate_fp_info *fpinfo = &context->fshader->info;
-   if (fpinfo->used_mask) {
+   if (!BITSET_IS_EMPTY(fpinfo->used_mask)) {
       const struct pipe_constant_buffer *cb =
          &context->constant_buffer[MESA_SHADER_FRAGMENT];
       const float *user = cb->user_buffer;
@@ -711,9 +711,9 @@ emit_program(struct grate_context *context, uint32_t **ptrp)
 
       for (int i = 0; i < GRATE_FP_NUM_CONSTS; i++) {
          unsigned u = fpinfo->user_index[i];
-         if (fpinfo->imm_mask & (1u << i))
+         if (BITSET_TEST(fpinfo->imm_mask, i))
             consts[i] = fpinfo->consts[i];
-         else if ((fpinfo->user_mask & (1u << i)) && u < user_len)
+         else if (BITSET_TEST(fpinfo->user_mask, i) && u < user_len)
             consts[i] = grate_float_to_fp20(user[u]);
          else
             consts[i] = 0;

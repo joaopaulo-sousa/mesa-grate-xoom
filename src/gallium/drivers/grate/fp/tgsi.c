@@ -70,21 +70,21 @@ fp_const_slot(struct fp_compiler *c, float value)
    uint32_t fp20 = grate_float_to_fp20(value);
    int i;
 
-   for (i = GRATE_FP_NUM_CONSTS - 1; i >= 0; i--)
-      if ((fp->info.imm_mask & (1u << i)) && fp->info.consts[i] == fp20)
+   for (i = 0; i < GRATE_FP_MAX_SLOTS; i++)
+      if (BITSET_TEST(fp->info.imm_mask, i) && fp->info.consts[i] == fp20)
          return i;
 
-   for (i = GRATE_FP_NUM_CONSTS - 1; i >= 0; i--)
-      if (!(fp->info.used_mask & (1u << i)))
+   for (i = 0; i < GRATE_FP_MAX_SLOTS; i++)
+      if (!BITSET_TEST(fp->info.used_mask, i))
          break;
-   if (i < 0) {
+   if (i == GRATE_FP_MAX_SLOTS) {
       fp_fail(c, "too many uniforms");
       return 0;
    }
 
    fp->info.consts[i] = fp20;
-   fp->info.imm_mask |= 1u << i;
-   fp->info.used_mask |= 1u << i;
+   BITSET_SET(fp->info.imm_mask, i);
+   BITSET_SET(fp->info.used_mask, i);
    return i;
 }
 
@@ -96,14 +96,14 @@ fp_uniform_slot(struct fp_compiler *c, int index, int comp)
    struct grate_fp_info *info = &c->fp->info;
    int user = index * 4 + comp;
 
-   for (int i = 0; i < GRATE_FP_NUM_CONSTS; i++)
-      if ((info->user_mask & (1u << i)) && info->user_index[i] == user)
+   for (int i = 0; i < GRATE_FP_MAX_SLOTS; i++)
+      if (BITSET_TEST(info->user_mask, i) && info->user_index[i] == user)
          return i;
-   for (int i = 0; i < GRATE_FP_NUM_CONSTS; i++)
-      if (!(info->used_mask & (1u << i))) {
+   for (int i = 0; i < GRATE_FP_MAX_SLOTS; i++)
+      if (!BITSET_TEST(info->used_mask, i)) {
          info->user_index[i] = user;
-         info->user_mask |= 1u << i;
-         info->used_mask |= 1u << i;
+         BITSET_SET(info->user_mask, i);
+         BITSET_SET(info->used_mask, i);
          return i;
       }
    fp_fail(c, "too many uniforms");
@@ -220,6 +220,13 @@ fp_opnd_one(struct fp_compiler *c, bool output)
       return o;
    }
    return fp_opnd_uniform(fp_const_slot(c, 1.0f));
+}
+
+/* An fp20 immediate */
+struct fp_opnd
+fp_opnd_const(struct fp_compiler *c, float value)
+{
+   return fp_opnd_uniform(fp_const_slot(c, value));
 }
 
 static struct fp_opnd
@@ -532,6 +539,17 @@ fp_val(struct fp_compiler *c, enum fp_alu_op op, struct fp_opnd a,
  * TEX with varying coordinates: one texture fetch per EXEC, the texel
  * channels become fixed10 operands. A colour destination gets copies.
  */
+/* Texture coordinates a multi-row program can fetch with: a varying .xy
+ * or .zw, interpolated straight into a register pair */
+static bool
+fp_tex_varying(const struct fp_opnd *s, const struct fp_opnd *t)
+{
+   return s->kind == FP_OPND_INPUT && t->kind == FP_OPND_INPUT &&
+          s->index == t->index && !s->negate && !s->absolute &&
+          !t->negate && !t->absolute && !(s->comp & 1) &&
+          t->comp == s->comp + 1;
+}
+
 static void
 emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
 {
@@ -551,10 +569,7 @@ emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
 
    /* coordinates other than a varying .xy/.zw (a dependent read) need a
     * sequential program: the ALU computes them in an earlier pass */
-   bool varying = s.kind == FP_OPND_INPUT && t.kind == FP_OPND_INPUT &&
-                  s.index == t.index && !s.negate && !s.absolute &&
-                  !t.negate && !t.absolute && !(s.comp & 1) &&
-                  t.comp == s.comp + 1;
+   bool varying = fp_tex_varying(&s, &t);
    if (!varying) {
       /* the TEX reads fp20 coordinates from a register pair: anything but
        * a plain varying component or a value of its own gets copied */
@@ -719,7 +734,7 @@ fp_opnd_is_const(struct fp_compiler *c, const struct fp_opnd *o, float v)
    if (o->kind == FP_OPND_ONE)
       return v == 1.0f;
    return o->kind == FP_OPND_UNIFORM &&
-          (c->fp->info.imm_mask & (1u << o->index)) &&
+          BITSET_TEST(c->fp->info.imm_mask, o->index) &&
           c->fp->info.consts[o->index] == grate_float_to_fp20(v);
 }
 
@@ -1153,6 +1168,130 @@ fp_fuse_mad(struct fp_compiler *c)
    }
 }
 
+static void fp_dead_code(struct fp_compiler *c);
+
+/* What a value is a plain copy of (MAD x, 1, 0, possibly over a chain) */
+static struct fp_opnd
+fp_copy_source(struct fp_compiler *c, struct fp_opnd o)
+{
+   while (o.kind == FP_OPND_VALUE && !o.negate && !o.absolute) {
+      const struct fp_unit *u = &c->units[o.index];
+      const struct fp_unit_slot *s = &u->slots[0];
+      if (!fp_unit_has_value(u) || u->num_slots != 1 || u->sfu ||
+          u->saturate || s->op != FP_ALU_OP_MAD || s->accumulate_this ||
+          s->accumulate_other || !fp_opnd_is_const(c, &s->src[1], 1.0f) ||
+          !fp_opnd_is_const(c, &s->src[2], 0.0f))
+         break;
+      o = s->src[0];
+   }
+   return o;
+}
+
+/*
+ * After folding, a texture read may turn out to use a varying after all
+ * and the special functions may be gone (preshader, specialization): then
+ * the program needs no sequential layout. Liveness is computed afresh.
+ */
+static void
+fp_relayout(struct fp_compiler *c)
+{
+   for (int n = 0; n < c->num_tex; n++) {
+      struct fp_opnd s = fp_copy_source(c, c->tex[n].coord[0]);
+      struct fp_opnd t = fp_copy_source(c, c->tex[n].coord[1]);
+      if (c->tex[n].input >= 0 || !fp_tex_varying(&s, &t))
+         continue;
+      c->tex[n].coord[0] = s;
+      c->tex[n].coord[1] = t;
+      c->tex[n].input = s.index;
+      c->tex[n].pair = s.comp / 2;
+   }
+
+   for (int i = 0; i < c->num_units; i++)
+      c->units[i].live = false;
+   for (int n = 0; n < c->num_tex; n++)
+      c->tex[n].live = false;
+   fp_dead_code(c);
+
+   c->seq = false;
+   for (int i = 0; i < c->num_units; i++)
+      c->seq |= c->units[i].live && c->units[i].sfu;
+   for (int n = 0; n < c->num_tex; n++)
+      c->seq |= c->tex[n].live && c->tex[n].input < 0;
+}
+
+/*
+ * The uniform slots the program still reads get the hardware's uniform
+ * registers: user uniforms and immediates of code specialized away, and
+ * preshader results nothing reads any more, take none. Preshader entries
+ * keep their index (grate_fp_spec refers to them) and are evaluated all
+ * the same.
+ */
+static void
+fp_compact_uniforms(struct fp_compiler *c)
+{
+   struct grate_fp_info *info = &c->fp->info;
+   BITSET_DECLARE(read, GRATE_FP_MAX_SLOTS);
+   int map[GRATE_FP_MAX_SLOTS];
+   int n = 0;
+
+   BITSET_ZERO(read);
+   for (int i = 0; i < c->num_units; i++) {
+      struct fp_unit *u = &c->units[i];
+      if (!u->live)
+         continue;
+      fp_unit_foreach_src(u, k, j)
+         if (u->slots[k].src[j].kind == FP_OPND_UNIFORM)
+            BITSET_SET(read, u->slots[k].src[j].index);
+   }
+
+   for (int i = 0; i < GRATE_FP_MAX_SLOTS; i++)
+      map[i] = BITSET_TEST(read, i) ? n++ : -1;
+   if (n > GRATE_FP_NUM_CONSTS) {
+      fp_fail(c, "too many uniforms");
+      return;
+   }
+
+   uint32_t consts[GRATE_FP_NUM_CONSTS] = { 0 };
+   uint8_t user_index[GRATE_FP_NUM_CONSTS] = { 0 };
+   BITSET_DECLARE(imm_mask, GRATE_FP_MAX_SLOTS);
+   BITSET_DECLARE(user_mask, GRATE_FP_MAX_SLOTS);
+   BITSET_ZERO(imm_mask);
+   BITSET_ZERO(user_mask);
+   for (int i = 0; i < GRATE_FP_MAX_SLOTS; i++) {
+      if (map[i] < 0)
+         continue;
+      consts[map[i]] = info->consts[i];
+      user_index[map[i]] = info->user_index[i];
+      if (BITSET_TEST(info->imm_mask, i))
+         BITSET_SET(imm_mask, map[i]);
+      if (BITSET_TEST(info->user_mask, i))
+         BITSET_SET(user_mask, map[i]);
+   }
+
+   memset(info->consts, 0, sizeof(info->consts));
+   memset(info->user_index, 0, sizeof(info->user_index));
+   memcpy(info->consts, consts, sizeof(consts));
+   memcpy(info->user_index, user_index, sizeof(user_index));
+   BITSET_COPY(info->imm_mask, imm_mask);
+   BITSET_COPY(info->user_mask, user_mask);
+   BITSET_ZERO(info->used_mask);
+   for (int i = 0; i < n; i++)
+      BITSET_SET(info->used_mask, i);
+
+   for (int i = 0; i < info->num_pre; i++)
+      info->pre[i].dst = map[info->pre[i].dst] >= 0 ? map[info->pre[i].dst] :
+                                                      GRATE_FP_PRE_NO_DST;
+
+   for (int i = 0; i < c->num_units; i++) {
+      struct fp_unit *u = &c->units[i];
+      if (!u->live)
+         continue;
+      fp_unit_foreach_src(u, k, j)
+         if (u->slots[k].src[j].kind == FP_OPND_UNIFORM)
+            u->slots[k].src[j].index = map[u->slots[k].src[j].index];
+   }
+}
+
 /* Drop units whose value is never used */
 static void
 fp_dead_code(struct fp_compiler *c)
@@ -1224,9 +1363,9 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    fp->info.num_links = 0;
    fp->info.color_input = -1;
    fp->info.max_tram_row = 1;
-   fp->info.used_mask = 0;
-   fp->info.imm_mask = 0;
-   fp->info.user_mask = 0;
+   BITSET_ZERO(fp->info.used_mask);
+   BITSET_ZERO(fp->info.imm_mask);
+   BITSET_ZERO(fp->info.user_mask);
    fp->info.sampler_mask = 0;
    fp->info.num_pre = 0;
    fp->num_immediates = 0;
@@ -1264,9 +1403,13 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
 
    fp_cse(c);
    fp_preshade(c);
+   fp_specialize(c);
    fp_fuse_mad(c);
    fp_dead_code(c);
    fp_fold_sfu_copies(c);
+   fp_relayout(c);
+   if (!c->failed)
+      fp_compact_uniforms(c);
 
    /*
     * Multi-row programs have more registers, sequential ones room for more

@@ -27,7 +27,7 @@ struct grate_fs_variant {
    struct grate_fp_info info;
 };
 
-#define GRATE_FS_MAX_VARIANTS 8
+#define GRATE_FS_MAX_VARIANTS 16
 
 struct grate_fragment_shader_state {
    struct pipe_shader_state base;     /* owns base.tokens */
