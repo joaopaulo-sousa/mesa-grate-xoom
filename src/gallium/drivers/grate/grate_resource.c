@@ -591,6 +591,19 @@ grate_clear(struct pipe_context *pcontext, unsigned int buffers,
 
    fb = &context->framebuffer.base;
 
+   /* a scissored clear (compositors clear the damaged region only) */
+   unsigned x = 0, y = 0, w = fb->width, h = fb->height;
+   if (scissor_state) {
+      unsigned maxx = MIN2(scissor_state->maxx, fb->width);
+      unsigned maxy = MIN2(scissor_state->maxy, fb->height);
+      x = MIN2(scissor_state->minx, maxx);
+      y = MIN2(scissor_state->miny, maxy);
+      w = maxx - x;
+      h = maxy - y;
+      if (!w || !h)
+         return;
+   }
+
    err = grate_stream_begin(stream, &ptr);
    if (err < 0) {
       grate_loge("grate_stream_begin() failed: %d\n", err);
@@ -605,7 +618,7 @@ grate_clear(struct pipe_context *pcontext, unsigned int buffers,
                   grate_resource(dst->texture),
                   pack_color(dst->format, color->f),
                   util_format_get_blocksize(dst->format),
-                  0, 0, fb->width, fb->height);
+                  x, y, w, h);
       }
    }
 
@@ -616,7 +629,7 @@ grate_clear(struct pipe_context *pcontext, unsigned int buffers,
                   grate_resource(fb->zsbuf.texture),
                   util_pack_z_stencil(fb->zsbuf.format, depth, stencil),
                   util_format_get_blocksize(fb->zsbuf.format),
-                  0, 0, fb->width, fb->height);
+                  x, y, w, h);
       }
    }
    

@@ -103,8 +103,8 @@ grate_set_scissor_states(struct pipe_context *pcontext,
                          unsigned num_scissors,
                          const struct pipe_scissor_state * scissors)
 {
-   assert(num_scissors == 1);
-   grate_unimplemented();
+   assert(start_slot == 0 && num_scissors == 1);
+   grate_context(pcontext)->scissor = scissors[0];
 }
 
 static void
@@ -624,11 +624,31 @@ emit_render_targets(struct grate_context *context, uint32_t **ptrp)
    GRATE_PUSHBUF_WORD(*ptrp, fb->rt_mask);
 }
 
+/*
+ * The scissor rectangle is in the same coordinates as the viewport output
+ * (framebuffer rows from the first in memory), as the hardware rasterizes;
+ * max is exclusive. Without the scissor test, the whole framebuffer.
+ */
 static void
 emit_scissor(struct grate_context *context, uint32_t **ptrp)
 {
    struct grate_stream *stream = &context->gr3d->stream;
-   grate_stream_push_words(stream, ptrp, context->no_scissor, 3, 0);
+   const struct pipe_framebuffer_state *fb = &context->framebuffer.base;
+   const struct pipe_scissor_state *s = &context->scissor;
+
+   if (!context->rast || !context->rast->base.scissor) {
+      grate_stream_push_words(stream, ptrp, context->no_scissor, 3, 0);
+      return;
+   }
+
+   unsigned maxx = MIN2(s->maxx, fb->width), maxy = MIN2(s->maxy, fb->height);
+   unsigned minx = MIN2(s->minx, maxx), miny = MIN2(s->miny, maxy);
+
+   GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_SU_SCISSOR_X, 2));
+   GRATE_PUSHBUF_WORD(*ptrp, TGR3D_SU_SCISSOR_X_MIN(minx) |
+                             TGR3D_SU_SCISSOR_X_MAX(maxx));
+   GRATE_PUSHBUF_WORD(*ptrp, TGR3D_SU_SCISSOR_Y_MIN(miny) |
+                             TGR3D_SU_SCISSOR_Y_MAX(maxy));
 }
 
 static void

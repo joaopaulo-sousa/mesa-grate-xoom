@@ -53,6 +53,7 @@ struct grate_context {
    struct pipe_sampler_state *samplers[16];
 
    uint32_t no_scissor[3];
+   struct pipe_scissor_state scissor;
    uint32_t viewport[10];
    uint32_t guardband[4];
    bool y_invert;
