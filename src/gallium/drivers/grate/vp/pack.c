@@ -146,6 +146,16 @@ grate_vp_pack(uint32_t *dst, struct vp_instr *instr, bool end_of_program)
    tmp.uniform_fetch_index = uniform_fetch >= 0 ? uniform_fetch : 0;
 
    tmp.vector_opcode = instr->vec.op;
+   if (instr->vec.cond_set) {
+      tmp.condition_set = 1;
+      tmp.condition_flags_write_enable = 1;
+   }
+   if (instr->vec.cond_test) {
+      tmp.condition_check = 1;
+      tmp.predicate_lt = !!(instr->vec.cond_test & VP_COND_LT);
+      tmp.predicate_eq = !!(instr->vec.cond_test & VP_COND_EQ);
+      tmp.predicate_gt = !!(instr->vec.cond_test & VP_COND_GT);
+   }
    switch (instr->vec.dst.file) {
    case VP_DST_FILE_TEMP:
       tmp.vector_rD_index = instr->vec.dst.index;

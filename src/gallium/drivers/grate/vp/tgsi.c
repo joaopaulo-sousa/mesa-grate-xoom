@@ -282,16 +282,37 @@ emit_scalar(enum vp_scalar_op op, struct vp_dst_operand dst, struct vp_src_opera
    return ret;
 }
 
-/* d = t ? b : c for t 0.0 or 1.0, exactly: u = c - t * c, d = t * b + u */
+/*
+ * d = a < 0 ? b : c by the condition register, so that the value not taken
+ * never enters the result (an arithmetic select turned b * 0 into NaN when
+ * b was infinite: Qt's antialiasing shader computes normalize(0) in the
+ * branch it does not take). The condition is set by moving a, then c is
+ * written and b over it where a < 0; through a scratch register when d is
+ * b's register, which the second move would overwrite.
+ */
 static void
-emit_select(struct grate_vp_shader *vp, struct vp_dst_operand dst,
-            struct vp_src_operand t, struct vp_src_operand b, struct vp_src_operand c)
+emit_cmp(struct grate_vp_shader *vp, struct vp_dst_operand dst,
+         struct vp_src_operand a, struct vp_src_operand b, struct vp_src_operand c)
 {
-   struct vp_dst_operand u = dst_temp(VP_SCRATCH1, dst.write_mask, false);
-   emit_packed(vp, emit_vec(VP_VEC_OP_MAD, u, src_negated(t), c, c), emit_sNOP());
-   emit_packed(vp, emit_vec(VP_VEC_OP_MAD, dst, t, b,
-                            src_temp(VP_SCRATCH1, vp_swz_xyzw, false, false)),
-               emit_sNOP());
+   struct vp_vec_instr set = emit_vec(VP_VEC_OP_MOV, dst_temp(VP_SCRATCH0, dst.write_mask, false),
+                                      a, src_undef(), src_undef());
+   set.cond_set = true;
+   emit_packed(vp, set, emit_sNOP());
+
+   bool via_scratch = dst.file != VP_DST_FILE_TEMP ||
+                      (b.file == VP_SRC_FILE_TEMP && b.index == dst.index);
+   struct vp_dst_operand d = via_scratch ? dst_temp(VP_SCRATCH1, dst.write_mask, false) : dst;
+   d.saturate = false;
+   emit_packed(vp, emit_vec(VP_VEC_OP_MOV, d, c, src_undef(), src_undef()), emit_sNOP());
+   struct vp_vec_instr take_b = emit_vec(VP_VEC_OP_MOV, d, b, src_undef(), src_undef());
+   take_b.cond_test = VP_COND_LT;
+   emit_packed(vp, take_b, emit_sNOP());
+
+   if (via_scratch || dst.saturate)
+      emit_packed(vp, emit_vec(VP_VEC_OP_MOV, dst,
+                               src_temp(d.index, vp_swz_xyzw, false, false),
+                               src_undef(), src_undef()),
+                  emit_sNOP());
 }
 
 /*
@@ -345,7 +366,6 @@ tgsi_to_vp(struct grate_vp_shader *vp, const struct tgsi_full_instruction *inst)
       return true;
    }
 
-   struct vp_dst_operand t = dst_temp(VP_SCRATCH0, dst.write_mask, false);
    struct vp_src_operand ts = src_temp(VP_SCRATCH0, vp_swz_xyzw, false, false);
 
    switch (opcode) {
@@ -363,16 +383,17 @@ tgsi_to_vp(struct grate_vp_shader *vp, const struct tgsi_full_instruction *inst)
       return true;
 
    case TGSI_OPCODE_CMP:
-      /* d = a < 0 ? b : c, a < 0 being a < -a */
-      emit_packed(vp, emit_vec(VP_VEC_OP_SLT, t, src[0], src_negated(src[0]), src_undef()),
-                  emit_sNOP());
-      emit_select(vp, dst, ts, src[1], src[2]);
+      emit_cmp(vp, dst, src[0], src[1], src[2]);
       return true;
 
-   case TGSI_OPCODE_LRP:
+   case TGSI_OPCODE_LRP: {
       /* d = a * b + (c - a * c) */
-      emit_select(vp, dst, src[0], src[1], src[2]);
+      struct vp_dst_operand u = dst_temp(VP_SCRATCH0, dst.write_mask, false);
+      emit_packed(vp, emit_vec(VP_VEC_OP_MAD, u, src_negated(src[0]), src[2], src[2]),
+                  emit_sNOP());
+      emit_packed(vp, emit_vec(VP_VEC_OP_MAD, dst, src[0], src[1], ts), emit_sNOP());
       return true;
+   }
 
    case TGSI_OPCODE_POW: {
       /* d = 2^(b * log2(a)) */

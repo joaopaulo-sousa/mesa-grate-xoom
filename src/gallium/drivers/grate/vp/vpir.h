@@ -91,10 +91,18 @@ struct vp_src_operand {
    bool negate, absolute;
 };
 
+/* condition register 0 states a written component may be tested for */
+#define VP_COND_LT (1 << 0)
+#define VP_COND_EQ (1 << 1)
+#define VP_COND_GT (1 << 2)
+
 struct vp_vec_instr {
    enum vp_vec_op op;
    struct vp_dst_operand dst;
    struct vp_src_operand src[3];
+   bool cond_set;            /* record the sign of the written components */
+   unsigned cond_test;       /* VP_COND_*: write only components in those
+                                states; 0: unconditional */
 };
 
 struct vp_scalar_instr {
