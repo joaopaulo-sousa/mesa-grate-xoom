@@ -52,6 +52,8 @@ struct grate_context {
    unsigned num_sampler_views;
    struct pipe_sampler_state *samplers[16];
 
+   struct grate_twopass *twopass;     /* see grate_twopass.c */
+
    uint32_t no_scissor[3];
    struct pipe_scissor_state scissor;
    uint32_t viewport[10];

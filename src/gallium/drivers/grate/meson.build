@@ -54,6 +54,7 @@ files_libgrate = files(
   'grate_screen.c',
   'grate_screen.h',
   'grate_state.c',
+  'grate_twopass.c',
   'grate_state.h',
   'grate_stream.c',
   'grate_stream.h',

@@ -13,6 +13,7 @@
 #include "grate_program.h"
 #include "grate_resource.h"
 #include "grate_state.h"
+#include "grate_twopass.h"
 #include "grate_device.h"
 
 #include "host1x01_hardware.h"
@@ -332,6 +333,9 @@ grate_draw_vbo(struct pipe_context *pcontext,
 
    /* the fragment program variant for the bound blend state */
    grate_fs_update(context);
+   if (context->fshader && context->fshader->info.failed && !indirect &&
+       grate_twopass_draw(context, info, drawid_offset, draws, num_draws))
+      return;
 
    if (grate_debug & GRATE_DEBUG_TRACE) {
       fprintf(stderr, "GRATE DRAW: %s index_size %u start %u count %u bias %d"

@@ -10,6 +10,7 @@
 #include "grate_common.h"
 #include "grate_device.h"
 #include "grate_context.h"
+#include "grate_twopass.h"
 #include "grate_draw.h"
 #include "grate_program.h"
 #include "grate_resource.h"
@@ -79,6 +80,7 @@ grate_context_destroy(struct pipe_context *pcontext)
    struct grate_context *context = grate_context(pcontext);
    grate_trace();
 
+   grate_twopass_destroy(context, context->twopass);
    slab_destroy_child(&context->transfer_pool);
 
    grate_channel_delete(context->gr3d);
