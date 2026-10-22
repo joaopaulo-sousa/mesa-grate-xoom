@@ -3,6 +3,7 @@
 #include "unistd.h"
 #include "vpir.h"
 
+#include "tgsi/tgsi_info.h"
 #include "tgsi/tgsi_parse.h"
 
 #include "util/u_memory.h"
@@ -96,18 +97,6 @@ dst_temp(int index, unsigned int write_mask, bool saturate)
 }
 
 static struct vp_vec_instr
-emit_vec_unop(enum vp_vec_op op, struct vp_dst_operand dst,
-              struct vp_src_operand src)
-{
-   struct vp_vec_instr ret = {
-      .op = op,
-      .dst = dst,
-      .src = { src, src_undef(), src_undef() }
-   };
-   return ret;
-}
-
-static struct vp_vec_instr
 emit_vec_binop(enum vp_vec_op op, struct vp_dst_operand dst,
               struct vp_src_operand src0, struct vp_src_operand src1)
 {
@@ -131,12 +120,6 @@ emit_vNOP()
 }
 
 static struct vp_vec_instr
-emit_vMOV(struct vp_dst_operand dst, struct vp_src_operand src)
-{
-   return emit_vec_unop(VP_VEC_OP_MOV, dst, src);
-}
-
-static struct vp_vec_instr
 emit_vADD(struct vp_dst_operand dst, struct vp_src_operand src0,
           struct vp_src_operand src2)
 {
@@ -157,22 +140,6 @@ emit_v ## OP (struct vp_dst_operand dst, struct vp_src_operand src0, \
 }
 
 GEN_V_BINOP(MUL)
-GEN_V_BINOP(DP3)
-GEN_V_BINOP(DP4)
-GEN_V_BINOP(SLT)
-GEN_V_BINOP(MAX)
-
-static struct vp_vec_instr
-emit_vMAD(struct vp_dst_operand dst, struct vp_src_operand src0,
-          struct vp_src_operand src1, struct vp_src_operand src2)
-{
-   struct vp_vec_instr ret = {
-      .op = VP_VEC_OP_MAD,
-      .dst = dst,
-      .src = { src0, src1, src2 }
-   };
-   return ret;
-}
 
 static struct vp_scalar_instr
 emit_sNOP()
@@ -185,29 +152,40 @@ emit_sNOP()
    return ret;
 }
 
-#define GEN_S_UNOP(OP) \
-static struct vp_scalar_instr \
-emit_s ## OP (struct vp_dst_operand dst, struct vp_src_operand src) \
-{ \
-   struct vp_scalar_instr ret = { \
-      .op = VP_SCALAR_OP_ ## OP, \
-      .dst = dst, \
-      .src = src \
-   }; \
-   return ret; \
+/* the last two of the 32 temporaries hold intermediate results of the
+ * TGSI opcodes that take several instructions, the two below them sources
+ * moved out of the attribute and constant files (vp_fetch_once) */
+#define VP_SCRATCH0 31
+#define VP_SCRATCH1 30
+#define VP_FETCH0 29
+#define VP_MAX_TGSI_TEMPS 28
+
+static const enum vp_swz vp_swz_xyzw[4] = { VP_SWZ_X, VP_SWZ_Y, VP_SWZ_Z, VP_SWZ_W };
+
+/* component swz of a scratch register, replicated */
+static struct vp_src_operand
+src_scratch(int index, enum vp_swz swz)
+{
+   enum vp_swz swizzle[4] = { swz, swz, swz, swz };
+   return src_temp(index, swizzle, false, false);
 }
 
-GEN_S_UNOP(RSQ)
-GEN_S_UNOP(RCP)
+static struct vp_src_operand
+src_negated(struct vp_src_operand src)
+{
+   src.negate = !src.negate;
+   return src;
+}
 
-static struct vp_instr *
-emit_packed(struct vp_vec_instr vec, struct vp_scalar_instr scalar)
+static void
+emit_packed(struct grate_vp_shader *vp, struct vp_vec_instr vec,
+            struct vp_scalar_instr scalar)
 {
    struct vp_instr *ret = CALLOC_STRUCT(vp_instr);
    list_inithead(&ret->link);
    ret->vec = vec;
    ret->scalar = scalar;
-   return ret;
+   list_addtail(&ret->link, &vp->instructions);
 }
 
 static struct vp_dst_operand
@@ -218,6 +196,7 @@ tgsi_dst_to_vp(struct grate_vp_shader *vp, const struct tgsi_dst_register *dst, 
       return emit_output(vp, dst->Index, dst->WriteMask, saturate);
 
    case TGSI_FILE_TEMPORARY:
+      assert(dst->Index < VP_MAX_TGSI_TEMPS);
       return dst_temp(dst->Index, dst->WriteMask, saturate);
 
    default:
@@ -256,73 +235,159 @@ tgsi_src_to_vp(struct grate_vp_shader *vp, const struct tgsi_src_register *src)
    }
 }
 
-static struct vp_instr *
+/*
+ * TGSI opcodes the vector or scalar unit has one instruction for; the
+ * scalar unit works on the first component of its source
+ */
+static const struct {
+   bool scalar;
+   int op, num_src;
+} vp_direct_ops[TGSI_OPCODE_LAST] = {
+   [TGSI_OPCODE_MOV] = { false, VP_VEC_OP_MOV, 1 },
+   [TGSI_OPCODE_MUL] = { false, VP_VEC_OP_MUL, 2 },
+   [TGSI_OPCODE_MAD] = { false, VP_VEC_OP_MAD, 3 },
+   [TGSI_OPCODE_DP3] = { false, VP_VEC_OP_DP3, 2 },
+   [TGSI_OPCODE_DP4] = { false, VP_VEC_OP_DP4, 2 },
+   [TGSI_OPCODE_MIN] = { false, VP_VEC_OP_MIN, 2 },
+   [TGSI_OPCODE_MAX] = { false, VP_VEC_OP_MAX, 2 },
+   [TGSI_OPCODE_SLT] = { false, VP_VEC_OP_SLT, 2 },
+   [TGSI_OPCODE_SGE] = { false, VP_VEC_OP_SGE, 2 },
+   [TGSI_OPCODE_SEQ] = { false, VP_VEC_OP_SEQ, 2 },
+   [TGSI_OPCODE_SNE] = { false, VP_VEC_OP_SNE, 2 },
+   [TGSI_OPCODE_SGT] = { false, VP_VEC_OP_SGT, 2 },
+   [TGSI_OPCODE_SLE] = { false, VP_VEC_OP_SLE, 2 },
+   [TGSI_OPCODE_FRC] = { false, VP_VEC_OP_FRC, 1 },
+   [TGSI_OPCODE_FLR] = { false, VP_VEC_OP_FLR, 1 },
+   [TGSI_OPCODE_SSG] = { false, VP_VEC_OP_SSG, 1 },
+   [TGSI_OPCODE_RCP] = { true, VP_SCALAR_OP_RCP, 1 },
+   [TGSI_OPCODE_RSQ] = { true, VP_SCALAR_OP_RSQ, 1 },
+   [TGSI_OPCODE_EX2] = { true, VP_SCALAR_OP_EX2, 1 },
+   [TGSI_OPCODE_LG2] = { true, VP_SCALAR_OP_LG2, 1 },
+   [TGSI_OPCODE_SIN] = { true, VP_SCALAR_OP_SIN, 1 },
+   [TGSI_OPCODE_COS] = { true, VP_SCALAR_OP_COS, 1 },
+};
+
+static struct vp_vec_instr
+emit_vec(enum vp_vec_op op, struct vp_dst_operand dst, struct vp_src_operand a,
+         struct vp_src_operand b, struct vp_src_operand c)
+{
+   struct vp_vec_instr ret = { .op = op, .dst = dst, .src = { a, b, c } };
+   return ret;
+}
+
+static struct vp_scalar_instr
+emit_scalar(enum vp_scalar_op op, struct vp_dst_operand dst, struct vp_src_operand src)
+{
+   struct vp_scalar_instr ret = { .op = op, .dst = dst, .src = src };
+   return ret;
+}
+
+/* d = t ? b : c for t 0.0 or 1.0, exactly: u = c - t * c, d = t * b + u */
+static void
+emit_select(struct grate_vp_shader *vp, struct vp_dst_operand dst,
+            struct vp_src_operand t, struct vp_src_operand b, struct vp_src_operand c)
+{
+   struct vp_dst_operand u = dst_temp(VP_SCRATCH1, dst.write_mask, false);
+   emit_packed(vp, emit_vec(VP_VEC_OP_MAD, u, src_negated(t), c, c), emit_sNOP());
+   emit_packed(vp, emit_vec(VP_VEC_OP_MAD, dst, t, b,
+                            src_temp(VP_SCRATCH1, vp_swz_xyzw, false, false)),
+               emit_sNOP());
+}
+
+/*
+ * An instruction fetches one attribute and one constant (immediates are
+ * constants too): sources reading another one are moved to a temporary
+ * first, keeping their swizzle and modifiers.
+ */
+static void
+vp_fetch_once(struct grate_vp_shader *vp, struct vp_src_operand *src, int num)
+{
+   int attrib = -1, constant = -1, temp = VP_FETCH0;
+
+   for (int i = 0; i < num; i++) {
+      int *fetch = src[i].file == VP_SRC_FILE_ATTRIB ? &attrib :
+                   src[i].file == VP_SRC_FILE_UNIFORM ? &constant : NULL;
+      if (!fetch)
+         continue;
+      if (*fetch < 0 || *fetch == src[i].index) {
+         *fetch = src[i].index;
+         continue;
+      }
+      emit_packed(vp, emit_vec(VP_VEC_OP_MOV, dst_temp(temp, 0xf, false), src[i],
+                               src_undef(), src_undef()),
+                  emit_sNOP());
+      src[i] = src_temp(temp--, vp_swz_xyzw, false, false);
+   }
+}
+
+static bool
 tgsi_to_vp(struct grate_vp_shader *vp, const struct tgsi_full_instruction *inst)
 {
+   unsigned opcode = inst->Instruction.Opcode;
    bool saturate = inst->Instruction.Saturate != 0;
-   switch (inst->Instruction.Opcode) {
-   case TGSI_OPCODE_MOV:
-      return emit_packed(emit_vMOV(tgsi_dst_to_vp(vp, &inst->Dst[0].Register, saturate),
-                                   tgsi_src_to_vp(vp, &inst->Src[0].Register)),
-                         emit_sNOP());
+   struct vp_dst_operand dst = tgsi_dst_to_vp(vp, &inst->Dst[0].Register, saturate);
+   struct vp_src_operand src[3];
 
+   for (unsigned i = 0; i < inst->Instruction.NumSrcRegs && i < 3; i++)
+      src[i] = tgsi_src_to_vp(vp, &inst->Src[i].Register);
+   vp_fetch_once(vp, src, MIN2(inst->Instruction.NumSrcRegs, 3));
+
+   if (vp_direct_ops[opcode].num_src) {
+      if (vp_direct_ops[opcode].scalar) {
+         emit_packed(vp, emit_vNOP(), emit_scalar(vp_direct_ops[opcode].op, dst, src[0]));
+      } else {
+         struct vp_src_operand s[3] = { src_undef(), src_undef(), src_undef() };
+         for (int i = 0; i < vp_direct_ops[opcode].num_src; i++)
+            s[i] = src[i];
+         emit_packed(vp, emit_vec(vp_direct_ops[opcode].op, dst, s[0], s[1], s[2]),
+                     emit_sNOP());
+      }
+      return true;
+   }
+
+   struct vp_dst_operand t = dst_temp(VP_SCRATCH0, dst.write_mask, false);
+   struct vp_src_operand ts = src_temp(VP_SCRATCH0, vp_swz_xyzw, false, false);
+
+   switch (opcode) {
    case TGSI_OPCODE_ADD:
-      return emit_packed(emit_vADD(tgsi_dst_to_vp(vp, &inst->Dst[0].Register, saturate),
-                                   tgsi_src_to_vp(vp, &inst->Src[0].Register),
-                                   tgsi_src_to_vp(vp, &inst->Src[1].Register)),
-                         emit_sNOP());
+      emit_packed(vp, emit_vADD(dst, src[0], src[1]), emit_sNOP());
+      return true;
 
-   case TGSI_OPCODE_MUL:
-      return emit_packed(emit_vMUL(tgsi_dst_to_vp(vp, &inst->Dst[0].Register, saturate),
-                                   tgsi_src_to_vp(vp, &inst->Src[0].Register),
-                                   tgsi_src_to_vp(vp, &inst->Src[1].Register)),
-                         emit_sNOP());
+   case TGSI_OPCODE_DP2:
+      /* t = a * b, d = t.x + t.y */
+      emit_packed(vp, emit_vMUL(dst_temp(VP_SCRATCH0, 0x3, false), src[0], src[1]),
+                  emit_sNOP());
+      emit_packed(vp, emit_vADD(dst, src_scratch(VP_SCRATCH0, VP_SWZ_X),
+                                src_scratch(VP_SCRATCH0, VP_SWZ_Y)),
+                  emit_sNOP());
+      return true;
 
-   case TGSI_OPCODE_DP3:
-      return emit_packed(emit_vDP3(tgsi_dst_to_vp(vp, &inst->Dst[0].Register, saturate),
-                                   tgsi_src_to_vp(vp, &inst->Src[0].Register),
-                                   tgsi_src_to_vp(vp, &inst->Src[1].Register)),
-                         emit_sNOP());
+   case TGSI_OPCODE_CMP:
+      /* d = a < 0 ? b : c, a < 0 being a < -a */
+      emit_packed(vp, emit_vec(VP_VEC_OP_SLT, t, src[0], src_negated(src[0]), src_undef()),
+                  emit_sNOP());
+      emit_select(vp, dst, ts, src[1], src[2]);
+      return true;
 
-   case TGSI_OPCODE_DP4:
-      return emit_packed(emit_vDP4(tgsi_dst_to_vp(vp, &inst->Dst[0].Register, saturate),
-                                   tgsi_src_to_vp(vp, &inst->Src[0].Register),
-                                   tgsi_src_to_vp(vp, &inst->Src[1].Register)),
-                         emit_sNOP());
+   case TGSI_OPCODE_LRP:
+      /* d = a * b + (c - a * c) */
+      emit_select(vp, dst, src[0], src[1], src[2]);
+      return true;
 
-   case TGSI_OPCODE_SLT:
-      return emit_packed(emit_vSLT(tgsi_dst_to_vp(vp, &inst->Dst[0].Register, saturate),
-                                   tgsi_src_to_vp(vp, &inst->Src[0].Register),
-                                   tgsi_src_to_vp(vp, &inst->Src[1].Register)),
-                         emit_sNOP());
-
-   case TGSI_OPCODE_MAX:
-      return emit_packed(emit_vMAX(tgsi_dst_to_vp(vp, &inst->Dst[0].Register, saturate),
-                                   tgsi_src_to_vp(vp, &inst->Src[0].Register),
-                                   tgsi_src_to_vp(vp, &inst->Src[1].Register)),
-                         emit_sNOP());
-
-   case TGSI_OPCODE_MAD:
-      return emit_packed(emit_vMAD(tgsi_dst_to_vp(vp, &inst->Dst[0].Register, saturate),
-                                   tgsi_src_to_vp(vp, &inst->Src[0].Register),
-                                   tgsi_src_to_vp(vp, &inst->Src[1].Register),
-                                   tgsi_src_to_vp(vp, &inst->Src[2].Register)),
-                         emit_sNOP());
-
-   case TGSI_OPCODE_RSQ:
-      return emit_packed(emit_vNOP(),
-                         emit_sRSQ(tgsi_dst_to_vp(vp, &inst->Dst[0].Register, saturate),
-                                   tgsi_src_to_vp(vp, &inst->Src[0].Register)));
-      
-   case TGSI_OPCODE_RCP:
-      return emit_packed(emit_vNOP(),
-                           emit_sRCP(tgsi_dst_to_vp(vp, &inst->Dst[0].Register, saturate),
-                                    tgsi_src_to_vp(vp, &inst->Src[0].Register)));
+   case TGSI_OPCODE_POW: {
+      /* d = 2^(b * log2(a)) */
+      struct vp_dst_operand t1 = dst_temp(VP_SCRATCH0, 0x1, false);
+      emit_packed(vp, emit_vNOP(), emit_scalar(VP_SCALAR_OP_LG2, t1, src[0]));
+      emit_packed(vp, emit_vMUL(t1, src_scratch(VP_SCRATCH0, VP_SWZ_X), src[1]),
+                  emit_sNOP());
+      emit_packed(vp, emit_vNOP(),
+                  emit_scalar(VP_SCALAR_OP_EX2, dst, src_scratch(VP_SCRATCH0, VP_SWZ_X)));
+      return true;
+   }
 
    default:
-      fprintf(stderr, "GRATE VERTEX TGSI UNIMPLEMENTED: 0x%02x\n", inst->Instruction.Opcode);
-      assert(0);
-      return 0;
+      fprintf(stderr, "GRATE VERTEX TGSI UNIMPLEMENTED: %s\n", tgsi_get_opcode_name(opcode));
+      return false;
    }
 }
 
@@ -358,10 +423,8 @@ grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi)
       }
       case TGSI_TOKEN_TYPE_INSTRUCTION:
          if (tgsi->FullToken.FullInstruction.Instruction.Opcode != TGSI_OPCODE_END) {
-            struct vp_instr *instr = tgsi_to_vp(vp, &tgsi->FullToken.FullInstruction);
-            if (!instr) 
-               continue;
-            list_addtail(&instr->link, &vp->instructions);
+            if (!tgsi_to_vp(vp, &tgsi->FullToken.FullInstruction))
+               assert(!"unsupported vertex opcode");
          }
          break;
       }
