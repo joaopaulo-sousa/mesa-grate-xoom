@@ -36,6 +36,8 @@ struct grate_fragment_shader_state {
    struct grate_shader_blob blob;
    struct grate_fp_info info;
 
+   bool discards;                     /* KILL/KILL_IF: discards fragments */
+
    struct grate_fs_variant variants[GRATE_FS_MAX_VARIANTS];
    unsigned num_variants;
    unsigned next_evict;

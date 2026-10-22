@@ -40,6 +40,7 @@ struct grate_context {
    struct pipe_constant_buffer constant_buffer[PIPE_MAX_CONSTANT_BUFFERS]; // ??, stolen from other drivers but no idea
 
    struct grate_zsa_state *zsa;
+   struct pipe_stencil_ref stencil_ref;
    const struct pipe_blend_state *blend;
    struct grate_rasterizer_state *rast;
 

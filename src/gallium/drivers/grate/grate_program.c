@@ -335,6 +335,10 @@ grate_create_fs_state(struct pipe_context *pcontext,
       fprintf(stderr, "\n");
    }
 
+   struct tgsi_shader_info scan;
+   tgsi_scan_shader(so->base.tokens, &scan);
+   so->discards = scan.uses_kill;
+
    /* the opaque variant, used without blending */
    grate_fs_compile(context->drm->soc_id, so->base.tokens, &grate_fp_key_none,
                     &so->variants[0]);

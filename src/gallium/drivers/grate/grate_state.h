@@ -16,6 +16,11 @@ struct grate_zsa_state {
    struct pipe_depth_stencil_alpha_state base;
    uint32_t commands[4];
    unsigned int num_commands;
+
+   /* stencil test and operations, front and back face; the reference is
+    * added from grate_context.stencil_ref */
+   uint32_t s_test[2];
+   uint32_t s_operation[2];
 };
 
 struct grate_vertexbuf_state {

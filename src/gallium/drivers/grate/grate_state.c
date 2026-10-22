@@ -196,7 +196,7 @@ static void
 grate_set_stencil_ref(struct pipe_context *pctx,
                       const struct pipe_stencil_ref stencil_ref)
 {
-   grate_unimplemented();
+   grate_context(pctx)->stencil_ref = stencil_ref;
 }
 
 static void
@@ -418,6 +418,23 @@ grate_compare_func(enum pipe_compare_func func)
    }
 }
 
+/* libgrate's TGR3D_STENCIL_OP_* */
+static uint32_t
+grate_stencil_op(enum pipe_stencil_op op)
+{
+   switch (op) {
+   case PIPE_STENCIL_OP_ZERO: return 0;
+   case PIPE_STENCIL_OP_KEEP: return 1;
+   case PIPE_STENCIL_OP_REPLACE: return 2;
+   case PIPE_STENCIL_OP_INCR: return 3;
+   case PIPE_STENCIL_OP_DECR: return 4;
+   case PIPE_STENCIL_OP_INVERT: return 5;
+   case PIPE_STENCIL_OP_INCR_WRAP: return 6;
+   case PIPE_STENCIL_OP_DECR_WRAP: return 7;
+   default: UNREACHABLE("unknown pipe_stencil_op");
+   }
+}
+
 static void *
 grate_create_zsa_state(struct pipe_context *pcontext,
                        const struct pipe_depth_stencil_alpha_state *template)
@@ -435,6 +452,19 @@ grate_create_zsa_state(struct pipe_context *pcontext,
    depth_test |= TGR3D_QR_Z_TEST_Z_ENABLE(template->depth_enabled);
    depth_test |= TGR3D_QR_Z_TEST_QRAST_FB_WRITE(template->depth_writemask);
    depth_test |= TGR3D_QR_Z_TEST_Z_CLAMP(TGR3D_Z_CLAMP_KILL);
+
+   /* the back face takes the front face's state unless two-sided */
+   for (int i = 0; i < 2; i++) {
+      const struct pipe_stencil_state *s =
+         &template->stencil[i && template->stencil[1].enabled];
+      so->s_test[i] = TGR3D_QR_S_TEST_FRONT_S_MASK(s->valuemask) |
+                      TGR3D_QR_S_TEST_FRONT_S_FUNC(grate_compare_func(s->func));
+      so->s_operation[i] =
+         TGR3D_GLOBAL_S_OPERATION_FRONT_S_FAIL(grate_stencil_op(s->fail_op)) |
+         TGR3D_GLOBAL_S_OPERATION_FRONT_Z_FAIL(grate_stencil_op(s->zfail_op)) |
+         TGR3D_GLOBAL_S_OPERATION_FRONT_Z_PASS(grate_stencil_op(s->zpass_op)) |
+         TGR3D_GLOBAL_S_OPERATION_FRONT_S_WR_MASK(s->writemask);
+   }
 
    so->commands[0] = host1x_opcode_incr(REG_TGR3D_QR_Z_TEST, 1);
    so->commands[1] = depth_test;
@@ -600,6 +630,14 @@ emit_attribs(struct grate_context *context, uint32_t **ptrp)
  * TGR3D_RT_ENABLE_DEPTH_BUFFER) */
 #define GRATE_DW_ST_DEPTH_BUFFER 0x00010000
 
+/* Whether the bound state tests stencil against a bound stencil buffer */
+static bool
+grate_stencil_test(const struct grate_context *context)
+{
+   return context->zsa && context->zsa->base.stencil[0].enabled &&
+          (context->framebuffer.rt_present & (1 << GRATE_RT_STENCIL));
+}
+
 /* Whether the bound state tests depth against a bound depth buffer */
 static bool
 grate_depth_test(const struct grate_context *context)
@@ -609,8 +647,8 @@ grate_depth_test(const struct grate_context *context)
 }
 
 /*
- * The colour surface, and the depth one while the depth test is on, as
- * libgrate does: the depth unit uses surface 0 whenever it is enabled.
+ * The colour surface, and the depth and stencil ones while their tests are
+ * on, as libgrate does: the units use surfaces 0 and 2 whenever enabled.
  */
 static void
 emit_render_targets(struct grate_context *context, uint32_t **ptrp)
@@ -621,6 +659,8 @@ emit_render_targets(struct grate_context *context, uint32_t **ptrp)
 
    if (grate_depth_test(context))
       enable |= 1 << GRATE_RT_DEPTH | GRATE_DW_ST_DEPTH_BUFFER;
+   if (grate_stencil_test(context))
+      enable |= 1 << GRATE_RT_STENCIL;
 
    u_foreach_bit(i, enable & 0xffff) {
       GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_GLOBAL_SURFDESC(i), 1));
@@ -688,6 +728,35 @@ emit_zsa_state(struct grate_context *context, uint32_t **ptrp)
          commands[i] &= ~(TGR3D_QR_Z_TEST_Z_ENABLE__MASK |
                           TGR3D_QR_Z_TEST_QRAST_FB_WRITE__MASK);
    grate_stream_push_words(stream, ptrp, commands, n, 0);
+
+   if (grate_stencil_test(context)) {
+      const struct grate_zsa_state *zsa = context->zsa;
+      /*
+       * The stencil buffer is written by the rasterizer, before the
+       * fragment program runs. libgrate has a program that discards
+       * write it after the test instead (DW "store stencil", late test in
+       * QR_OUTPUT_TO_SHADER), which the compiler does not emit: the
+       * fragments it discards still update the stencil buffer.
+       */
+      bool discards = context->fshader && context->fshader->discards;
+      static bool warned;
+      if (discards && !warned) {
+         warned = true;
+         mesa_logw("grate: stencil written before discard\n");
+      }
+
+      GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_QR_S_TEST_FRONT, 3));
+      GRATE_PUSHBUF_WORD(*ptrp, zsa->s_test[0]);
+      GRATE_PUSHBUF_WORD(*ptrp, zsa->s_test[1]);
+      GRATE_PUSHBUF_WORD(*ptrp, TGR3D_QR_S_CTRL_S_ENABLE(TGR3D_STATE_ENABLED) |
+                                TGR3D_QR_S_CTRL_S_SURF_PTR(GRATE_RT_STENCIL) |
+                                TGR3D_QR_S_CTRL_QRAST_FB_WRITE(TGR3D_STATE_ENABLED));
+      GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_GLOBAL_S_OPERATION_FRONT, 2));
+      GRATE_PUSHBUF_WORD(*ptrp, zsa->s_operation[0] |
+                                TGR3D_GLOBAL_S_OPERATION_FRONT_S_REF(context->stencil_ref.ref_value[0]));
+      GRATE_PUSHBUF_WORD(*ptrp, zsa->s_operation[1] |
+                                TGR3D_GLOBAL_S_OPERATION_BACK_S_REF(context->stencil_ref.ref_value[1]));
+   }
 }
 
 static void
