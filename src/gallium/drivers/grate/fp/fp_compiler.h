@@ -25,7 +25,9 @@
 #define FP_MAX_INPUTS 16
 #define FP_MAX_EXECS 4           /* multi-row programs */
 #define FP_SEQ_MAX_EXECS 16      /* one-row sequential programs */
+#ifndef FP_MAX_PACKETS_PER_EXEC   /* fphost-relaxed: how many a program needs */
 #define FP_MAX_PACKETS_PER_EXEC 3
+#endif
 #define FP_MAX_PACKETS 64
 #define FP_MAX_TEXTURES 4
 #define FP_TRAM_ROWS 16
@@ -178,6 +180,8 @@ uint32_t fp_tex_word(const struct fp_compiler *c, int n, int coord_pair);
 
 /* fx10.c */
 void fp_mark_fx10(struct fp_compiler *c);
+void fp_reassociate(struct fp_compiler *c);
+bool fp_opnd_is_const(struct fp_compiler *c, const struct fp_opnd *o, float v);
 
 /* preshader.c */
 float fp20_to_float(uint32_t v);

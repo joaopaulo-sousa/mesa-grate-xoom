@@ -29,6 +29,7 @@ files_libgrate = files(
   'fp/pack.c',
   'fp/fp_compiler.h',
   'fp/fx10.c',
+  'fp/reassoc.c',
   'fp/sched_rows.c',
   'fp/linker.c',
   'fp/preshader.c',

@@ -725,7 +725,7 @@ emit_sfu(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
 }
 
 /* Whether o is the constant v (an fp20 immediate or the fixed10 0/1) */
-static bool
+bool
 fp_opnd_is_const(struct fp_compiler *c, const struct fp_opnd *o, float v)
 {
    if (o->negate || o->absolute)
@@ -1402,6 +1402,8 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    if (c->redirect_output && !c->failed)
       emit_blend(c);
 
+   fp_cse(c);
+   fp_reassociate(c);
    fp_cse(c);
    fp_preshade(c);
    fp_specialize(c);

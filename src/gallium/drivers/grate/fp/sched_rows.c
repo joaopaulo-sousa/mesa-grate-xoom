@@ -46,9 +46,37 @@ fp_assign_inputs(struct fp_compiler *c)
    /*
     * Texture fetches first, one EXEC each: the coordinate pair is fetched by
     * that EXEC's MFU, the other pair receives the texel (-2: no varying).
+    * The texels with the longest chain of operations after them come first,
+    * their chains then start earliest.
     */
-   int e = 0;
+   int height[FP_MAX_UNITS], tex_height[FP_MAX_TEXTURES] = { 0 };
+   for (int i = c->num_units - 1; i >= 0; i--)
+      height[i] = c->units[i].live && !fp_unit_has_value(&c->units[i]) ? 1 : 0;
+   for (int i = c->num_units - 1; i >= 0; i--) {
+      struct fp_unit *u = &c->units[i];
+      if (!u->live || !height[i])
+         continue;
+      fp_unit_foreach_src(u, k, j) {
+         struct fp_opnd *o = &u->slots[k].src[j];
+         if (o->kind == FP_OPND_VALUE)
+            height[o->index] = MAX2(height[o->index], height[i] + 1);
+         else if (o->kind == FP_OPND_TEXEL)
+            tex_height[o->index] = MAX2(tex_height[o->index], height[i]);
+      }
+   }
+   int order[FP_MAX_TEXTURES], num = 0;
    for (int n = 0; n < c->num_tex; n++) {
+      int at = num++;
+      while (at > 0 && tex_height[order[at - 1]] < tex_height[n]) {
+         order[at] = order[at - 1];
+         at--;
+      }
+      order[at] = n;
+   }
+
+   int e = 0;
+   for (int t = 0; t < num; t++) {
+      int n = order[t];
       if (!c->tex[n].live)
          continue;
       int p = c->tex[n].pair, in = c->tex[n].input;
@@ -224,8 +252,23 @@ fp_unit_pressure(struct fp_compiler *c, struct fp_unit *u, const int *uses_left)
 static bool
 fp_schedule(struct fp_compiler *c, int limit)
 {
-   int uses_left[FP_MAX_UNITS] = { 0 };
+   int uses_left[FP_MAX_UNITS] = { 0 }, height[FP_MAX_UNITS];
    int remaining = 0, packet = 0, exec = 0, in_exec = 0, stalls = 0, open = 0;
+
+   /* operations on the longest path from a unit to the end of the program:
+    * the critical units go first */
+   for (int i = c->num_units - 1; i >= 0; i--)
+      height[i] = 1;
+   for (int i = c->num_units - 1; i >= 0; i--) {
+      struct fp_unit *u = &c->units[i];
+      if (!u->live)
+         continue;
+      fp_unit_foreach_src(u, k, j) {
+         struct fp_opnd *o = &u->slots[k].src[j];
+         if (o->kind == FP_OPND_VALUE)
+            height[o->index] = MAX2(height[o->index], height[i] + 1);
+      }
+   }
 
    for (int i = 0; i < c->num_units; i++) {
       struct fp_unit *u = &c->units[i];
@@ -259,7 +302,8 @@ fp_schedule(struct fp_compiler *c, int limit)
                limited = true;
                continue;
             }
-            if (best < 0 || delta < best_delta) {
+            if (best < 0 || height[i] > height[best] ||
+                (height[i] == height[best] && delta < best_delta)) {
                best = i;
                best_delta = delta;
             }

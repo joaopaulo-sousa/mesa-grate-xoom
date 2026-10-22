@@ -1,0 +1,265 @@
+/*
+ * Reassociation for shorter dependency chains. A multi-row program has 12
+ * ALU packets at most (4 EXECs of 3), and a value one packet computes is
+ * read by the next only, so the depth of the chains, more than the number
+ * of operations, decides whether a shader fits. Two rewrites, on plain
+ * MADs (no saturate on the inner one, no absolute values):
+ *
+ * - (x * y + k) * w + z with y, k, w, z uniform becomes x * (y * w) +
+ *   (k * w + z), and (a * b + x) * w + z becomes x * w + (a * b * w + z):
+ *   the uniform parts go to the preshader, one operation remains per pixel
+ *   instead of two. E.g. smoothstep's (x - edge0) * (1 / (edge1 - edge0)).
+ *
+ * - a product of three factors (x * y) * z is regrouped so that the two
+ *   available first are multiplied first: t * (t * (3 - 2t)) becomes
+ *   (t * t) * (3 - 2t), t * t then going in parallel with 3 - 2t.
+ *
+ * Runs before fp_preshade, which takes the uniform-only units out.
+ */
+#include <string.h>
+
+#include "fp_compiler.h"
+
+#include "util/macros.h"
+
+/* Move the last unit to position pos, renumbering the units after it */
+static void
+fp_move_last_unit(struct fp_compiler *c, int pos)
+{
+   int last = c->num_units - 1;
+   struct fp_unit moved = c->units[last];
+
+   memmove(&c->units[pos + 1], &c->units[pos], (last - pos) * sizeof(c->units[0]));
+   c->units[pos] = moved;
+
+   for (int i = 0; i < c->num_units; i++) {
+      struct fp_unit *u = &c->units[i];
+      fp_unit_foreach_src(u, k, j) {
+         struct fp_opnd *o = &u->slots[k].src[j];
+         if (o->kind == FP_OPND_VALUE && o->index >= pos && i != pos)
+            o->index = o->index == last ? pos : o->index + 1;
+      }
+   }
+   for (int n = 0; n < c->num_tex; n++)
+      for (int k = 0; k < 2; k++) {
+         struct fp_opnd *o = &c->tex[n].coord[k];
+         if (o->kind == FP_OPND_VALUE && o->index >= pos)
+            o->index = o->index == last ? pos : o->index + 1;
+      }
+}
+
+struct fp_reassoc {
+   bool alive[FP_MAX_UNITS];     /* read by a colour write, discard or TEX */
+   bool uniform[FP_MAX_UNITS];   /* the same for every pixel (preshader) */
+   int depth[FP_MAX_UNITS];      /* ALU operations on the longest path */
+   int readers[FP_MAX_UNITS];    /* by live units */
+};
+
+/* A live single-slot MAD, which the rewrites may change: a value or, as
+ * the outer unit, a colour write */
+static bool
+fp_plain_mad(const struct fp_reassoc *r, const struct fp_compiler *c, int i)
+{
+   const struct fp_unit *u = &c->units[i];
+   const struct fp_unit_slot *s = &u->slots[0];
+   return r->alive[i] && !u->kill && u->num_slots == 1 && !u->sfu &&
+          !u->sfu_copy && s->op == FP_ALU_OP_MAD && !s->accumulate_this &&
+          !s->accumulate_other;
+}
+
+static bool
+fp_opnd_uniform(const struct fp_reassoc *r, const struct fp_opnd *o)
+{
+   return o->kind == FP_OPND_UNIFORM || o->kind == FP_OPND_ZERO ||
+          o->kind == FP_OPND_ONE ||
+          (o->kind == FP_OPND_VALUE && r->uniform[o->index]);
+}
+
+static int
+fp_opnd_depth(const struct fp_reassoc *r, const struct fp_opnd *o)
+{
+   return o->kind == FP_OPND_VALUE ? r->depth[o->index] : 0;
+}
+
+static void
+fp_reassoc_scan(struct fp_compiler *c, struct fp_reassoc *r)
+{
+   memset(r->alive, 0, sizeof(r->alive));
+   memset(r->readers, 0, sizeof(r->readers));
+   for (int i = c->num_units - 1; i >= 0; i--) {
+      struct fp_unit *u = &c->units[i];
+      r->alive[i] |= u->output_chan >= 0 || u->kill;
+      if (!r->alive[i])
+         continue;
+      fp_unit_foreach_src(u, k, j) {
+         const struct fp_opnd *o = &u->slots[k].src[j];
+         if (o->kind == FP_OPND_VALUE) {
+            r->alive[o->index] = true;
+            r->readers[o->index]++;
+         } else if (o->kind == FP_OPND_TEXEL) {
+            for (int t = 0; t < 2; t++)
+               if (c->tex[o->index].coord[t].kind == FP_OPND_VALUE) {
+                  r->alive[c->tex[o->index].coord[t].index] = true;
+                  r->readers[c->tex[o->index].coord[t].index] += 2;   /* keep */
+               }
+         }
+      }
+   }
+
+   for (int i = 0; i < c->num_units; i++) {
+      struct fp_unit *u = &c->units[i];
+      bool uniform = fp_unit_has_value(u);
+      int depth = 0;
+      fp_unit_foreach_src(u, k, j) {
+         const struct fp_opnd *o = &u->slots[k].src[j];
+         uniform &= fp_opnd_uniform(r, o);
+         depth = MAX2(depth, fp_opnd_depth(r, o));
+      }
+      r->uniform[i] = uniform;
+      r->depth[i] = uniform ? 0 : depth + 1;
+   }
+}
+
+/* The inner unit an operand of a rewrite may fold: a plain MAD without
+ * saturate that only this operand reads */
+static struct fp_unit *
+fp_inner(struct fp_compiler *c, const struct fp_reassoc *r, const struct fp_opnd *o)
+{
+   if (o->kind != FP_OPND_VALUE || o->absolute || r->readers[o->index] != 1 ||
+       !fp_plain_mad(r, c, o->index) || c->units[o->index].saturate ||
+       !fp_unit_has_value(&c->units[o->index]))
+      return NULL;
+   return &c->units[o->index];
+}
+
+static struct fp_opnd
+fp_negated(struct fp_opnd o, bool negate)
+{
+   o.negate ^= negate;
+   return o;
+}
+
+/*
+ * (x * y + k) * w + z  -> x * (y * w) + (k * w + z)
+ * (a * b + x) * w + z  -> x * w + (a * b * w + z)
+ * with x the only operand that depends on the pixel
+ */
+static bool
+fp_fold_affine(struct fp_compiler *c, struct fp_reassoc *r, int i)
+{
+   struct fp_unit_slot *s = &c->units[i].slots[0];
+
+   if (!fp_opnd_uniform(r, &s->src[2]))
+      return false;
+   for (int at = 0; at < 2; at++) {
+      struct fp_opnd w = s->src[1 - at];
+      struct fp_unit *v = fp_inner(c, r, &s->src[at]);
+      if (!v || !fp_opnd_uniform(r, &w) || w.absolute)
+         continue;
+      const struct fp_unit_slot *vs = &v->slots[0];
+      int pixel = -1;
+      for (int j = 0; j < 3; j++)
+         if (!fp_opnd_uniform(r, &vs->src[j]))
+            pixel = pixel < 0 ? j : 3;
+      if (pixel < 0 || pixel == 3)
+         continue;
+
+      /* the sign of the folded operand goes with w */
+      w = fp_negated(w, s->src[at].negate);
+      struct fp_opnd x = vs->src[pixel], z = s->src[2];
+      struct fp_opnd p0, p1, k;      /* x * (p0 * p1) + (k * w + z) */
+      if (pixel == 2) {
+         p0 = w;
+         p1 = fp_opnd_one(c, false);
+         k = vs->src[0];   /* k * w is a * b * w: a, then b * w below */
+      } else {
+         p0 = vs->src[1 - pixel];
+         p1 = w;
+         k = vs->src[2];
+      }
+
+      /* new units before this one, w may come after the inner unit, which
+       * is left unread: the factor of x, and the constant term */
+      struct fp_unit *n = fp_new_unit(c);
+      if (c->failed)
+         return false;
+      fp_unit_op(&n->slots[0], FP_ALU_OP_MAD, p0, p1, fp_opnd_zero(c, false));
+      fp_move_last_unit(c, i);
+      int at_unit = i + 1;
+      if (pixel == 2) {
+         /* b * w first, then a * (b * w) + z */
+         n = fp_new_unit(c);
+         if (c->failed)
+            return false;
+         fp_unit_op(&n->slots[0], FP_ALU_OP_MAD, vs->src[1], w, fp_opnd_zero(c, false));
+         fp_move_last_unit(c, at_unit++);
+         w = fp_opnd_value(c, &c->units[at_unit - 1]);
+      }
+      n = fp_new_unit(c);
+      if (c->failed)
+         return false;
+      fp_unit_op(&n->slots[0], FP_ALU_OP_MAD, k, w, z);
+      fp_move_last_unit(c, at_unit);
+      fp_unit_op(&c->units[at_unit + 1].slots[0], FP_ALU_OP_MAD, x,
+                 fp_opnd_value(c, &c->units[i]), fp_opnd_value(c, &c->units[at_unit]));
+      return true;
+   }
+   return false;
+}
+
+/* (x * y) * z -> the two shallower factors first */
+static bool
+fp_regroup_product(struct fp_compiler *c, struct fp_reassoc *r, int i)
+{
+   struct fp_unit_slot *s = &c->units[i].slots[0];
+
+   if (!fp_opnd_is_const(c, &s->src[2], 0.0f))
+      return false;
+   for (int a = 0; a < 2; a++) {
+      struct fp_unit *v = fp_inner(c, r, &s->src[a]);
+      if (!v || !fp_opnd_is_const(c, &v->slots[0].src[2], 0.0f))
+         continue;
+
+      struct fp_opnd f[3] = { v->slots[0].src[0], v->slots[0].src[1], s->src[1 - a] };
+      bool negate = s->src[a].negate;
+      /* a level is gained when an inner factor is deeper than both others */
+      int deepest = fp_opnd_depth(r, &f[0]) > fp_opnd_depth(r, &f[1]) ? 0 : 1;
+      int dd = fp_opnd_depth(r, &f[deepest]);
+      if (dd <= fp_opnd_depth(r, &f[1 - deepest]) || dd <= fp_opnd_depth(r, &f[2]))
+         continue;
+
+      /* the pair goes into a new unit before this one (the outer factor
+       * may come after the inner unit) */
+      struct fp_opnd p0 = f[deepest == 0 ? 1 : 0], p1 = f[2];
+      struct fp_unit *n = fp_new_unit(c);
+      if (c->failed)
+         return false;
+      fp_unit_op(&n->slots[0], FP_ALU_OP_MAD, fp_negated(p0, negate), p1,
+                 fp_opnd_zero(c, false));
+      fp_move_last_unit(c, i);
+      struct fp_opnd d = f[deepest];
+      if (d.kind == FP_OPND_VALUE && d.index >= i)
+         d.index++;
+      fp_unit_op(&c->units[i + 1].slots[0], FP_ALU_OP_MAD,
+                 fp_opnd_value(c, &c->units[i]), d, fp_opnd_zero(c, false));
+      return true;
+   }
+   return false;
+}
+
+void
+fp_reassociate(struct fp_compiler *c)
+{
+   struct fp_reassoc r;
+   bool progress = true;
+
+   for (int pass = 0; progress && pass < 16 && !c->failed; pass++) {
+      progress = false;
+      fp_reassoc_scan(c, &r);
+      for (int i = 0; i < c->num_units && !progress; i++) {
+         if (!fp_plain_mad(&r, c, i) || r.uniform[i])
+            continue;
+         progress = fp_fold_affine(c, &r, i) || fp_regroup_product(c, &r, i);
+      }
+   }
+}
