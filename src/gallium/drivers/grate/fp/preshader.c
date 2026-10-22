@@ -21,7 +21,7 @@
 
 #include "util/macros.h"
 
-static float
+float
 fp20_to_float(uint32_t v)
 {
    union { uint32_t u; float f; } r;

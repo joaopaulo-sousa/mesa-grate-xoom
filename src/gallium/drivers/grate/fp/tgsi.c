@@ -171,6 +171,7 @@ fp_new_unit(struct fp_compiler *c)
    u->forward = true;
    u->packet = -1;
    u->reg = -1;
+   u->half = -1;
    return u;
 }
 

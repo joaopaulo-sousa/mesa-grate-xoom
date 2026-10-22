@@ -74,6 +74,8 @@ struct fp_unit {
    int packet;
    int slot;
    int reg;                /* register holding the value, -1 if none */
+   bool fx10;              /* may be kept as a fixed10 half (fx10.c) */
+   int half;               /* ... and is, in this half of reg; -1: fp20 */
 };
 
 /* What one EXEC of a sequential program does (sched_seq.c) */
@@ -174,7 +176,11 @@ void fp_mfu_bary_setup(struct fp_mfu_instr *mfu);
 uint32_t fp_pseq_word(const struct fp_compiler *c, int pair);
 uint32_t fp_tex_word(const struct fp_compiler *c, int n, int coord_pair);
 
+/* fx10.c */
+void fp_mark_fx10(struct fp_compiler *c);
+
 /* preshader.c */
+float fp20_to_float(uint32_t v);
 void fp_preshade(struct fp_compiler *c);
 void fp_specialize(struct fp_compiler *c);
 

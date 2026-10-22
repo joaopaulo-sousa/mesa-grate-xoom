@@ -14,15 +14,19 @@
  *   either pair.
  * - Within an EXEC the ALU sees what that EXEC's PSEQ/MFU/TEX loaded, and a
  *   packet reads the previous packet's results as alu0..3; its own register
- *   writes are only seen by the following EXECs.
+ *   writes are only seen by the following EXECs. A later packet of the EXEC
+ *   may see them all the same (a fixed10 half was, fstest fxlum), so no
+ *   register is written while a later packet of its EXEC reads it.
  * - ex2/sin/cos take the pre-op on the same register in an earlier EXEC.
  *
  * Phase 1 assigns every unit, varying fetch, texture fetch and the
  * destination load an EXEC (and the ALU units a packet), keeping at most
- * "limit" register items live; phase 2 gives the items one of the four
- * registers. A failed phase 2 is retried with a lower limit.
+ * "limit" register halves live; phase 2 gives the items one of the four
+ * registers, or of their halves for fixed10 values (fx10.c). A failed phase 2
+ * is retried with a lower limit.
  */
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "grate_common.h"
@@ -32,12 +36,12 @@
 #include "util/u_memory.h"
 
 #define SEQ_REGS 4
-#define T_PSEQ 0          /* stages of an EXEC, as times 5 * exec + stage */
+#define SEQ_HALVES (2 * SEQ_REGS)
+#define T_PSEQ 0          /* stages of an EXEC, as times 8 * (4 * exec + stage) */
 #define T_MFU 1
 #define T_TEX 2
-#define T_ALU_READ 3
-#define T_ALU_WRITE 4
-#define SEQ_T(e, stage) (5 * (e) + (stage))
+#define T_ALU 3           /* ... + 2 * packet in the EXEC, + 1 for its writes */
+#define SEQ_T(e, stage) (8 * (4 * (e) + (stage)))
 #define SEQ_FOREVER (1 << 20)
 
 struct seq_state {
@@ -109,6 +113,13 @@ seq_reg_ready(struct fp_compiler *c, struct seq_state *s,
  * colour in a register pair.
  */
 enum seq_item_kind { SEQ_NONE, SEQ_VALUE, SEQ_INPUT, SEQ_TEXEL, SEQ_DST, SEQ_OUT };
+
+/* Register halves an item takes: one for a fixed10 value */
+static int
+seq_item_size(struct fp_compiler *c, enum seq_item_kind kind, int a)
+{
+   return kind == SEQ_VALUE && c->units[a].fx10 ? 1 : 2;
+}
 
 static bool
 seq_opnd_is(const struct fp_opnd *o, enum seq_item_kind kind, int a, int b)
@@ -186,29 +197,36 @@ seq_fixed_free(struct fp_compiler *c, const struct seq_owner *own, int e)
           !seq_item_needed(c, own->kind, own->a, own->b, e, -1);
 }
 
-/* Register items live after EXEC e */
+/* Register halves live after EXEC e */
 static int
 seq_live_items(struct fp_compiler *c, const struct seq_owner *owner, int e)
 {
    int n = 0;
 
-   for (int r = 0; r < SEQ_REGS; r++)
-      n += !seq_fixed_free(c, &owner[r], e + 1);
+   for (int r = 0; r < SEQ_REGS; r++) {
+      if (seq_fixed_free(c, &owner[r], e + 1))
+         continue;
+      if (owner[r].kind == SEQ_TEXEL || owner[r].kind == SEQ_DST)
+         for (int h = 0; h < 2; h++)
+            n += seq_half_needed(c, owner[r].kind, owner[r].a, r, h, e + 1, -1);
+      else
+         n += 2;
+   }
    for (int i = 0; i < c->num_units; i++) {
       struct fp_unit *u = &c->units[i];
       if (u->live && u->exec >= 0 && fp_unit_has_value(u) &&
           seq_item_needed(c, SEQ_VALUE, i, 0, e + 1, -1))
-         n++;
+         n += seq_item_size(c, SEQ_VALUE, i);
    }
    return n;
 }
 
-/* Change of the live items when unit i is scheduled in EXEC e */
+/* Change of the live halves when unit i is scheduled in EXEC e */
 static int
 seq_unit_delta(struct fp_compiler *c, int i, int e)
 {
    struct fp_unit *u = &c->units[i];
-   int delta = fp_unit_has_value(u) ? 1 : 0;
+   int delta = fp_unit_has_value(u) ? seq_item_size(c, SEQ_VALUE, i) : 0;
 
    fp_unit_foreach_src(u, k, j) {
       struct fp_opnd *o = &u->slots[k].src[j];
@@ -227,7 +245,7 @@ seq_unit_delta(struct fp_compiler *c, int i, int e)
             seen = true;
       }
       if (!seen && !seq_item_needed(c, kind, o->index, o->comp, e + 1, i))
-         delta--;
+         delta -= seq_item_size(c, kind, o->index);
    }
    return delta;
 }
@@ -331,7 +349,7 @@ seq_fetch_inputs(struct fp_compiler *c, struct seq_state *s,
          struct fp_opnd *o = ops[k];
          int comp = o->comp;
          if (o->kind != FP_OPND_INPUT || s->fetch_exec[o->index][comp] >= 0 ||
-             live + 1 > limit)
+             live + 2 > limit)
             continue;
          int r = seq_fetch_reg(c, owner, x, o->index, comp, e);
          if (r < 0)
@@ -341,7 +359,7 @@ seq_fetch_inputs(struct fp_compiler *c, struct seq_state *s,
          s->fetch_exec[o->index][comp] = e;
          s->fetch_reg[o->index][comp] = r;
          owner[r] = (struct seq_owner) { SEQ_INPUT, o->index, comp };
-         live++;
+         live += 2;
          any = true;
       }
    }
@@ -514,7 +532,7 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
       /* PSEQ: once a reader of the destination has its other operands,
        * into a free register pair */
       if (c->dst_used && s->dst_exec < 0 &&
-          seq_live_items(c, owner, e - 1) + 2 <= limit) {
+          seq_live_items(c, owner, e - 1) + 4 <= limit) {
          for (int i = 0; i < c->num_units; i++) {
             struct fp_unit *u = &c->units[i];
             if (!u->live || u->exec >= 0 || !seq_reads_dst(u) ||
@@ -541,7 +559,7 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
          if (!c->tex[n].live || c->tex[n].exec >= 0 ||
              !seq_reg_ready(c, s, &c->tex[n].coord[0], e, true) ||
              !seq_reg_ready(c, s, &c->tex[n].coord[1], e, true) ||
-             seq_live_items(c, owner, e - 1) + 2 > limit)
+             seq_live_items(c, owner, e - 1) + 4 > limit)
             continue;
          for (int p = 0; p < 2; p++) {
             struct fp_opnd *s0 = &c->tex[n].coord[0], *s1 = &c->tex[n].coord[1];
@@ -568,7 +586,9 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
          }
       }
 
-      /* ALU packets: closing items first, at most "limit" live */
+      /* ALU packets: closing items first, at most "limit" live; room is
+       * kept for the destination colour load unless that blocks everything */
+      bool reserve = c->dst_used && s->dst_exec < 0;
       for (int p = 0; p < FP_MAX_PACKETS_PER_EXEC && remaining; p++) {
          unsigned mask = 0;
          for (;;) {
@@ -582,8 +602,7 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
                                       mask == 0xf)
                   continue;
                int delta = seq_unit_delta(c, i, e);
-               /* keep a register pair for the destination colour load */
-               int room = limit - (c->dst_used && s->dst_exec < 0 ? 2 : 0);
+               int room = limit - (reserve && s->dst_exec < 0 ? 4 : 0);
                if (delta > 0 && seq_live_items(c, owner, e) + delta > room &&
                    !seq_forwardable(c, s, i, e, packet, p))
                   continue;
@@ -591,6 +610,10 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
                   best = i;
                   best_delta = delta;
                }
+            }
+            if (best < 0 && reserve && !mask && !progress) {
+               reserve = false;
+               continue;
             }
             if (best < 0)
                break;
@@ -639,34 +662,63 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
 /*
  * Phase 2: register items. Values an SFU works on in place share one item
  * (the chain of copy, pre-op and op); an item lives from the stage that
- * writes it to the last stage reading it.
+ * writes it to the last stage reading it. Texels, the destination colour and
+ * the colour output are fixed10 halves, one item each, so that a half freed
+ * by its last read can take a fixed10 value or a colour channel.
  */
 struct seq_item {
    int def, last;
    int reg;               /* fixed register or -1 */
-   bool halves;           /* fixed10 halves: texel, destination, colour */
-   int pair_tex;          /* coordinate of texture fetch n (pair constraint) */
-   int pair_slot;         /* 0: s, 1: t */
+   int half;              /* fixed half of reg, -1: the whole register */
+   bool fx10;             /* a fixed10 value: any one half */
 };
+
+static int
+seq_alu_time(struct fp_compiler *c, struct fp_unit *u, bool write)
+{
+   return SEQ_T(u->exec, T_ALU) + 2 * (u->packet - c->seq_exec[u->exec].first_packet) + write;
+}
 
 static int
 seq_read_time(struct fp_compiler *c, struct fp_unit *r)
 {
-   return seq_is_alu(r) ? SEQ_T(r->exec, T_ALU_READ) : SEQ_T(r->exec, T_MFU);
+   return seq_is_alu(r) ? seq_alu_time(c, r, false) : SEQ_T(r->exec, T_MFU);
+}
+
+static bool
+seq_overlap(const struct seq_item *a, const struct seq_item *b)
+{
+   return a->def <= b->last && b->def <= a->last;
+}
+
+/* Whether a fixed item other than "self" needs register r (half h, -1: any)
+ * while item "it" lives */
+static bool
+seq_fixed_clash(const struct seq_item *items, int num, int self,
+                const struct seq_item *it, int r, int h)
+{
+   for (int f = 0; f < num; f++) {
+      const struct seq_item *x = &items[f];
+      if (f != self && x->reg == r && x->last >= x->def &&
+          (h < 0 || x->half < 0 || x->half == h) && seq_overlap(x, it))
+         return true;
+   }
+   return false;
 }
 
 static bool
 seq_alloc(struct fp_compiler *c, struct seq_state *s)
 {
-   struct seq_item items[FP_MAX_UNITS + FP_MAX_INPUTS * 4 + 2 * FP_MAX_TEXTURES + 4];
+   struct seq_item items[FP_MAX_UNITS + FP_MAX_INPUTS * 4 + 4 * FP_MAX_TEXTURES + 8];
    int value_item[FP_MAX_UNITS], input_item[FP_MAX_INPUTS][4];
-   int texel_item[FP_MAX_TEXTURES][2], dst_item[2] = { -1, -1 };
-   int out_item[2] = { -1, -1 };
+   int texel_item[FP_MAX_TEXTURES][4], dst_item[4], out_item[4];
    int num = 0;
 
    memset(value_item, -1, sizeof(value_item));
    memset(input_item, -1, sizeof(input_item));
    memset(texel_item, -1, sizeof(texel_item));
+   memset(dst_item, -1, sizeof(dst_item));
+   memset(out_item, -1, sizeof(out_item));
 
    /* values that need a register: read in a later EXEC, by an SFU or TEX */
    for (int i = 0; i < c->num_units; i++) {
@@ -678,29 +730,31 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
          value_item[i] = value_item[u->slots[0].src[0].index];
          continue;
       }
-      items[num] = (struct seq_item) { .def = SEQ_T(u->exec, T_ALU_WRITE), .last = -1, .reg = -1, .pair_tex = -1 };
+      items[num] = (struct seq_item) { .def = seq_alu_time(c, u, true), .last = -1, .reg = -1, .half = -1, .fx10 = u->fx10 };
       value_item[i] = num++;
    }
    for (int i = 0; i < FP_MAX_INPUTS; i++)
       for (int k = 0; k < 4; k++)
          if (s->fetch_exec[i][k] >= 0) {
-            items[num] = (struct seq_item) { .def = SEQ_T(s->fetch_exec[i][k], T_MFU), .last = -1, .reg = s->fetch_reg[i][k], .pair_tex = -1 };
+            items[num] = (struct seq_item) { .def = SEQ_T(s->fetch_exec[i][k], T_MFU), .last = -1, .reg = s->fetch_reg[i][k], .half = -1 };
             input_item[i][k] = num++;
          }
+   /* the TEX and the PSEQ load write all four halves of their pair, read
+    * or not */
    for (int n = 0; n < c->num_tex; n++) {
       if (!c->tex[n].live)
          continue;
-      int q = 1 - c->tex[n].pair;
-      for (int k = 0; k < 2; k++) {
-         items[num] = (struct seq_item) { .def = SEQ_T(c->tex[n].exec, T_TEX), .last = -1, .reg = 2 * q + k, .halves = true, .pair_tex = -1 };
-         texel_item[n][k] = num++;
+      int q = 1 - c->tex[n].pair, t = SEQ_T(c->tex[n].exec, T_TEX);
+      for (int h = 0; h < 4; h++) {
+         items[num] = (struct seq_item) { .def = t, .last = t, .reg = 2 * q + h / 2, .half = h % 2 };
+         texel_item[n][h] = num++;
       }
    }
    if (c->dst_used) {
-      int q = c->dst_pair;
-      for (int k = 0; k < 2; k++) {
-         items[num] = (struct seq_item) { .def = SEQ_T(s->dst_exec, T_PSEQ), .last = -1, .reg = 2 * q + k, .halves = true, .pair_tex = -1 };
-         dst_item[k] = num++;
+      int q = c->dst_pair, t = SEQ_T(s->dst_exec, T_PSEQ);
+      for (int h = 0; h < 4; h++) {
+         items[num] = (struct seq_item) { .def = t, .last = t, .reg = 2 * q + h / 2, .half = h % 2 };
+         dst_item[h] = num++;
       }
    }
 
@@ -722,9 +776,9 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
          } else if (o->kind == FP_OPND_INPUT)
             SEQ_READ(input_item[o->index][o->comp], t);
          else if (o->kind == FP_OPND_TEXEL)
-            SEQ_READ(texel_item[o->index][fp_output_half(o->comp) / 2], t);
+            SEQ_READ(texel_item[o->index][fp_output_half(o->comp)], t);
          else if (o->kind == FP_OPND_DST)
-            SEQ_READ(dst_item[fp_output_half(o->comp) / 2], t);
+            SEQ_READ(dst_item[fp_output_half(o->comp)], t);
       }
    }
    for (int n = 0; n < c->num_tex; n++) {
@@ -738,27 +792,29 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
          if (it < 0)
             return false;
          SEQ_READ(it, SEQ_T(c->tex[n].exec, T_TEX));
-         /* the coordinates are read from pair p: s in 2p, t in 2p+1 */
+         /* the coordinates are read from pair p: s in 2p, t in 2p+1, as
+          * fp20 values */
          int want = 2 * p + k;
          if (items[it].reg >= 0 && items[it].reg != want)
             return false;
          items[it].reg = want;
+         items[it].fx10 = false;
       }
    }
 #undef SEQ_READ
 
-   /* colour writes own their pair from the first one on */
+   /* colour channels own their half from the first write on */
    for (int i = 0; i < c->num_units; i++) {
       struct fp_unit *u = &c->units[i];
       if (!u->live || u->output_chan < 0)
          continue;
-      int r = fp_output_half(u->output_chan) / 2;
-      int t = SEQ_T(u->exec, T_ALU_WRITE);
-      if (out_item[r] < 0) {
-         items[num] = (struct seq_item) { .def = t, .last = SEQ_FOREVER, .reg = 2 * c->out_pair + r, .halves = true, .pair_tex = -1 };
-         out_item[r] = num++;
+      int h = fp_output_half(u->output_chan);
+      int t = seq_alu_time(c, u, true);
+      if (out_item[h] < 0) {
+         items[num] = (struct seq_item) { .def = t, .last = SEQ_FOREVER, .reg = 2 * c->out_pair + h / 2, .half = h % 2 };
+         out_item[h] = num++;
       }
-      items[out_item[r]].def = MIN2(items[out_item[r]].def, t);
+      items[out_item[h]].def = MIN2(items[out_item[h]].def, t);
    }
 
    /* items without readers (results only forwarded) take no register */
@@ -778,66 +834,70 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
          int tmp = order[k]; order[k] = order[k - 1]; order[k - 1] = tmp;
       }
 
-   int busy_until[SEQ_REGS];
-   bool busy_halves[SEQ_REGS];
-   for (int r = 0; r < SEQ_REGS; r++) {
-      busy_until[r] = -1;
-      busy_halves[r] = true;
-   }
-   int assigned[ARRAY_SIZE(items)];
+   int until[SEQ_REGS][2];
+   memset(until, -1, sizeof(until));
+   int assigned[ARRAY_SIZE(items)], assigned_half[ARRAY_SIZE(items)];
    for (int oi = 0; oi < num; oi++) {
       int i = order[oi];
       struct seq_item *it = &items[i];
-      if (it->last < it->def) {
-         assigned[i] = -1;
+      assigned[i] = assigned_half[i] = -1;
+      if (it->last < it->def)
          continue;
-      }
-      int r = it->reg;
+
+      int r = it->reg, h = it->half;
       if (r < 0) {
-         /* a free register no later fixed item needs during this one */
+         /* a free register, or half for a fixed10 value, that no fixed
+          * item needs meanwhile */
          for (r = 0; r < SEQ_REGS; r++) {
-            if (busy_until[r] >= it->def)
-               continue;
-            bool clash = false;
-            for (int f = 0; f < num; f++)
-               if (f != i && items[f].reg == r && items[f].def <= it->last &&
-                   items[f].last >= it->def && items[f].last >= items[f].def)
-                  clash = true;
-            if (!clash)
+            if (it->fx10) {
+               for (h = 0; h < 2; h++)
+                  if (until[r][h] < it->def && !seq_fixed_clash(items, num, i, it, r, h))
+                     break;
+               if (h < 2)
+                  break;
+            } else if (until[r][0] < it->def && until[r][1] < it->def &&
+                       !seq_fixed_clash(items, num, i, it, r, -1))
                break;
          }
          if (r == SEQ_REGS) {
             if (grate_debug & GRATE_DEBUG_TGSI)
-               fprintf(stderr, "GRATE FRAG: no register for item %d [%d, %d] (busy %d %d %d %d)\n",
-                       i, it->def, it->last, busy_until[0], busy_until[1],
-                       busy_until[2], busy_until[3]);
+               fprintf(stderr, "GRATE FRAG: no register for item %d [%d, %d]%s\n",
+                       i, it->def, it->last, it->fx10 ? " (fixed10)" : "");
             return false;
          }
-      } else if (busy_until[r] >= it->def && !(it->halves && busy_halves[r])) {
+         if (!it->fx10)
+            h = -1;
+      } else if (h >= 0 ? until[r][h] >= it->def :
+                          until[r][0] >= it->def || until[r][1] >= it->def) {
          if (grate_debug & GRATE_DEBUG_TGSI)
-            fprintf(stderr, "GRATE FRAG: fixed r%d for item %d [%d, %d] busy until %d\n",
-                    r, i, it->def, it->last, busy_until[r]);
+            fprintf(stderr, "GRATE FRAG: fixed r%d%s for item %d [%d, %d] busy until %d/%d\n",
+                    r, h < 0 ? "" : h ? ".h" : ".l", i, it->def, it->last,
+                    until[r][0], until[r][1]);
          return false;
       }
       assigned[i] = r;
-      busy_halves[r] = it->halves && (busy_halves[r] || busy_until[r] < it->def);
-      busy_until[r] = MAX2(busy_until[r], it->last);
+      assigned_half[i] = h;
+      for (int k = 0; k < 2; k++)
+         if (h < 0 || h == k)
+            until[r][k] = it->last;
    }
 
    for (int i = 0; i < c->num_units; i++) {
       struct fp_unit *u = &c->units[i];
-      u->reg = u->live && value_item[i] >= 0 ? assigned[value_item[i]] : -1;
+      bool held = u->live && value_item[i] >= 0;
+      u->reg = held ? assigned[value_item[i]] : -1;
+      u->half = held ? assigned_half[value_item[i]] : -1;
    }
    return true;
 }
 
-bool
-fp_sched_seq(struct fp_compiler *c)
+static bool
+seq_try(struct fp_compiler *c, int step)
 {
    struct seq_state s;
 
    for (c->out_pair = 1; c->out_pair >= 0; c->out_pair--)
-   for (int limit = SEQ_REGS; limit > 0; limit--) {
+   for (int limit = SEQ_HALVES; limit > 0; limit -= step) {
       if (!seq_schedule(c, &s, limit)) {
          if (grate_debug & GRATE_DEBUG_TGSI)
             fprintf(stderr, "GRATE FRAG: sequential schedule failed (limit %d)\n", limit);
@@ -860,6 +920,27 @@ fp_sched_seq(struct fp_compiler *c)
          fprintf(stderr, "GRATE FRAG: sequential registers failed (limit %d)\n", limit);
    }
    return false;
+}
+
+/* fp20 values first; fixed10 halves for those that may (fx10.c) only when
+ * the program does not fit otherwise. GRATE_FP_FX10=0 turns them off. */
+bool
+fp_sched_seq(struct fp_compiler *c)
+{
+   for (int i = 0; i < c->num_units; i++)
+      c->units[i].fx10 = false;
+   if (seq_try(c, 2))
+      return true;
+   if (getenv("GRATE_FP_FX10") && !atoi(getenv("GRATE_FP_FX10")))
+      return false;
+
+   fp_mark_fx10(c);
+   int n = 0;
+   for (int i = 0; i < c->num_units; i++)
+      n += c->units[i].fx10;
+   if (grate_debug & GRATE_DEBUG_TGSI)
+      fprintf(stderr, "GRATE FRAG: retrying with %d fixed10 values\n", n);
+   return n && seq_try(c, 1);
 }
 
 /* Register an operand of a unit in EXEC e, packet p is read from */
@@ -896,6 +977,10 @@ seq_resolve(struct fp_compiler *c, const struct fp_opnd *o, int e, int p)
       else {
          assert(d->reg >= 0);
          ret.index = d->reg;
+         if (d->half >= 0) {
+            ret.datatype = FP_DATATYPE_FIXED10;
+            ret.sub_reg_select_high = d->half;
+         }
       }
       break;
    }
@@ -939,8 +1024,8 @@ seq_emit_unit(struct fp_compiler *c, struct fp_unit *u,
          a->dst.write_high_sub_reg = (o % 2) != 0;
       } else {
          a->dst.index = u->kill ? FP_KILL_REG : u->reg >= 0 ? u->reg : 31;
-         a->dst.write_low_sub_reg = true;
-         a->dst.write_high_sub_reg = true;
+         a->dst.write_low_sub_reg = u->half != 1;
+         a->dst.write_high_sub_reg = u->half != 0;
       }
    }
 }
