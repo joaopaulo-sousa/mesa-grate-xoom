@@ -128,6 +128,8 @@ grate_resource_destroy(struct pipe_screen *pscreen,
 {
    struct grate_resource *resource = grate_resource(presource);
 
+   if (resource->stencil)
+      grate_resource_destroy(pscreen, &resource->stencil->b);
    grate_bo_unref(resource->bo);
    FREE(resource);
 }
@@ -146,6 +148,12 @@ grate_resource_transfer_map(struct pipe_context *pcontext,
 
    if (usage & PIPE_MAP_DIRECTLY)
       return NULL;
+
+   /* the two planes have no packed CPU view; GLES 2 does not read depth */
+   if (resource->stencil) {
+      grate_loge("no CPU access to %s\n", util_format_short_name(presource->format));
+      return NULL;
+   }
 
    /*
     * Let the jobs that used the BO land before handing out a CPU pointer:
@@ -221,6 +229,7 @@ grate_pixel_format(enum pipe_format format)
    case PIPE_FORMAT_B4G4R4A4_UNORM:
       return TGR3D_SURF_FORMAT_A4B4G4R4;
    case PIPE_FORMAT_Z16_UNORM:
+   case PIPE_FORMAT_Z24_UNORM_S8_UINT:   /* the depth plane, see stencil */
       return TGR3D_SURF_FORMAT_Z16;
    case PIPE_FORMAT_B8G8R8A8_UNORM:
    case PIPE_FORMAT_B8G8R8X8_UNORM:
@@ -230,6 +239,13 @@ grate_pixel_format(enum pipe_format format)
    default:
       return -1;
    }
+}
+
+/* Bytes per pixel of the surface the hardware uses */
+unsigned
+grate_resource_blocksize(enum pipe_format format)
+{
+   return format == PIPE_FORMAT_Z24_UNORM_S8_UINT ? 2 : util_format_get_blocksize(format);
 }
 
 static struct pipe_resource *
@@ -249,7 +265,7 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
    pipe_reference_init(&resource->b.reference, 1);
    resource->b.screen = pscreen;
 
-   resource->pitch = template->width0 * util_format_get_blocksize(template->format);
+   resource->pitch = template->width0 * grate_resource_blocksize(template->format);
    height = template->height0;
 
    resource->tiled = 0;
@@ -303,7 +319,7 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
     */
    unsigned levels = MIN2(template->last_level + 1, GRATE_MAX_MIP_LEVELS);
    unsigned lw = template->width0, lh = height;
-   unsigned blocksize = util_format_get_blocksize(template->format);
+   unsigned blocksize = grate_resource_blocksize(template->format);
 
    size = 0;
    for (unsigned l = 0; l < levels; ++l) {
@@ -325,7 +341,19 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
    resource->bo = grate_bo_alloc(screen->drm, size, flags);
    if (!resource->bo) {
       fprintf(stderr, "grate_bo_alloc() failed\n");
+      FREE(resource);
       return NULL;
+   }
+
+   if (template->format == PIPE_FORMAT_Z24_UNORM_S8_UINT) {
+      struct pipe_resource plane = *template;
+      plane.format = PIPE_FORMAT_S8_UINT;
+      struct pipe_resource *s = grate_screen_resource_create(pscreen, &plane);
+      if (!s) {
+         grate_resource_destroy(pscreen, &resource->b);
+         return NULL;
+      }
+      resource->stencil = grate_resource(s);
    }
 
    return &resource->b;
@@ -574,6 +602,29 @@ fill(struct grate_stream *stream, uint32_t **ptrp,
    *ptrp = ptr;
 }
 
+/* Clear the depth and/or stencil of a depth/stencil surface, plane by plane */
+static void
+fill_zs(struct grate_stream *stream, uint32_t **ptrp, struct pipe_surface *dst,
+        unsigned flags, double depth, unsigned stencil,
+        unsigned x, unsigned y, unsigned width, unsigned height)
+{
+   struct grate_resource *res = grate_resource(dst->texture);
+   const struct util_format_description *desc = util_format_description(dst->format);
+   bool clear_depth = (flags & PIPE_CLEAR_DEPTH) && util_format_has_depth(desc);
+   bool clear_stencil = (flags & PIPE_CLEAR_STENCIL) && util_format_has_stencil(desc);
+
+   if (res->stencil) {
+      if (clear_depth)
+         fill(stream, ptrp, res, util_pack_z(PIPE_FORMAT_Z16_UNORM, depth), 2,
+              x, y, width, height);
+      if (clear_stencil)
+         fill(stream, ptrp, res->stencil, stencil, 1, x, y, width, height);
+   } else if (clear_depth || clear_stencil) {
+      fill(stream, ptrp, res, util_pack_z_stencil(dst->format, depth, stencil),
+           util_format_get_blocksize(dst->format), x, y, width, height);
+   }
+}
+
 static void
 grate_clear(struct pipe_context *pcontext, unsigned int buffers,
             uint32_t color_clear_mask, uint8_t stencil_clear_mask,
@@ -623,14 +674,8 @@ grate_clear(struct pipe_context *pcontext, unsigned int buffers,
    }
 
    if (buffers & PIPE_CLEAR_DEPTH || buffers & PIPE_CLEAR_STENCIL) {
-      if (fb->zsbuf.texture) {
-         /* TODO: handle the case where both are not set! */
-         fill(stream, &ptr, 
-                  grate_resource(fb->zsbuf.texture),
-                  util_pack_z_stencil(fb->zsbuf.format, depth, stencil),
-                  util_format_get_blocksize(fb->zsbuf.format),
-                  x, y, w, h);
-      }
+      if (fb->zsbuf.texture)
+         fill_zs(stream, &ptr, &fb->zsbuf, buffers, depth, stencil, x, y, w, h);
    }
    
    grate_stream_end(stream, &ptr);
@@ -689,11 +734,7 @@ grate_clear_depth_stencil(struct pipe_context *pipe,
       return;
    }
    
-   fill(&context->gr2d->stream, &ptr,
-        grate_resource(dst->texture),
-        util_pack_z_stencil(dst->format, depth, stencil),
-        util_format_get_blocksize(dst->format),
-        dstx, dsty, width, height);
+   fill_zs(stream, &ptr, dst, clear_flags, depth, stencil, dstx, dsty, width, height);
    
    grate_stream_end(stream, &ptr);
    grate_stream_flush(stream, false);

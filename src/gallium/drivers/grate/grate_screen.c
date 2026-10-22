@@ -407,6 +407,15 @@ grate_screen_is_format_supported(struct pipe_screen *pscreen,
     * came out with red and blue swapped in RetroArch). Sample only those,
     * the frontend converts the rest on upload.
     */
+   /* depth/stencil is two planes (grate_resource.stencil): a depth/stencil
+    * buffer only */
+   if (format == PIPE_FORMAT_Z24_UNORM_S8_UINT &&
+       (usage & ~PIPE_BIND_DEPTH_STENCIL & (PIPE_BIND_RENDER_TARGET |
+                                            PIPE_BIND_SAMPLER_VIEW |
+                                            PIPE_BIND_DISPLAY_TARGET |
+                                            PIPE_BIND_SCANOUT | PIPE_BIND_SHARED)))
+      return false;
+
    if ((usage & PIPE_BIND_SAMPLER_VIEW) &&
        format != PIPE_FORMAT_B8G8R8A8_UNORM &&
        format != PIPE_FORMAT_B8G8R8X8_UNORM)

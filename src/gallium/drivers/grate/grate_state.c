@@ -39,9 +39,8 @@ grate_set_constant_buffer(struct pipe_context *pcontext, enum mesa_shader_stage 
 
 static void
 grate_set_render_target(struct grate_context *context, unsigned slot,
-                        const struct pipe_surface *ref)
+                        const struct grate_resource *res)
 {
-   struct grate_resource *res = grate_resource(ref->texture);
    uint32_t rt_params;
 
    rt_params  = TGR3D_GLOBAL_SURFDESC_SURF_FORMAT(res->format);
@@ -65,10 +64,19 @@ grate_set_framebuffer_state(struct pipe_context *pcontext,
 
    assert(framebuffer->nr_cbufs <= 1);
    if (framebuffer->nr_cbufs && framebuffer->cbufs[0].texture)
-      grate_set_render_target(context, GRATE_RT_COLOR, &framebuffer->cbufs[0]);
+      grate_set_render_target(context, GRATE_RT_COLOR,
+                              grate_resource(framebuffer->cbufs[0].texture));
 
-   if (framebuffer->zsbuf.texture)
-      grate_set_render_target(context, GRATE_RT_DEPTH, &framebuffer->zsbuf);
+   if (framebuffer->zsbuf.texture) {
+      struct grate_resource *zs = grate_resource(framebuffer->zsbuf.texture);
+      const struct util_format_description *desc =
+         util_format_description(framebuffer->zsbuf.format);
+
+      if (util_format_has_depth(desc))
+         grate_set_render_target(context, GRATE_RT_DEPTH, zs);
+      if (util_format_has_stencil(desc))
+         grate_set_render_target(context, GRATE_RT_STENCIL, zs->stencil ? zs->stencil : zs);
+   }
 
    /* prepare the scissor-registers for the non-scissor case */
    context->no_scissor[0]  = host1x_opcode_incr(REG_TGR3D_SU_SCISSOR_X, 2);
