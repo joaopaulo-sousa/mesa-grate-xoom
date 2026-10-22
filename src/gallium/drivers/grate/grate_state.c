@@ -37,30 +37,20 @@ grate_set_constant_buffer(struct pipe_context *pcontext, enum mesa_shader_stage 
    util_copy_constant_buffer(&context->constant_buffer[shader], buffer);
 }
 
-static void grate_add_render_target(struct grate_context *context,
-                                    const struct pipe_surface *ref) 
+static void
+grate_set_render_target(struct grate_context *context, unsigned slot,
+                        const struct pipe_surface *ref)
 {
-   if (!ref->texture) {
-      fprintf(stderr, "%s: texture at %p null!", __func__, ref);
-      assert(0);
-      return;
-   }
-   if (context->framebuffer.num_rts >= context->base.screen->caps.max_render_targets) {
-      fprintf(stderr, "%s: Reached max render targets!", __func__);
-      assert(0);
-      return;
-   }
    struct grate_resource *res = grate_resource(ref->texture);
    uint32_t rt_params;
-   
+
    rt_params  = TGR3D_GLOBAL_SURFDESC_SURF_FORMAT(res->format);
    rt_params |= TGR3D_GLOBAL_SURFDESC_ARRAY_STRIDE(res->pitch);
    rt_params |= TGR3D_GLOBAL_SURFDESC_STRUCTURE(res->tiled);
-   
-   context->framebuffer.rt_params[context->framebuffer.num_rts] = rt_params;
-   context->framebuffer.rt_bos[context->framebuffer.num_rts] = res->bo;
-   context->framebuffer.rt_mask |= 1 << context->framebuffer.num_rts;
-   context->framebuffer.num_rts++;
+
+   context->framebuffer.rt_params[slot] = rt_params;
+   context->framebuffer.rt_bos[slot] = res->bo;
+   context->framebuffer.rt_present |= 1 << slot;
 }
 
 static void
@@ -69,18 +59,16 @@ grate_set_framebuffer_state(struct pipe_context *pcontext,
 {
    struct grate_context *context = grate_context(pcontext);
    struct pipe_framebuffer_state *cso = &context->framebuffer.base;
-   context->framebuffer.rt_mask = 0;
-   context->framebuffer.num_rts = 0;
+   context->framebuffer.rt_present = 0;
 
    util_copy_framebuffer_state(cso, framebuffer);
 
-   for (unsigned int i = 0; i < framebuffer->nr_cbufs; i++) {
-      grate_add_render_target(context, &framebuffer->cbufs[i]);
-   }
-   
-   if (framebuffer->zsbuf.texture) {
-      grate_add_render_target(context, &framebuffer->zsbuf);
-   }
+   assert(framebuffer->nr_cbufs <= 1);
+   if (framebuffer->nr_cbufs && framebuffer->cbufs[0].texture)
+      grate_set_render_target(context, GRATE_RT_COLOR, &framebuffer->cbufs[0]);
+
+   if (framebuffer->zsbuf.texture)
+      grate_set_render_target(context, GRATE_RT_DEPTH, &framebuffer->zsbuf);
 
    /* prepare the scissor-registers for the non-scissor case */
    context->no_scissor[0]  = host1x_opcode_incr(REG_TGR3D_SU_SCISSOR_X, 2);
@@ -600,28 +588,41 @@ emit_attribs(struct grate_context *context, uint32_t **ptrp)
    }
 }
 
+/* DW_ST_ENABLE: surface 0 is the depth buffer (libgrate's
+ * TGR3D_RT_ENABLE_DEPTH_BUFFER) */
+#define GRATE_DW_ST_DEPTH_BUFFER 0x00010000
+
+/* Whether the bound state tests depth against a bound depth buffer */
+static bool
+grate_depth_test(const struct grate_context *context)
+{
+   return context->zsa && context->zsa->base.depth_enabled &&
+          (context->framebuffer.rt_present & (1 << GRATE_RT_DEPTH));
+}
+
+/*
+ * The colour surface, and the depth one while the depth test is on, as
+ * libgrate does: the depth unit uses surface 0 whenever it is enabled.
+ */
 static void
 emit_render_targets(struct grate_context *context, uint32_t **ptrp)
 {
-   unsigned int i;
    struct grate_stream *stream = &context->gr3d->stream;
    const struct grate_framebuffer_state *fb = &context->framebuffer;
+   uint32_t enable = fb->rt_present & (1 << GRATE_RT_COLOR);
 
-   *(*ptrp)++ = host1x_opcode_incr(REG_TGR3D_GLOBAL_SURFDESC(0), fb->num_rts);
-   for (i = 0; i < fb->num_rts; ++i) {
-      uint32_t rt_params = fb->rt_params[i];
-      /* TODO: setup dither */
-      /* rt_params |= TGR3D_GLOBAL_SURFDESC_DITHER(enable_dither); */
-      *(*ptrp)++ = rt_params;
-   }
+   if (grate_depth_test(context))
+      enable |= 1 << GRATE_RT_DEPTH | GRATE_DW_ST_DEPTH_BUFFER;
 
-   GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_GLOBAL_SURFADDR(0), fb->num_rts));
-   for (i = 0; i < fb->num_rts; ++i) {
+   u_foreach_bit(i, enable & 0xffff) {
+      GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_GLOBAL_SURFDESC(i), 1));
+      GRATE_PUSHBUF_WORD(*ptrp, fb->rt_params[i]);
+      GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_GLOBAL_SURFADDR(i), 1));
       grate_stream_push_reloc(stream, ptrp, fb->rt_bos[i], 0, true);
    }
 
    GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_DW_ST_ENABLE, 1));
-   GRATE_PUSHBUF_WORD(*ptrp, fb->rt_mask);
+   GRATE_PUSHBUF_WORD(*ptrp, enable);
 }
 
 /*
@@ -669,7 +670,16 @@ static void
 emit_zsa_state(struct grate_context *context, uint32_t **ptrp)
 {
    struct grate_stream *stream = &context->gr3d->stream;
-   grate_stream_push_words(stream, ptrp, context->zsa->commands, context->zsa->num_commands, 0);
+   uint32_t commands[ARRAY_SIZE(context->zsa->commands)];
+   int n = context->zsa->num_commands;
+
+   memcpy(commands, context->zsa->commands, n * sizeof(commands[0]));
+   /* without a depth buffer there is nothing to test or write */
+   if (!grate_depth_test(context))
+      for (int i = 1; i < n; i += 2)
+         commands[i] &= ~(TGR3D_QR_Z_TEST_Z_ENABLE__MASK |
+                          TGR3D_QR_Z_TEST_QRAST_FB_WRITE__MASK);
+   grate_stream_push_words(stream, ptrp, commands, n, 0);
 }
 
 static void

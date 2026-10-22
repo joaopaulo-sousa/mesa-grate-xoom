@@ -14,10 +14,9 @@
 
 struct grate_framebuffer_state {
    struct pipe_framebuffer_state base;
-   int num_rts;
+   uint32_t rt_present;   /* surfaces bound, by GRATE_RT_* slot */
    struct grate_bo *rt_bos[REG_TGR3D_GLOBAL_SURFDESC_LENGTH];
    uint32_t rt_params[REG_TGR3D_GLOBAL_SURFDESC_LENGTH];
-   uint32_t rt_mask;
 };
 
 struct grate_channel {

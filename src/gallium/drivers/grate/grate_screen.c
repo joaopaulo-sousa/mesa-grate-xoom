@@ -249,8 +249,9 @@ grate_screen_init_caps(struct grate_screen *screen)
    caps->fragment_shader_derivatives = true;
    caps->min_texel_offset = 0;
    caps->max_texel_offset = 0;
-   //- 1 so one is reserved for zsbuf if PIPE_MAX_COLOR_BUFS ever increases
-   caps->max_render_targets = MIN2(PIPE_MAX_COLOR_BUFS, (REG_TGR3D_GLOBAL_SURFDESC_LENGTH - 1));
+   /* one colour buffer, surface GRATE_RT_COLOR; further ones would be
+    * surfaces 5.. (MRT), which the fragment compiler does not write */
+   caps->max_render_targets = 1;
    caps->max_texture_2d_size = 2048;
    caps->max_texture_3d_levels = 0;
    caps->max_texture_cube_levels = 16; // ???

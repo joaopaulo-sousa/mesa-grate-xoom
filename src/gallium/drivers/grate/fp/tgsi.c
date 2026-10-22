@@ -293,7 +293,7 @@ fp_dst(struct fp_compiler *c, struct fp_unit *u,
    switch (dst->File) {
    case TGSI_FILE_OUTPUT:
       c->dw.enable = 1;
-      c->dw.index = dst->Index;
+      c->dw.index = GRATE_RT_COLOR;
       c->dw.stencil_write = 0;
       c->dw.src_regs = FP_DW_REGS_R2_R3;
       if (c->redirect_output) {
@@ -341,7 +341,7 @@ fp_set_dst_opnd(struct fp_compiler *c, const struct tgsi_dst_register *dst,
    }
    if (dst->File == TGSI_FILE_OUTPUT && c->redirect_output) {
       c->dw.enable = 1;
-      c->dw.index = dst->Index;
+      c->dw.index = GRATE_RT_COLOR;
       c->dw.src_regs = FP_DW_REGS_R2_R3;
       c->outv[chan] = o;
       c->outv_written[chan] = true;

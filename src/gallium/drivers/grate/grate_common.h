@@ -45,6 +45,16 @@
       mesa_logw("GRATE TODO: %s()\n", __func__); \
 } while (0)
 
+/*
+ * Render target surfaces with a fixed purpose, as libgrate uses them: the
+ * depth test reads and writes surface 0 and the stencil test surface 2,
+ * whatever QR_Z_TEST/QR_S_CTRL point at, so the fragment program stores the
+ * colour to surface 1.
+ */
+#define GRATE_RT_DEPTH 0
+#define GRATE_RT_COLOR 1
+#define GRATE_RT_STENCIL 2
+
 /* GPU job/fence wait timeout: one second */
 #define GRATE_JOB_TIMEOUT_NS 1000000000ull
 
