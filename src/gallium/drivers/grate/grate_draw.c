@@ -333,6 +333,21 @@ grate_draw_vbo(struct pipe_context *pcontext,
    /* the fragment program variant for the bound blend state */
    grate_fs_update(context);
 
+   if (grate_debug & GRATE_DEBUG_TRACE) {
+      fprintf(stderr, "GRATE DRAW: %s index_size %u start %u count %u bias %d"
+              " restart %d", u_prim_name(info->mode), info->index_size,
+              draws[0].start, draws[0].count,
+              info->index_size ? draws[0].index_bias : 0,
+              info->primitive_restart);
+      for (unsigned i = 0; i < context->vs->num_elements; i++) {
+         const struct grate_vertex_element *e = &context->vs->elements[i];
+         fprintf(stderr, " | a%u fmt 0x%x off %u+%u stride %u", i, e->attrib,
+                 context->vbs.vb[e->buffer_index].buffer_offset, e->offset,
+                 e->stride);
+      }
+      fprintf(stderr, "\n");
+   }
+
    err = grate_stream_begin(stream, &ptr);
    if (err < 0) {
       grate_loge("grate_stream_begin() failed: %d\n", err);
