@@ -30,4 +30,12 @@ grate_screen(struct pipe_screen *screen)
 struct pipe_screen *
 grate_screen_create(int fd);
 
+/* Whether the TEX unit samples the format */
+bool
+grate_sampler_format(enum pipe_format format);
+
+/* Texel channel the TEX unit returns channel c of the format in */
+unsigned
+grate_sampler_channel(enum pipe_format format, unsigned c);
+
 #endif

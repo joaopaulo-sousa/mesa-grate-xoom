@@ -384,6 +384,36 @@ grate_screen_init_shader_caps(struct grate_screen *screen)
 }
 
 
+/*
+ * Formats the TEX unit samples, measured (gpu/dev/texfmt.sh): the 8888 ones,
+ * 565 (red and blue come swapped, see grate_sampler_swizzle) and the 8-bit
+ * luminance/alpha ones. Others (4444, 5551: wrong bits) the frontend
+ * converts on upload.
+ */
+unsigned
+grate_sampler_channel(enum pipe_format format, unsigned c)
+{
+   if (format == PIPE_FORMAT_B5G6R5_UNORM && c != 3)
+      return 2 - c;
+   return c;
+}
+
+bool
+grate_sampler_format(enum pipe_format format)
+{
+   switch (format) {
+   case PIPE_FORMAT_B8G8R8A8_UNORM:
+   case PIPE_FORMAT_B8G8R8X8_UNORM:
+   case PIPE_FORMAT_B5G6R5_UNORM:
+   case PIPE_FORMAT_L8_UNORM:
+   case PIPE_FORMAT_A8_UNORM:
+   case PIPE_FORMAT_L8A8_UNORM:
+      return true;
+   default:
+      return false;
+   }
+}
+
 static bool
 grate_screen_is_format_supported(struct pipe_screen *pscreen,
                                  enum pipe_format format,
@@ -416,9 +446,7 @@ grate_screen_is_format_supported(struct pipe_screen *pscreen,
                                             PIPE_BIND_SCANOUT | PIPE_BIND_SHARED)))
       return false;
 
-   if ((usage & PIPE_BIND_SAMPLER_VIEW) &&
-       format != PIPE_FORMAT_B8G8R8A8_UNORM &&
-       format != PIPE_FORMAT_B8G8R8X8_UNORM)
+   if ((usage & PIPE_BIND_SAMPLER_VIEW) && !grate_sampler_format(format))
       return false;
 
    return true;

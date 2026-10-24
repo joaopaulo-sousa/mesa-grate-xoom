@@ -415,10 +415,18 @@ grate_fs_key(struct grate_context *context)
 
    for (unsigned i = 0; i < GRATE_FP_MAX_SWIZZLED; i++) {
       const struct pipe_sampler_view *view = context->sampler_views[i];
-      if (view)
-         key.tex_swizzle[i] = (view->swizzle_r | view->swizzle_g << 3 |
-                               view->swizzle_b << 6 | view->swizzle_a << 9) ^
-                              GRATE_SWIZZLE_IDENTITY;
+      if (!view)
+         continue;
+      /* the view's swizzle, then where the TEX unit puts the channels */
+      unsigned sw[4] = { view->swizzle_r, view->swizzle_g, view->swizzle_b,
+                         view->swizzle_a };
+      unsigned bits = 0;
+      for (int c = 0; c < 4; c++) {
+         if (sw[c] <= PIPE_SWIZZLE_W)
+            sw[c] = grate_sampler_channel(view->format, sw[c]);
+         bits |= sw[c] << (3 * c);
+      }
+      key.tex_swizzle[i] = bits ^ GRATE_SWIZZLE_IDENTITY;
    }
 
    if (!blend)
