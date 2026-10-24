@@ -59,6 +59,7 @@ struct fp_opnd {
    bool negate;
    bool absolute;
    bool twice;     /* operand modifier: scaled by two (fp_fold_scales) */
+   bool minus_one; /* operand modifier: read less one */
 };
 
 struct fp_unit_slot {
@@ -77,6 +78,8 @@ struct fp_unit {
    bool kill;              /* writes the kill register: no value, always live */
    bool saturate;
    enum fp_scale scale;    /* result scaled by 2, 4 or 1/2 before saturating */
+   bool blend_inv;         /* d * (1 - y) + ts of a blend, y read less one
+                              (fp_expand_blend_inv) */
    int output_chan;        /* colour channel written, or -1: defines a value */
    bool forward;           /* the next packet may read the result as aluN */
    bool live;
@@ -193,6 +196,7 @@ uint32_t fp_tex_word(const struct fp_compiler *c, int n, int coord_pair);
 void fp_mark_fx10(struct fp_compiler *c);
 void fp_reassociate(struct fp_compiler *c);
 void fp_fold_scales(struct fp_compiler *c);
+void fp_expand_blend_inv(struct fp_compiler *c);
 bool fp_opnd_is_const(struct fp_compiler *c, const struct fp_opnd *o, float v);
 
 /* preshader.c */

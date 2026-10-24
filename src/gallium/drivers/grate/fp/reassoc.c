@@ -126,7 +126,8 @@ fp_reassoc_scan(struct fp_compiler *c, struct fp_reassoc *r)
 static struct fp_unit *
 fp_inner(struct fp_compiler *c, const struct fp_reassoc *r, const struct fp_opnd *o)
 {
-   if (o->kind != FP_OPND_VALUE || o->absolute || r->readers[o->index] != 1 ||
+   if (o->kind != FP_OPND_VALUE || o->absolute || o->minus_one || o->twice ||
+       r->readers[o->index] != 1 ||
        !fp_plain_mad(r, c, o->index) || c->units[o->index].saturate ||
        !fp_unit_has_value(&c->units[o->index]))
       return NULL;
@@ -152,6 +153,8 @@ fp_opnd_known(struct fp_compiler *c, const struct fp_opnd *o, float *v)
       *v = fp20_to_float(c->fp->info.consts[o->index]);
    else
       return false;
+   if (o->minus_one)
+      *v -= 1.0f;
    if (o->twice)
       *v *= 2.0f;
    if (o->absolute)
@@ -313,7 +316,8 @@ fp_scale_result(struct fp_compiler *c, struct fp_reassoc *r, int i,
 {
    struct fp_unit *u = &c->units[i];
 
-   if (x->kind != FP_OPND_VALUE || x->absolute || r->readers[x->index] != 1)
+   if (x->kind != FP_OPND_VALUE || x->absolute || x->minus_one || x->twice ||
+       r->readers[x->index] != 1)
       return false;
    struct fp_unit *v = &c->units[x->index];
    struct fp_unit_slot s = v->slots[0];
@@ -339,7 +343,7 @@ fp_scale_operand(struct fp_compiler *c, struct fp_reassoc *r, int i, const struc
 {
    const struct fp_unit *u = &c->units[i];
 
-   if (!fp_unit_has_value(u) || u->saturate || x->absolute || x->twice ||
+   if (!fp_unit_has_value(u) || u->saturate || x->absolute || x->twice || x->minus_one ||
        r->readers[i] == 0)
       return false;
    for (int n = 0; n < c->num_tex; n++)
@@ -352,7 +356,8 @@ fp_scale_operand(struct fp_compiler *c, struct fp_reassoc *r, int i, const struc
          continue;
       fp_unit_foreach_src(v, k, j)
          if (v->slots[k].src[j].kind == FP_OPND_VALUE && v->slots[k].src[j].index == i &&
-             (v->sfu || v->sfu_copy || v->slots[k].src[j].twice))
+             (v->sfu || v->sfu_copy || v->slots[k].src[j].twice ||
+              v->slots[k].src[j].minus_one))
             return false;
    }
    for (int n = i + 1; n < c->num_units; n++) {
@@ -399,5 +404,39 @@ fp_fold_scales(struct fp_compiler *c)
                        (scale == FP_SCALE_MUL2 && fp_scale_operand(c, &r, i, &x));
          }
       }
+   }
+}
+
+/*
+ * A blend's d * (1 - y) + ts reads y less one (one MAD). In a sequential
+ * program the colour goes to the register pair a texel or the destination
+ * colour may be in, and four channels reading y and ts to the end leave no
+ * half free to write: there it becomes ts' = d + ts, then ts' - d * y,
+ * taking ts in earlier.
+ */
+void
+fp_expand_blend_inv(struct fp_compiler *c)
+{
+   for (int i = 0; i < c->num_units && !c->failed; i++) {
+      struct fp_unit *u = &c->units[i];
+      if (!u->live || !u->blend_inv)
+         continue;
+      struct fp_unit_slot s = u->slots[0];
+      struct fp_opnd y = s.src[1];
+      y.minus_one = false;
+      y.negate = !y.negate;
+
+      struct fp_unit *n = fp_new_unit(c);
+      if (c->failed)
+         return;
+      fp_unit_op(&n->slots[0], FP_ALU_OP_MAD, s.src[0], (struct fp_opnd) { .kind = FP_OPND_ONE },
+                 s.src[2]);
+      n->live = true;
+      fp_move_last_unit(c, i);
+      u = &c->units[i + 1];
+      u->blend_inv = false;
+      fp_unit_op(&u->slots[0], FP_ALU_OP_MAD, fp_negated(s.src[0], true), y,
+                 fp_opnd_value(c, &c->units[i]));
+      i++;
    }
 }

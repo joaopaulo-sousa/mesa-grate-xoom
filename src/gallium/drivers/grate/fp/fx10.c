@@ -122,6 +122,8 @@ fx10_opnd_range(struct fp_compiler *c, const struct fx10_range *value,
    default:
       return fx10_unknown;
    }
+   if (o->minus_one)
+      r = (struct fx10_range) { r.lo - 1.0f, r.hi - 1.0f };
    if (o->twice)
       r = (struct fx10_range) { 2.0f * r.lo, 2.0f * r.hi };
    if (o->absolute)

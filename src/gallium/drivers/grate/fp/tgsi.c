@@ -1109,13 +1109,23 @@ emit_blend(struct fp_compiler *c)
             ts = fp_opnd_modify(ts, true, false);
          struct fp_opnd dd = fp_opnd_modify(d[ch], sub, false);
          struct fp_opnd y = fp_blend_factor(c, df, ch, s, d, &inv);
-         /* (units are in dependency order: the operand first) */
-         if (inv) {
+         /*
+          * 1 - y is y read less one, negated: one MAD (fp_expand_blend_inv
+          * undoes it for sequential programs). Measured: "minus one" takes
+          * fixed10 operands only (a texel, the destination); for an fp20 y
+          * d - d * y, with d added to ts first.
+          */
+         bool fixed10 = y.kind == FP_OPND_TEXEL || y.kind == FP_OPND_DST;
+         if (inv && fixed10) {
+            y.minus_one = true;
+            y.negate = !y.negate;
+         } else if (inv) {
             ts = fp_val(c, FP_ALU_OP_MAD, dd, fp_opnd_one(c, false), ts);
             dd = fp_opnd_modify(dd, true, false);
          }
          u = fp_new_unit(c);
          u->saturate = true;
+         u->blend_inv = inv && fixed10;
          fp_unit_op(&u->slots[0], FP_ALU_OP_MAD, dd, y, ts);
       }
       u->output_chan = ch;
@@ -1127,7 +1137,8 @@ static bool
 fp_opnd_equal(const struct fp_opnd *a, const struct fp_opnd *b)
 {
    return a->kind == b->kind && a->index == b->index && a->comp == b->comp &&
-          a->negate == b->negate && a->absolute == b->absolute && a->twice == b->twice;
+          a->negate == b->negate && a->absolute == b->absolute && a->twice == b->twice &&
+          a->minus_one == b->minus_one;
 }
 
 /*
@@ -1237,7 +1248,8 @@ fp_fuse_mad(struct fp_compiler *c)
 
       struct fp_opnd p = s->src[p_at];
       struct fp_unit *m = &c->units[p.index];
-      if (!fp_unit_is_mul(c, m) || readers[p.index] != 1 || p.absolute)
+      if (!fp_unit_is_mul(c, m) || readers[p.index] != 1 || p.absolute ||
+          p.minus_one || p.twice)
          continue;
 
       struct fp_opnd x = m->slots[0].src[0], y = m->slots[0].src[1];
@@ -1505,6 +1517,11 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
     */
    if (!c->failed && !c->seq && !fp_sched_rows(c))
       c->seq = true;
+   if (!c->failed && c->seq) {
+      /* and the sum it adds may take in a multiply, as when written so */
+      fp_expand_blend_inv(c);
+      fp_fuse_mad(c);
+   }
    if (!c->failed && c->seq && !fp_sched_seq(c))
       fp_fail(c, "shader too big (out of ALU packets or registers)");
 

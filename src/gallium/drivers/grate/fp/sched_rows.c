@@ -480,6 +480,7 @@ fp_resolve(struct fp_compiler *c, const struct fp_opnd *o, int packet)
    ret.negate = o->negate;
    ret.absolute_value = o->absolute;
    ret.scale_by_two = o->twice;
+   ret.minus_one = o->minus_one;
    return ret;
 }
 
