@@ -406,6 +406,15 @@ tgsi_to_vp(struct grate_vp_shader *vp, const struct tgsi_full_instruction *inst)
       return true;
    }
 
+   case TGSI_OPCODE_SQRT: {
+      /* d = 1 / rsq(a), which is 0 for a = 0 (1 / inf) unlike a * rsq(a) */
+      struct vp_dst_operand t1 = dst_temp(VP_SCRATCH0, 0x1, false);
+      emit_packed(vp, emit_vNOP(), emit_scalar(VP_SCALAR_OP_RSQ, t1, src[0]));
+      emit_packed(vp, emit_vNOP(),
+                  emit_scalar(VP_SCALAR_OP_RCP, dst, src_scratch(VP_SCRATCH0, VP_SWZ_X)));
+      return true;
+   }
+
    default:
       fprintf(stderr, "GRATE VERTEX TGSI UNIMPLEMENTED: %s\n", tgsi_get_opcode_name(opcode));
       return false;
