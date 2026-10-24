@@ -406,6 +406,8 @@ grate_sampler_format(enum pipe_format format)
    switch (format) {
    case PIPE_FORMAT_B8G8R8A8_UNORM:
    case PIPE_FORMAT_B8G8R8X8_UNORM:
+   case PIPE_FORMAT_R8G8B8A8_UNORM:
+   case PIPE_FORMAT_R8G8B8X8_UNORM:
    case PIPE_FORMAT_B5G6R5_UNORM:
    case PIPE_FORMAT_L8_UNORM:
    case PIPE_FORMAT_A8_UNORM:
