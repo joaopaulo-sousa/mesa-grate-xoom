@@ -155,6 +155,8 @@ struct fp_compiler {
    /* TGSI inputs: semantic; TRAM layout, input * 4 + component per row and
     * column (-1: free) */
    uint16_t input_semantic[FP_MAX_INPUTS];
+   uint8_t input_interp[FP_MAX_INPUTS];    /* TGSI_INTERPOLATE_* */
+   int num_inputs;                         /* declared, then moved ones */
    int tram[FP_TRAM_ROWS][4];
 
    /* EXEC whose MFU fetches TGSI input i component c, into which column
@@ -241,6 +243,7 @@ void fp_reassociate(struct fp_compiler *c);
 void fp_fold_scales(struct fp_compiler *c);
 void fp_expand_blend_inv(struct fp_compiler *c);
 void fp_fold_conditions(struct fp_compiler *c);
+void fp_move_coords(struct fp_compiler *c);
 bool fp_opnd_is_const(struct fp_compiler *c, const struct fp_opnd *o, float v);
 
 /* preshader.c */

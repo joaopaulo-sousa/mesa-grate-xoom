@@ -195,6 +195,8 @@ tgsi_dst_to_vp(struct grate_vp_shader *vp, const struct tgsi_dst_register *dst, 
 {
    switch (dst->File) {
    case TGSI_FILE_OUTPUT:
+      if (dst->Index < 16 && vp->shadow[dst->Index] >= 0)
+         return dst_temp(vp->shadow[dst->Index], dst->WriteMask, saturate);
       return emit_output(vp, dst->Index, dst->WriteMask, saturate);
 
    case TGSI_FILE_TEMPORARY:
@@ -553,22 +555,133 @@ tgsi_to_vp(struct grate_vp_shader *vp, struct vp_flow *flow,
    }
 }
 
-void
-grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi)
+/* Output of semantic sem, -1 if none */
+static int
+vp_output_of(const struct grate_vp_shader *vp, uint16_t sem)
+{
+   for (int o = 0; o < 16; o++)
+      if (vp->output_semantic[o] == sem)
+         return o;
+   return -1;
+}
+
+static bool
+vp_moved_src(struct grate_vp_shader *vp, const struct grate_moved_src *m,
+             const int *node_reg, int imm_slot, struct vp_src_operand *out)
+{
+   enum vp_swz x[4] = { VP_SWZ_X, VP_SWZ_X, VP_SWZ_X, VP_SWZ_X };
+   enum vp_swz y[4] = { VP_SWZ_Y, VP_SWZ_Y, VP_SWZ_Y, VP_SWZ_Y };
+
+   switch (m->kind) {
+   case GRATE_MOVED_NODE:
+      *out = src_temp(node_reg[m->index], x, m->negate, false);
+      return true;
+   case GRATE_MOVED_OUTPUT: {
+      int o = vp_output_of(vp, m->semantic);
+      if (o < 0 || vp->shadow[o] < 0)
+         return false;
+      enum vp_swz c[4] = { m->comp, m->comp, m->comp, m->comp };
+      *out = src_temp(vp->shadow[o], c, m->negate, false);
+      return true;
+   }
+   case GRATE_MOVED_UNIFORM:
+      *out = uniform(vp->fs_const_base + m->index, x, m->negate, false);
+      return true;
+   case GRATE_MOVED_ZERO:
+   case GRATE_MOVED_ONE:
+      /* the immediate (0, 1, 0, 0) */
+      *out = uniform(imm_slot, m->kind == GRATE_MOVED_ONE ? y : x, m->negate, false);
+      return true;
+   default:
+      return false;
+   }
+}
+
+/*
+ * After the program: the shadowed outputs are exported, then the moved
+ * coordinates computed, one MAD per node (into a temporary of its own) and
+ * exported as further outputs, .xy each.
+ */
+static bool
+vp_emit_moved(struct grate_vp_shader *vp, const struct grate_moved *moved,
+              int next_temp, int max_const)
+{
+   for (int o = 0; o < 16; o++)
+      if (vp->shadow[o] >= 0)
+         emit_packed(vp, emit_vec(VP_VEC_OP_MOV, emit_output(vp, o, 0xf, false),
+                                  src_temp(vp->shadow[o], vp_swz_xyzw, false, false),
+                                  src_undef(), src_undef()), emit_sNOP());
+
+   if (vp->num_immediates == GRATE_VP_MAX_IMMEDIATES)
+      return false;
+   int imm = vp->num_immediates++;
+   memcpy(vp->immediates[imm], (float[4]) { 0.0f, 1.0f, 0.0f, 0.0f }, sizeof(vp->immediates[imm]));
+   int imm_slot = GRATE_VP_NUM_CONSTS - 1 - imm;
+
+   /* FS uniform slots below the immediates, above the user constants */
+   vp->fs_const_base = GRATE_VP_NUM_CONSTS - vp->num_immediates - GRATE_FP_NUM_CONSTS;
+   if (vp->fs_const_base <= max_const)
+      return false;
+
+   int node_reg[GRATE_MOVED_MAX_NODES];
+   for (int i = 0; i < moved->num_nodes; i++) {
+      if (next_temp >= VP_MAX_TGSI_TEMPS)
+         return false;
+      struct vp_src_operand s[3];
+      for (int k = 0; k < 3; k++)
+         if (!vp_moved_src(vp, &moved->nodes[i][k], node_reg, imm_slot, &s[k]))
+            return false;
+      vp_fetch_once(vp, s, 3);
+      node_reg[i] = next_temp++;
+      emit_packed(vp, emit_vec(VP_VEC_OP_MAD, dst_temp(node_reg[i], 0x1, false),
+                               s[0], s[1], s[2]), emit_sNOP());
+   }
+
+   for (int k = 0; k < moved->num_coords; k++) {
+      int e = 1;
+      while (e < 16 && (vp->output_semantic[e] != 0xffff || (vp->output_mask & (1 << e))))
+         e++;
+      if (e == 16)
+         return false;
+      vp->output_semantic[e] = GRATE_MOVED_SEMANTIC(k);
+      for (int j = 0; j < 2; j++) {
+         struct vp_src_operand s;
+         if (!vp_moved_src(vp, &moved->coord[k].root[j], node_reg, imm_slot, &s))
+            return false;
+         emit_packed(vp, emit_vec(VP_VEC_OP_MOV, emit_output(vp, e, 1 << j, false),
+                                  s, src_undef(), src_undef()), emit_sNOP());
+      }
+   }
+   return true;
+}
+
+bool
+grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi,
+                 const struct grate_moved *moved)
 {
    struct vp_flow flow = { .depth = 0, .last_target = -1 };
+   int max_temp = -1, max_const = -1;
+   bool shadowed = false;
 
    list_inithead(&vp->instructions);
    vp->output_mask = 0;
    vp->num_immediates = 0;
    vp->num_instructions = 0;
+   vp->fs_const_base = -1;
    memset(vp->output_semantic, 0xff, sizeof(vp->output_semantic));
+   memset(vp->shadow, -1, sizeof(vp->shadow));
+   if (moved && !moved->num_coords)
+      moved = NULL;
 
    while (!tgsi_parse_end_of_tokens(tgsi)) {
       tgsi_parse_token(tgsi);
       switch (tgsi->FullToken.Token.Type) {
       case TGSI_TOKEN_TYPE_DECLARATION: {
          const struct tgsi_full_declaration *decl = &tgsi->FullToken.FullDeclaration;
+         if (decl->Declaration.File == TGSI_FILE_TEMPORARY)
+            max_temp = MAX2(max_temp, (int)decl->Range.Last);
+         if (decl->Declaration.File == TGSI_FILE_CONSTANT)
+            max_const = MAX2(max_const, (int)decl->Range.Last);
          if (decl->Declaration.File != TGSI_FILE_OUTPUT)
             break;
          for (unsigned i = decl->Range.First; i <= decl->Range.Last && i < 16; i++)
@@ -587,6 +700,24 @@ grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi)
          break;
       }
       case TGSI_TOKEN_TYPE_INSTRUCTION:
+         /* the declarations are all seen: the outputs the moved
+          * coordinates read get a temporary */
+         if (moved && !shadowed) {
+            shadowed = true;
+            for (int i = 0; i < moved->num_nodes * 3 + moved->num_coords * 2; i++) {
+               const struct grate_moved_src *m = i < moved->num_nodes * 3 ?
+                  &moved->nodes[i / 3][i % 3] :
+                  &moved->coord[(i - moved->num_nodes * 3) / 2].root[i % 2];
+               int o = m->kind == GRATE_MOVED_OUTPUT ? vp_output_of(vp, m->semantic) : -1;
+               if (m->kind == GRATE_MOVED_OUTPUT && o < 0)
+                  return false;
+               if (o >= 0 && vp->shadow[o] < 0) {
+                  if (max_temp + 1 >= VP_MAX_TGSI_TEMPS)
+                     return false;
+                  vp->shadow[o] = ++max_temp;
+               }
+            }
+         }
          if (tgsi->FullToken.FullInstruction.Instruction.Opcode != TGSI_OPCODE_END) {
             if (!tgsi_to_vp(vp, &flow, &tgsi->FullToken.FullInstruction))
                assert(!"unsupported vertex opcode");
@@ -595,8 +726,12 @@ grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi)
       }
    }
 
+   if (moved && !vp_emit_moved(vp, moved, max_temp + 1, max_const))
+      return false;
+
    /* a jump past the last instruction lands on one more, which ends the
     * program */
    if (flow.last_target >= vp->num_instructions)
       emit_packed(vp, emit_vNOP(), emit_sNOP());
+   return vp->num_instructions < 256;
 }

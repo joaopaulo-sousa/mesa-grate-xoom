@@ -11,13 +11,36 @@ struct grate_shader_blob {
    int num_commands;
 };
 
-struct grate_vertex_shader_state {
-   struct pipe_shader_state base;
+/* A vertex program compiled to also compute the moved texture coordinates
+ * of a fragment program (grate_moved; none for the plain one) */
+struct grate_vs_variant {
+   struct grate_moved moved;
+   bool ok;                           /* they fit */
    struct grate_shader_blob blob;
    uint16_t output_mask;
    uint16_t output_semantic[16];
    float immediates[GRATE_VP_MAX_IMMEDIATES][4];
    int num_immediates;
+   int fs_const_base;                 /* grate_vp_shader.fs_const_base */
+};
+
+#define GRATE_VS_MAX_VARIANTS 8
+
+struct grate_vertex_shader_state {
+   struct pipe_shader_state base;
+   struct tgsi_token *tokens;         /* the TGSI the variants compile */
+
+   /* the variant in use, set by grate_vs_update() */
+   struct grate_shader_blob blob;
+   uint16_t output_mask;
+   uint16_t output_semantic[16];
+   float immediates[GRATE_VP_MAX_IMMEDIATES][4];
+   int num_immediates;
+   int fs_const_base;
+
+   struct grate_vs_variant variants[GRATE_VS_MAX_VARIANTS];
+   unsigned num_variants;
+   unsigned next_evict;
 };
 
 /* A fragment program compiled for one blend state (see grate_fp_key) */
@@ -49,6 +72,10 @@ struct grate_context;
  * blend state; call before emitting a draw. */
 void
 grate_fs_update(struct grate_context *context);
+
+/* The fragment program's uniform registers for the bound constants */
+void
+grate_fs_consts(struct grate_context *context, uint32_t *consts);
 
 void
 grate_context_program_init(struct pipe_context *pcontext);

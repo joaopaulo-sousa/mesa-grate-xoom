@@ -82,6 +82,86 @@ grate_vs_tgsi_transform(const struct tgsi_token *tokens_in)
 }
 
 
+/* Compile the vertex program, computing "moved" too if not NULL */
+static void
+grate_vs_compile(const struct tgsi_token *tokens, const struct grate_moved *moved,
+                 struct grate_vs_variant *v)
+{
+   struct tgsi_parse_context parser;
+   unsigned ok = tgsi_parse_init(&parser, tokens);
+   assert(ok == TGSI_PARSE_OK);
+
+   struct grate_vp_shader vp;
+   memset(v, 0, sizeof(*v));
+   if (moved)
+      v->moved = *moved;
+   v->ok = grate_tgsi_to_vp(&vp, &parser, moved);
+
+   memcpy(v->immediates, vp.immediates, sizeof(vp.immediates));
+   v->num_immediates = vp.num_immediates;
+   v->fs_const_base = vp.fs_const_base;
+
+   int num_instructions = v->ok ? list_length(&vp.instructions) : 0;
+   int num_commands = 2 + num_instructions * 4;
+   uint32_t *commands = MALLOC(num_commands * sizeof(uint32_t));
+
+   commands[0] = host1x_opcode_imm(REG_TGR3D_VPE_INST_OFFSET, 0);
+   commands[1] = host1x_opcode_nonincr(REG_TGR3D_VPE_INST_DATA,
+                                       num_instructions * 4);
+
+   struct vp_instr *last = list_last_entry(&vp.instructions, struct vp_instr, link);
+   int offset = 2;
+   list_for_each_entry_safe(struct vp_instr, instr, &vp.instructions, link) {
+      if (v->ok) {
+         grate_vp_pack(commands + offset, instr, instr == last);
+         offset += 4;
+      }
+      FREE(instr);
+   }
+
+   v->blob.commands = commands;
+   v->blob.num_commands = num_commands;
+   v->output_mask = vp.output_mask;
+   memcpy(v->output_semantic, vp.output_semantic, sizeof(v->output_semantic));
+}
+
+static void
+grate_vs_use(struct grate_vertex_shader_state *so, const struct grate_vs_variant *v)
+{
+   so->blob = v->blob;
+   so->output_mask = v->output_mask;
+   memcpy(so->output_semantic, v->output_semantic, sizeof(so->output_semantic));
+   memcpy(so->immediates, v->immediates, sizeof(so->immediates));
+   so->num_immediates = v->num_immediates;
+   so->fs_const_base = v->fs_const_base;
+}
+
+/* The variant computing "moved" (NULL: the plain one), compiled if needed;
+ * NULL if they do not fit */
+static struct grate_vs_variant *
+grate_vs_variant(struct grate_vertex_shader_state *so, const struct grate_moved *moved)
+{
+   static const struct grate_moved none;
+   unsigned i;
+
+   if (!moved)
+      moved = &none;
+   for (i = 0; i < so->num_variants; i++)
+      if (!memcmp(&so->variants[i].moved, moved, sizeof(*moved)))
+         return so->variants[i].ok ? &so->variants[i] : NULL;
+
+   if (so->num_variants < GRATE_VS_MAX_VARIANTS) {
+      i = so->num_variants++;
+   } else {
+      /* replace one, never the plain variant 0 */
+      i = 1 + so->next_evict++ % (GRATE_VS_MAX_VARIANTS - 1);
+      FREE(so->variants[i].blob.commands);
+   }
+   grate_vs_compile(so->tokens, moved == &none ? NULL : moved, &so->variants[i]);
+   so->variants[i].moved = *moved;
+   return so->variants[i].ok ? &so->variants[i] : NULL;
+}
+
 static void *
 grate_create_vs_state(struct pipe_context *pcontext,
                       const struct pipe_shader_state *template)
@@ -108,46 +188,16 @@ grate_create_vs_state(struct pipe_context *pcontext,
       fprintf(stderr, "\n");
    }
 
-   struct tgsi_token *new_tokens = grate_vs_tgsi_transform(so->base.tokens);
-   if (!new_tokens)
-      return NULL;
-
-   struct tgsi_parse_context parser;
-   unsigned ok = tgsi_parse_init(&parser, new_tokens);
-   assert(ok == TGSI_PARSE_OK);
-
-   struct grate_vp_shader vp;
-   grate_tgsi_to_vp(&vp, &parser);
-
-   memcpy(so->immediates, vp.immediates, sizeof(vp.immediates));
-   so->num_immediates = vp.num_immediates;
-
-   int num_instructions = list_length(&vp.instructions);
-   assert(num_instructions < 256);
-   int num_commands = 2 + num_instructions * 4;
-   uint32_t *commands = MALLOC(num_commands * sizeof(uint32_t));
-   if (!commands) {
+   so->tokens = grate_vs_tgsi_transform(so->base.tokens);
+   if (!so->tokens) {
       FREE(so);
       return NULL;
    }
 
-   commands[0] = host1x_opcode_imm(REG_TGR3D_VPE_INST_OFFSET, 0);
-   commands[1] = host1x_opcode_nonincr(REG_TGR3D_VPE_INST_DATA,
-                                       num_instructions * 4);
-
-   struct vp_instr *last = list_last_entry(&vp.instructions, struct vp_instr, link);
-   int offset = 2;
-   list_for_each_entry(struct vp_instr, instr, &vp.instructions, link) {
-      bool end_of_program = instr == last;
-      grate_vp_pack(commands + offset, instr, end_of_program);
-      offset += 4;
-   }
-
-   so->blob.commands = commands;
-   so->blob.num_commands = num_commands;
-   so->output_mask = vp.output_mask;
-   memcpy(so->output_semantic, vp.output_semantic, sizeof(so->output_semantic));
-
+   /* the plain variant */
+   struct grate_vs_variant *v = grate_vs_variant(so, NULL);
+   assert(v);
+   grate_vs_use(so, v);
    return so;
 }
 
@@ -159,9 +209,14 @@ grate_bind_vs_state(struct pipe_context *pcontext, void *so)
 }
 
 static void
-grate_delete_vs_state(struct pipe_context *pcontext, void *so)
+grate_delete_vs_state(struct pipe_context *pcontext, void *hwcso)
 {
+   struct grate_vertex_shader_state *so = hwcso;
+
    grate_trace();
+   for (unsigned i = 0; i < so->num_variants; i++)
+      FREE(so->variants[i].blob.commands);
+   FREE(so->tokens);
    FREE(so);
 }
 
@@ -402,20 +457,10 @@ grate_fs_variant(struct grate_context *context,
  * The variant for the bound blend state and, when the program branches on
  * uniforms (grate_fp_spec), for the values they have at this draw
  */
-void
-grate_fs_update(struct grate_context *context)
+static struct grate_fs_variant *
+grate_fs_select(struct grate_context *context, struct grate_fragment_shader_state *so,
+                struct grate_fp_key key, const float *user, unsigned user_len)
 {
-   struct grate_fragment_shader_state *so = context->fshader;
-   struct grate_fp_key key = grate_fs_key(context);
-
-   if (!so)
-      return;
-
-   const struct pipe_constant_buffer *cb =
-      &context->constant_buffer[MESA_SHADER_FRAGMENT];
-   const float *user = cb->user_buffer;
-   unsigned user_len = user ? cb->buffer_size / sizeof(float) : 0;
-
    struct grate_fs_variant *v = grate_fs_variant(context, so, &key);
    if (v->info.num_flow) {
       /* loops counted by uniforms: the variant for their values */
@@ -432,9 +477,64 @@ grate_fs_update(struct grate_context *context)
       key.spec_bits = grate_fp_eval_spec(&v->info, user, user_len);
       v = grate_fs_variant(context, so, &key);
    }
+   return v;
+}
+
+void
+grate_fs_update(struct grate_context *context)
+{
+   struct grate_fragment_shader_state *so = context->fshader;
+   struct grate_vertex_shader_state *vs = context->vshader;
+   struct grate_fp_key key = grate_fs_key(context);
+
+   if (!so)
+      return;
+
+   const struct pipe_constant_buffer *cb =
+      &context->constant_buffer[MESA_SHADER_FRAGMENT];
+   const float *user = cb->user_buffer;
+   unsigned user_len = user ? cb->buffer_size / sizeof(float) : 0;
+
+   struct grate_fs_variant *v = grate_fs_select(context, so, key, user, user_len);
+   struct grate_vs_variant *vv = vs ? grate_vs_variant(vs, NULL) : NULL;
+
+   /* texture coordinates the vertex shader can compute: when both fit */
+   if (vv && v->info.can_move) {
+      key.move = 1;
+      struct grate_fs_variant *mv = grate_fs_select(context, so, key, user, user_len);
+      struct grate_vs_variant *mvv = !mv->info.failed && mv->info.moved.num_coords ?
+                                     grate_vs_variant(vs, &mv->info.moved) : NULL;
+      if (mvv) {
+         v = mv;
+         vv = mvv;
+      }
+   }
 
    so->blob = v->blob;
    so->info = v->info;
+   if (vv)
+      grate_vs_use(vs, vv);
+}
+
+void
+grate_fs_consts(struct grate_context *context, uint32_t *consts)
+{
+   const struct grate_fp_info *fpinfo = &context->fshader->info;
+   const struct pipe_constant_buffer *cb =
+      &context->constant_buffer[MESA_SHADER_FRAGMENT];
+   const float *user = cb->user_buffer;
+   unsigned user_len = user ? cb->buffer_size / sizeof(float) : 0;
+
+   for (int i = 0; i < GRATE_FP_NUM_CONSTS; i++) {
+      unsigned u = fpinfo->user_index[i];
+      if (BITSET_TEST(fpinfo->imm_mask, i))
+         consts[i] = fpinfo->consts[i];
+      else if (BITSET_TEST(fpinfo->user_mask, i) && u < user_len)
+         consts[i] = grate_float_to_fp20(user[u]);
+      else
+         consts[i] = 0;
+   }
+   grate_fp_eval_pre(fpinfo, user, user_len, consts);
 }
 
 static void

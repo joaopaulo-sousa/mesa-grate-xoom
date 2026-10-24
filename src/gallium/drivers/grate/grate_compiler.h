@@ -24,6 +24,11 @@ struct grate_vp_shader {
    float immediates[GRATE_VP_MAX_IMMEDIATES][4];
    int num_immediates;
    int num_instructions;
+   /* moved texture coordinates (grate_moved): outputs written to a
+    * temporary first, -1 if not; FS uniform slot k is constant
+    * fs_const_base + k, -1 if none are read */
+   int8_t shadow[16];
+   int fs_const_base;
 };
 
 /* ALU uniform registers 32..63, loaded from TGR3D_ALU_GLOBALS(0..31). The
@@ -91,6 +96,50 @@ struct grate_fp_spec {
  */
 #define GRATE_FP_MAX_FLOW 4
 
+/*
+ * Texture coordinates computed in the vertex shader (fp/move.c): a dependent
+ * read whose coordinates are linear in the varyings (vtc + offset, as blur
+ * kernels and scrolling textures do) forces a one-row sequential program
+ * with four registers. Interpolation is linear, so the vertex shader can
+ * compute them instead and the fragment program fetches with a varying.
+ * Coordinate pair n becomes FS input "input" (.xy, semantic
+ * GRATE_MOVED_SEMANTIC(n)), root[0] and root[1] of a small program of MADs
+ * the vertex shader runs after its own: the leaves are its outputs (by
+ * semantic), FS uniform slots (copied into VS constants at each draw) and
+ * the constants 0 and 1.
+ */
+#define GRATE_MOVED_MAX 4
+#define GRATE_MOVED_MAX_NODES 24
+#define GRATE_MOVED_SEMANTIC(n) GRATE_SEMANTIC(5 /* TGSI_SEMANTIC_GENERIC */, 200 + (n))
+
+enum grate_moved_kind {
+   GRATE_MOVED_NONE,
+   GRATE_MOVED_NODE,       /* result of nodes[index] */
+   GRATE_MOVED_OUTPUT,     /* VS output "semantic" component "comp" */
+   GRATE_MOVED_UNIFORM,    /* FS uniform slot "index" */
+   GRATE_MOVED_ZERO,
+   GRATE_MOVED_ONE,
+};
+
+struct grate_moved_src {
+   uint8_t kind;
+   uint8_t index;
+   uint8_t comp;
+   uint8_t negate;
+   uint16_t semantic;
+   uint16_t pad;
+};
+
+struct grate_moved {
+   struct grate_moved_src nodes[GRATE_MOVED_MAX_NODES][3];   /* a * b + c */
+   int num_nodes;
+   struct {
+      struct grate_moved_src root[2];
+      int input;
+   } coord[GRATE_MOVED_MAX];
+   int num_coords;
+};
+
 /* linker (SU) instructions: up to 32 */
 #define GRATE_FP_MAX_LINKS 32
 
@@ -128,11 +177,16 @@ struct grate_fp_info {
    int num_spec;
    uint8_t flow_user[GRATE_FP_MAX_FLOW];   /* user uniforms loops exit by */
    int num_flow;
+   bool can_move;           /* texture coordinates the VS could compute */
+   struct grate_moved moved;   /* ... that it does (grate_fp_key.move) */
    bool failed;             /* did not fit: the program draws magenta */
 };
 
 uint32_t
 grate_float_to_fp20(float f);
+
+float
+fp20_to_float(uint32_t v);
 
 /* Fill in the preshader slots of consts[] (user: the user uniforms) */
 void
@@ -153,8 +207,10 @@ struct grate_fp_shader {
    int num_immediates;
 };
 
-void
-grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi);
+/* false if the moved coordinates do not fit */
+bool
+grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi,
+                 const struct grate_moved *moved);
 
 /*
  * Fragment program variant: blending and the colour write mask are done by
@@ -172,7 +228,8 @@ struct grate_fp_key {
    uint8_t colormask;                        /* PIPE_MASK_R.. bits */
    uint8_t spec;
    uint8_t num_flow;
-   uint8_t pad[2];
+   uint8_t move;                             /* grate_fp_info.moved */
+   uint8_t pad[1];
 };
 
 void

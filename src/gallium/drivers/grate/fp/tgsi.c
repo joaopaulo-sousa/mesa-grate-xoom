@@ -1381,6 +1381,18 @@ fp_compact_uniforms(struct fp_compiler *c)
          if (u->slots[k].src[j].kind == FP_OPND_UNIFORM)
             BITSET_SET(read, u->slots[k].src[j].index);
    }
+   /* the vertex shader reads those of the moved coordinates */
+   struct grate_moved_src *msrc[GRATE_MOVED_MAX_NODES * 3 + GRATE_MOVED_MAX * 2];
+   int num_msrc = 0;
+   for (int i = 0; i < info->moved.num_nodes; i++)
+      for (int k = 0; k < 3; k++)
+         msrc[num_msrc++] = &info->moved.nodes[i][k];
+   for (int i = 0; i < info->moved.num_coords; i++)
+      for (int k = 0; k < 2; k++)
+         msrc[num_msrc++] = &info->moved.coord[i].root[k];
+   for (int i = 0; i < num_msrc; i++)
+      if (msrc[i]->kind == GRATE_MOVED_UNIFORM)
+         BITSET_SET(read, msrc[i]->index);
 
    for (int i = 0; i < GRATE_FP_MAX_SLOTS; i++)
       map[i] = BITSET_TEST(read, i) ? n++ : -1;
@@ -1428,6 +1440,9 @@ fp_compact_uniforms(struct fp_compiler *c)
          if (u->slots[k].src[j].kind == FP_OPND_UNIFORM)
             u->slots[k].src[j].index = map[u->slots[k].src[j].index];
    }
+   for (int i = 0; i < num_msrc; i++)
+      if (msrc[i]->kind == GRATE_MOVED_UNIFORM)
+         msrc[i]->index = map[msrc[i]->index];
 }
 
 /* Drop units whose value is never used */
@@ -1469,6 +1484,8 @@ emit_tgsi_input(struct fp_compiler *c, const struct tgsi_full_declaration *decl)
 
    c->input_semantic[index] = GRATE_SEMANTIC(decl->Semantic.Name,
                                              decl->Semantic.Index);
+   c->input_interp[index] = decl->Interp.Interpolate;
+   c->num_inputs = MAX2(c->num_inputs, index + 1);
    if (decl->Declaration.Semantic == TGSI_SEMANTIC_COLOR)
       c->fp->info.color_input = index;
 }
@@ -1982,6 +1999,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    fp_fold_conditions(c);
    fp_dead_code(c);
    fp_fold_sfu_copies(c);
+   fp_move_coords(c);
    fp_relayout(c);
    if (!c->failed)
       fp_compact_uniforms(c);

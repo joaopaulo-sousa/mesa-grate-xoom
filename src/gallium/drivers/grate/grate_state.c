@@ -786,6 +786,17 @@ emit_vs_uniforms(struct grate_context *context, uint32_t **ptrp)
       memcpy(&consts[slot * 4], vs->immediates[i], sizeof(vs->immediates[i]));
    }
 
+   /* the fragment program's uniforms its moved coordinates read */
+   if (vs->fs_const_base >= 0 && context->fshader) {
+      uint32_t fs[GRATE_FP_NUM_CONSTS];
+      grate_fs_consts(context, fs);
+      for (int k = 0; k < GRATE_FP_NUM_CONSTS; k++) {
+         union { float f; uint32_t u; } v = { .f = fp20_to_float(fs[k]) };
+         assert((vs->fs_const_base + k) * 4 >= len);
+         consts[(vs->fs_const_base + k) * 4] = v.u;
+      }
+   }
+
    if (len == 0 && vs->num_immediates == 0)
       return;
 
@@ -814,22 +825,8 @@ emit_program(struct grate_context *context, uint32_t **ptrp)
    /* fragment shader constants: ALU uniform registers 32.. */
    const struct grate_fp_info *fpinfo = &context->fshader->info;
    if (!BITSET_IS_EMPTY(fpinfo->used_mask)) {
-      const struct pipe_constant_buffer *cb =
-         &context->constant_buffer[MESA_SHADER_FRAGMENT];
-      const float *user = cb->user_buffer;
-      unsigned user_len = user ? cb->buffer_size / sizeof(float) : 0;
       uint32_t consts[GRATE_FP_NUM_CONSTS];
-
-      for (int i = 0; i < GRATE_FP_NUM_CONSTS; i++) {
-         unsigned u = fpinfo->user_index[i];
-         if (BITSET_TEST(fpinfo->imm_mask, i))
-            consts[i] = fpinfo->consts[i];
-         else if (BITSET_TEST(fpinfo->user_mask, i) && u < user_len)
-            consts[i] = grate_float_to_fp20(user[u]);
-         else
-            consts[i] = 0;
-      }
-      grate_fp_eval_pre(fpinfo, user, user_len, consts);
+      grate_fs_consts(context, consts);
 
       GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_ALU_GLOBALS(0),
                                                    GRATE_FP_NUM_CONSTS));

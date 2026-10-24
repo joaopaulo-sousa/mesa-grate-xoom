@@ -32,6 +32,7 @@ files_libgrate = files(
   'fp/reassoc.c',
   'fp/sched_rows.c',
   'fp/linker.c',
+  'fp/move.c',
   'fp/preshader.c',
   'fp/sched_seq.c',
   'fp/tgsi.c',
