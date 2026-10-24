@@ -524,6 +524,20 @@ tgsi_to_vp(struct grate_vp_shader *vp, struct vp_flow *flow,
       return true;
    }
 
+   case TGSI_OPCODE_TRUNC: {
+      /* d = sign(a) * floor(|a|) */
+      struct vp_src_operand a = src[0];
+      a.absolute = true;
+      a.negate = false;
+      emit_packed(vp, emit_vec(VP_VEC_OP_FLR, dst_temp(VP_SCRATCH0, dst.write_mask, false),
+                               a, src_undef(), src_undef()), emit_sNOP());
+      emit_packed(vp, emit_vec(VP_VEC_OP_SSG, dst_temp(VP_SCRATCH1, dst.write_mask, false),
+                               src[0], src_undef(), src_undef()), emit_sNOP());
+      emit_packed(vp, emit_vMUL(dst, ts, src_temp(VP_SCRATCH1, vp_swz_xyzw, false, false)),
+                  emit_sNOP());
+      return true;
+   }
+
    case TGSI_OPCODE_SQRT: {
       /* d = 1 / rsq(a), which is 0 for a = 0 (1 / inf) unlike a * rsq(a) */
       struct vp_dst_operand t1 = dst_temp(VP_SCRATCH0, 0x1, false);
