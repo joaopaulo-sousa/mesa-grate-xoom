@@ -135,6 +135,26 @@ grate_resource_destroy(struct pipe_screen *pscreen,
    FREE(resource);
 }
 
+/*
+ * The TEX unit takes an ETC1 block as a little-endian 64-bit word, the
+ * format stores it big-endian (as libgrate's upload does): swap the blocks
+ * of a box in place, either way.
+ */
+static void
+grate_etc1_swap(uint8_t *map, unsigned stride, const struct pipe_box *box)
+{
+   unsigned nx = util_format_get_nblocksx(PIPE_FORMAT_ETC1_RGB8, box->width);
+   unsigned ny = util_format_get_nblocksy(PIPE_FORMAT_ETC1_RGB8, box->height);
+
+   for (unsigned y = 0; y < ny; y++)
+      for (unsigned x = 0; x < nx; x++) {
+         uint64_t v;
+         memcpy(&v, map + y * stride + x * 8, 8);
+         v = __builtin_bswap64(v);
+         memcpy(map + y * stride + x * 8, &v, 8);
+      }
+}
+
 static void *
 grate_resource_transfer_map(struct pipe_context *pcontext,
                             struct pipe_resource *presource,
@@ -186,9 +206,13 @@ grate_resource_transfer_map(struct pipe_context *pcontext,
    ptrans->layer_stride = ptrans->stride;
    *transfer = ptrans;
 
-   return (uint8_t *)ret + resource->level_offset[lvl] +
-          box->y * lpitch +
-          box->x * util_format_get_blocksize(presource->format);
+   uint8_t *map = (uint8_t *)ret + resource->level_offset[lvl] +
+                  util_format_get_nblocksy(presource->format, box->y) * lpitch +
+                  util_format_get_nblocksx(presource->format, box->x) *
+                  util_format_get_blocksize(presource->format);
+   if ((usage & PIPE_MAP_READ) && presource->format == PIPE_FORMAT_ETC1_RGB8)
+      grate_etc1_swap(map, lpitch, box);
+   return map;
 }
 
 static void
@@ -204,8 +228,24 @@ grate_resource_transfer_unmap(struct pipe_context *pcontext,
                               struct pipe_transfer *transfer)
 {
    struct grate_context *context = grate_context(pcontext);
+   struct grate_resource *resource = grate_resource(transfer->resource);
 
-   grate_bo_unmap(grate_resource(transfer->resource)->bo);
+   /* back to the TEX unit's ETC1 layout what was read or written */
+   if (transfer->resource->format == PIPE_FORMAT_ETC1_RGB8 &&
+       (transfer->usage & (PIPE_MAP_READ | PIPE_MAP_WRITE))) {
+      void *ret;
+      if (!grate_bo_map(resource->bo, &ret)) {
+         unsigned lvl = MIN2(transfer->level, (unsigned)(GRATE_MAX_MIP_LEVELS - 1));
+         const struct pipe_box *box = &transfer->box;
+         uint8_t *map = (uint8_t *)ret + resource->level_offset[lvl] +
+                        util_format_get_nblocksy(PIPE_FORMAT_ETC1_RGB8, box->y) * transfer->stride +
+                        util_format_get_nblocksx(PIPE_FORMAT_ETC1_RGB8, box->x) * 8;
+         grate_etc1_swap(map, transfer->stride, box);
+         grate_bo_unmap(resource->bo);
+      }
+   }
+
+   grate_bo_unmap(resource->bo);
 
    pipe_resource_reference(&transfer->resource, NULL);
    slab_free(&context->transfer_pool, transfer);
@@ -237,6 +277,15 @@ grate_pixel_format(enum pipe_format format)
       return TGR3D_SURF_FORMAT_R8G8B8A8;
    case PIPE_FORMAT_R32G32B32A32_FLOAT:
       return TGR3D_SURF_FORMAT_R16G16B16A16_float;
+   case PIPE_FORMAT_DXT1_RGB:
+   case PIPE_FORMAT_DXT1_RGBA:
+      return TGR3D_SURF_FORMAT_DXT1;
+   case PIPE_FORMAT_DXT3_RGBA:
+      return TGR3D_SURF_FORMAT_DXT3;
+   case PIPE_FORMAT_DXT5_RGBA:
+      return TGR3D_SURF_FORMAT_DXT5;
+   case PIPE_FORMAT_ETC1_RGB8:
+      return TGR3D_SURF_FORMAT_ETC;
    default:
       return -1;
    }
@@ -266,8 +315,10 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
    pipe_reference_init(&resource->b.reference, 1);
    resource->b.screen = pscreen;
 
-   resource->pitch = template->width0 * grate_resource_blocksize(template->format);
-   height = template->height0;
+   /* compressed formats: rows of 4x4 blocks */
+   resource->pitch = util_format_get_nblocksx(template->format, template->width0) *
+                     grate_resource_blocksize(template->format);
+   height = util_format_get_nblocksy(template->format, template->height0);
 
    resource->tiled = 0;
    if (template->bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW |
@@ -319,12 +370,14 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
     * reading them would fault (from libre-tegra/mesa grate-tmp).
     */
    unsigned levels = MIN2(template->last_level + 1, GRATE_MAX_MIP_LEVELS);
-   unsigned lw = template->width0, lh = height;
+   /* in texels: rows of blocks per level below */
+   unsigned lw = template->width0;
+   unsigned lh = height * util_format_get_blockheight(template->format);
    unsigned blocksize = grate_resource_blocksize(template->format);
 
    size = 0;
    for (unsigned l = 0; l < levels; ++l) {
-      unsigned lpitch = lw * blocksize;
+      unsigned lpitch = util_format_get_nblocksx(template->format, lw) * blocksize;
 
       if (l == 0)
          lpitch = resource->pitch;
@@ -333,7 +386,7 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
 
       resource->level_offset[l] = size;
       resource->level_pitch[l] = lpitch;
-      size += lpitch * MAX2(lh, 1u);
+      size += lpitch * util_format_get_nblocksy(template->format, lh);
 
       lw = MAX2(lw >> 1, 1u);
       lh = MAX2(lh >> 1, 1u);

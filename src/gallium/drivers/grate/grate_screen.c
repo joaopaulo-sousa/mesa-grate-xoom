@@ -11,6 +11,7 @@
 #include "util/u_inlines.h"
 #include "util/u_memory.h"
 #include "util/u_screen.h"
+#include "util/format/u_format.h"
 
 #include "grate_common.h"
 #include "grate_device.h"
@@ -386,14 +387,15 @@ grate_screen_init_shader_caps(struct grate_screen *screen)
 
 /*
  * Formats the TEX unit samples, measured (gpu/dev/texfmt.sh): the 8888 ones,
- * 565 (red and blue come swapped, see grate_sampler_swizzle) and the 8-bit
- * luminance/alpha ones. Others (4444, 5551: wrong bits) the frontend
+ * 565 (red and blue come swapped, see grate_sampler_channel), the 8-bit
+ * luminance/alpha ones and the compressed DXT1/3/5 and ETC1. Others (4444, 5551: wrong bits) the frontend
  * converts on upload.
  */
 unsigned
 grate_sampler_channel(enum pipe_format format, unsigned c)
 {
-   if (format == PIPE_FORMAT_B5G6R5_UNORM && c != 3)
+   /* 565 and the compressed formats come with red and blue swapped */
+   if ((format == PIPE_FORMAT_B5G6R5_UNORM || util_format_is_compressed(format)) && c != 3)
       return 2 - c;
    return c;
 }
@@ -408,6 +410,11 @@ grate_sampler_format(enum pipe_format format)
    case PIPE_FORMAT_L8_UNORM:
    case PIPE_FORMAT_A8_UNORM:
    case PIPE_FORMAT_L8A8_UNORM:
+   case PIPE_FORMAT_DXT1_RGB:
+   case PIPE_FORMAT_DXT1_RGBA:
+   case PIPE_FORMAT_DXT3_RGBA:
+   case PIPE_FORMAT_DXT5_RGBA:
+   case PIPE_FORMAT_ETC1_RGB8:
       return true;
    default:
       return false;
@@ -444,6 +451,10 @@ grate_screen_is_format_supported(struct pipe_screen *pscreen,
                                             PIPE_BIND_SAMPLER_VIEW |
                                             PIPE_BIND_DISPLAY_TARGET |
                                             PIPE_BIND_SCANOUT | PIPE_BIND_SHARED)))
+      return false;
+
+   /* compressed: textures only */
+   if (util_format_is_compressed(format) && (usage & ~PIPE_BIND_SAMPLER_VIEW))
       return false;
 
    if ((usage & PIPE_BIND_SAMPLER_VIEW) && !grate_sampler_format(format))
