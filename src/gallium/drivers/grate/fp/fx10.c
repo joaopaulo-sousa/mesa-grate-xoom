@@ -180,6 +180,8 @@ fx10_unit_range(struct fp_compiler *c, const struct fx10_range *value,
    }
    static const float scale[] = { 1.0f, 2.0f, 4.0f, 0.5f };
    r = (struct fx10_range) { r.lo * scale[u->scale], r.hi * scale[u->scale] };
+   if (u->condition)
+      r = (struct fx10_range) { 0.0f, 1.0f };
    if (u->saturate)
       r = (struct fx10_range) { CLAMP(r.lo, 0.0f, 1.0f), CLAMP(r.hi, 0.0f, 1.0f) };
    if (isnan(r.lo) || isnan(r.hi))

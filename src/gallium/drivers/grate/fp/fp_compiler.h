@@ -78,6 +78,7 @@ struct fp_unit {
    bool kill;              /* writes the kill register: no value, always live */
    bool saturate;
    enum fp_scale scale;    /* result scaled by 2, 4 or 1/2 before saturating */
+   enum fp_condition condition;   /* result made 1.0 or 0.0 by testing it */
    bool blend_inv;         /* d * (1 - y) + ts of a blend, y read less one
                               (fp_expand_blend_inv) */
    int output_chan;        /* colour channel written, or -1: defines a value */
@@ -197,6 +198,7 @@ void fp_mark_fx10(struct fp_compiler *c);
 void fp_reassociate(struct fp_compiler *c);
 void fp_fold_scales(struct fp_compiler *c);
 void fp_expand_blend_inv(struct fp_compiler *c);
+void fp_fold_conditions(struct fp_compiler *c);
 bool fp_opnd_is_const(struct fp_compiler *c, const struct fp_opnd *o, float v);
 
 /* preshader.c */

@@ -1027,6 +1027,7 @@ seq_emit_unit(struct fp_compiler *c, struct fp_unit *u,
       }
 
       a->scale = u->scale;
+      a->condition = u->condition;
       a->dst.saturate = u->saturate;
       if (u->output_chan >= 0) {
          int o = fp_output_half(u->output_chan);

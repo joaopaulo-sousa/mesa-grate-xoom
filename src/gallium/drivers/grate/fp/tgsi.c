@@ -1504,6 +1504,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    fp_specialize(c);
    fp_fuse_mad(c);
    fp_fold_scales(c);
+   fp_fold_conditions(c);
    fp_dead_code(c);
    fp_fold_sfu_copies(c);
    fp_relayout(c);

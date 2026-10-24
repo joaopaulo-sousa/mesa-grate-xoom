@@ -65,7 +65,7 @@ fp_plain_mad(const struct fp_reassoc *r, const struct fp_compiler *c, int i)
    const struct fp_unit_slot *s = &u->slots[0];
    return r->alive[i] && !u->kill && u->num_slots == 1 && !u->sfu &&
           !u->sfu_copy && s->op == FP_ALU_OP_MAD && !s->accumulate_this &&
-          !s->accumulate_other && !s->square_c;
+          !s->accumulate_other && !s->square_c && !u->condition;
 }
 
 static bool
@@ -438,5 +438,65 @@ fp_expand_blend_inv(struct fp_compiler *c)
       fp_unit_op(&u->slots[0], FP_ALU_OP_MAD, fp_negated(s.src[0], true), y,
                  fp_opnd_value(c, &c->units[i]));
       i++;
+   }
+}
+
+/*
+ * Comparisons. An ALU instruction can test its result and give 1.0 or 0.0
+ * (fragment-shader-isa.md, "condition code": equal to, greater than or
+ * greater or equal to zero). SLT/SGE/SEQ come as d = a - b and a CSEL on d
+ * (or on -|d|) choosing 1 or 0, which the preshader recognises in uniform
+ * code; after it, CSEL(c, 1, 0) or CSEL(c, 0, 1) on such a difference
+ * nothing else reads becomes the difference itself, tested:
+ *   d < 0 ? 1 : 0   -d > 0      d < 0 ? 0 : 1   d >= 0
+ *  -d < 0 ? 1 : 0    d > 0     -d < 0 ? 0 : 1  -d >= 0
+ * -|d| < 0 ? 0 : 1   d == 0
+ */
+void
+fp_fold_conditions(struct fp_compiler *c)
+{
+   struct fp_reassoc r;
+
+   fp_reassoc_scan(c, &r);
+   for (int i = 0; i < c->num_units; i++) {
+      struct fp_unit *u = &c->units[i];
+      struct fp_unit_slot *s = &u->slots[0];
+      float x, y;
+      if (!r.alive[i] || u->num_slots != 1 || u->sfu || u->sfu_copy || u->kill ||
+          s->op != FP_ALU_OP_CSEL || u->scale || u->condition ||
+          !fp_opnd_known(c, &s->src[1], &x) || !fp_opnd_known(c, &s->src[2], &y) ||
+          !((x == 1.0f && y == 0.0f) || (x == 0.0f && y == 1.0f)))
+         continue;
+
+      struct fp_opnd cond = s->src[0];
+      if (cond.kind != FP_OPND_VALUE || cond.minus_one || cond.twice ||
+          r.readers[cond.index] != 1)
+         continue;
+      struct fp_unit *d = &c->units[cond.index];
+      struct fp_unit_slot ds = d->slots[0];
+      if (!r.alive[cond.index] || !fp_unit_has_value(d) || d->num_slots != 1 || d->sfu ||
+          d->sfu_copy || d->saturate || d->scale || d->condition || ds.op != FP_ALU_OP_MAD ||
+          ds.accumulate_this || ds.accumulate_other || ds.square_c)
+         continue;
+
+      bool lt_one = x == 1.0f;     /* 1 where the condition is negative */
+      bool negate;                 /* test -d instead of d */
+      enum fp_condition test;
+      if (cond.absolute) {
+         if (!cond.negate || lt_one)
+            continue;              /* d != 0 has no test */
+         negate = false;
+         test = FP_CONDITION_EQUAL;
+      } else {
+         /* c = +-d; c < 0 ? 1 : 0 is -c > 0, c < 0 ? 0 : 1 is c >= 0 */
+         negate = cond.negate ^ lt_one;
+         test = lt_one ? FP_CONDITION_GREATER : FP_CONDITION_GEQUAL;
+      }
+      if (negate) {
+         ds.src[0].negate = !ds.src[0].negate;
+         ds.src[2].negate = !ds.src[2].negate;
+      }
+      u->slots[0] = ds;
+      u->condition = test;
    }
 }
