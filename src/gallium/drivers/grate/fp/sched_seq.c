@@ -1014,6 +1014,11 @@ seq_emit_unit(struct fp_compiler *c, struct fp_unit *u,
             c2, c2
          },
       };
+      if (s->square_c) {
+         /* rC * rD with rD = rC: the sign drops out of the square */
+         a->src[2].negate = a->src[3].negate = false;
+         a->rd_enable = true;
+      }
 
       if (k > 0) {
          a->dst.index = 31;     /* DP partial product, added to slot 0 */

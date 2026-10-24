@@ -66,6 +66,7 @@ struct fp_unit_slot {
    struct fp_opnd src[3];
    bool accumulate_this;
    bool accumulate_other;
+   bool square_c;    /* the added term is src[2] * src[2] (rD = rC) */
 };
 
 struct fp_unit {

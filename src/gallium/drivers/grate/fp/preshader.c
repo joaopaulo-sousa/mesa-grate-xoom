@@ -85,6 +85,9 @@ fp_pre_unit(struct fp_compiler *c, const struct fp_unit *u, const int *pre_of,
    p->op = u->slots[0].op;
    p->saturate = u->saturate;
    p->num_products = u->num_slots;
+   for (int k = 0; k < u->num_slots; k++)
+      if (u->slots[k].square_c)
+         return false;   /* the CPU evaluator has no squared term */
 
    for (int k = 0; k < u->num_slots; k++) {
       if (!fp_pre_opnd(c, &u->slots[k].src[0], pre_of, &p->a[k]) ||

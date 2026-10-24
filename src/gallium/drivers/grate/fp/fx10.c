@@ -148,10 +148,16 @@ fx10_unit_range(struct fp_compiler *c, const struct fx10_range *value,
 
    switch (s->op) {
    case FP_ALU_OP_MAD:
-      r = fx10_add(fx10_mul(a, b), cc);
-      for (int k = 1; k < u->num_slots; k++)
-         r = fx10_add(r, fx10_mul(fx10_opnd_range(c, value, &u->slots[k].src[0]),
-                                  fx10_opnd_range(c, value, &u->slots[k].src[1])));
+      r = fx10_add(fx10_mul(a, b), s->square_c ? fx10_mul(cc, cc) : cc);
+      for (int k = 1; k < u->num_slots; k++) {
+         const struct fp_unit_slot *sk = &u->slots[k];
+         r = fx10_add(r, fx10_mul(fx10_opnd_range(c, value, &sk->src[0]),
+                                  fx10_opnd_range(c, value, &sk->src[1])));
+         if (sk->square_c) {
+            struct fx10_range d = fx10_opnd_range(c, value, &sk->src[2]);
+            r = fx10_add(r, fx10_mul(d, d));
+         }
+      }
       break;
    case FP_ALU_OP_MIN: {
       struct fx10_range p = fx10_mul(a, b);
@@ -193,7 +199,7 @@ fx10_read_ok(struct fp_compiler *c, const struct fx10_range *value,
    if (s->op == FP_ALU_OP_CSEL)
       return j != 0;
    if (j == 2)
-      return !s->accumulate_this;
+      return !s->accumulate_this && !s->square_c;   /* a square doubles errors */
    return fx10_within(fx10_opnd_range(c, value, &s->src[1 - j]), -1.0f, 1.0f);
 }
 

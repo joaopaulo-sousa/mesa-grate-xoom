@@ -61,7 +61,10 @@ struct fp_alu_instr {
    bool accumulate_other;
 
    struct fp_alu_dst_operand dst;
+   /* src[3] is rD: rC's or rB's register again, multiplying rC when
+    * rd_enable (op(rA * rB, rC * rD)) */
    struct fp_alu_src_operand src[4];
+   bool rd_enable;
 };
 
 enum fp_dw_src_regs {

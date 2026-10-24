@@ -65,7 +65,7 @@ fp_plain_mad(const struct fp_reassoc *r, const struct fp_compiler *c, int i)
    const struct fp_unit_slot *s = &u->slots[0];
    return r->alive[i] && !u->kill && u->num_slots == 1 && !u->sfu &&
           !u->sfu_copy && s->op == FP_ALU_OP_MAD && !s->accumulate_this &&
-          !s->accumulate_other;
+          !s->accumulate_other && !s->square_c;
 }
 
 static bool
@@ -319,7 +319,7 @@ fp_scale_result(struct fp_compiler *c, struct fp_reassoc *r, int i,
    struct fp_unit_slot s = v->slots[0];
    if (!r->alive[x->index] || !fp_unit_has_value(v) || v->num_slots != 1 || v->sfu ||
        v->sfu_copy || v->saturate || v->scale != FP_SCALE_NONE ||
-       s.accumulate_this || s.accumulate_other)
+       s.accumulate_this || s.accumulate_other || s.square_c)
       return false;
    if (x->negate) {
       /* -(a * b + c) = -a * b - c; MIN, MAX and CSEL do not turn */

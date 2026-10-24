@@ -546,6 +546,8 @@ emit_setcc(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
  * the next packet sees the sum as alu0 is not known, so it is only read back
  * from its register.
  */
+static bool fp_opnd_equal(const struct fp_opnd *a, const struct fp_opnd *b);
+
 static void
 emit_dot(struct fp_compiler *c, const struct tgsi_full_instruction *inst,
          int n)
@@ -553,14 +555,36 @@ emit_dot(struct fp_compiler *c, const struct tgsi_full_instruction *inst,
    const struct tgsi_dst_register *dst = &inst->Dst[0].Register;
    struct fp_unit *u = fp_new_unit(c);
 
-   u->num_slots = n;
-   u->forward = false;
+   struct fp_opnd a[4], b[4];
+   bool squares = true;
    for (int k = 0; k < n; k++) {
-      struct fp_unit_slot *s = &u->slots[k];
-      fp_unit_op(s, FP_ALU_OP_MAD, fp_src(c, &inst->Src[0].Register, k),
-                 fp_src(c, &inst->Src[1].Register, k), fp_opnd_zero(c, false));
-      s->accumulate_other = k == 1 || k == 2;
-      s->accumulate_this = k == 0 && n == 4;
+      a[k] = fp_src(c, &inst->Src[0].Register, k);
+      b[k] = fp_src(c, &inst->Src[1].Register, k);
+      squares &= fp_opnd_equal(&a[k], &b[k]);
+   }
+
+   u->forward = false;
+   if (squares) {
+      /*
+       * dot(v, v): slot 0 computes rA * rB + rC * rD with rD = rC, two
+       * squares, the others send it one square each. Measured: a sending
+       * slot gives its rA * rB only, without the rC * rD term.
+       */
+      u->num_slots = n - 1;
+      fp_unit_op(&u->slots[0], FP_ALU_OP_MAD, a[0], a[0], a[1]);
+      u->slots[0].square_c = true;
+      for (int k = 1; k < u->num_slots; k++) {
+         fp_unit_op(&u->slots[k], FP_ALU_OP_MAD, a[k + 1], a[k + 1], fp_opnd_zero(c, false));
+         u->slots[k].accumulate_other = true;
+      }
+   } else {
+      u->num_slots = n;
+      for (int k = 0; k < n; k++) {
+         struct fp_unit_slot *s = &u->slots[k];
+         fp_unit_op(s, FP_ALU_OP_MAD, a[k], b[k], fp_opnd_zero(c, false));
+         s->accumulate_other = k == 1 || k == 2;
+         s->accumulate_this = k == 0 && n == 4;
+      }
    }
 
    if (!fp_color_write(c, dst)) {
@@ -1134,7 +1158,8 @@ fp_cse(struct fp_compiler *c)
              q->sfu || q->sfu_copy || q->saturate != u->saturate ||
              q->slots[0].op != u->slots[0].op ||
              q->slots[0].accumulate_this || q->slots[0].accumulate_other ||
-             u->slots[0].accumulate_this || u->slots[0].accumulate_other)
+             u->slots[0].accumulate_this || u->slots[0].accumulate_other ||
+             q->slots[0].square_c || u->slots[0].square_c)
             continue;
          bool same = true;
          for (int j = 0; j < 3; j++)
@@ -1159,6 +1184,7 @@ fp_unit_is_mul(struct fp_compiler *c, const struct fp_unit *u)
    return fp_unit_has_value(u) && u->num_slots == 1 && !u->sfu &&
           !u->sfu_copy && !u->saturate && u->slots[0].op == FP_ALU_OP_MAD &&
           !u->slots[0].accumulate_this && !u->slots[0].accumulate_other &&
+          !u->slots[0].square_c &&
           fp_opnd_is_const(c, &u->slots[0].src[2], 0.0f);
 }
 
@@ -1188,7 +1214,7 @@ fp_fuse_mad(struct fp_compiler *c)
       struct fp_unit_slot *s = &u->slots[0];
       /* SFU operand copies stay plain copies (fp_fold_sfu_copies) */
       if (u->num_slots != 1 || u->sfu || u->sfu_copy || s->op != FP_ALU_OP_MAD ||
-          s->accumulate_this || s->accumulate_other)
+          s->accumulate_this || s->accumulate_other || s->square_c)
          continue;
 
       /* addition: one of a/b is 1, the other and c are the addends */

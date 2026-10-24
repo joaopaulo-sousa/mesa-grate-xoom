@@ -90,6 +90,9 @@ grate_fp_pack_alu(uint32_t *dst, struct fp_alu_instr *instr)
       .rD_reg_select = instr->src[3].index == instr->src[2].index,
       .rD_fixed10 = instr->src[3].datatype != FP_DATATYPE_FP20,
       .rD_sub_reg_select_high = instr->src[3].sub_reg_select_high,
+      .rD_enable = instr->rd_enable,
+      .rD_absolute_value = instr->src[3].absolute_value,
+      .rD_minus_one = instr->src[3].minus_one,
    };
 
    /* Tegra114 uses these bits for extra opcodes when rD is disabled */
