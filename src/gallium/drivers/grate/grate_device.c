@@ -129,6 +129,7 @@ static int grate_device_wrap(struct grate_device **drmp, int fd, bool close)
     
     util_sparse_array_init(&drm->bo_map, sizeof(struct grate_bo), 512);
     pthread_mutex_init(&drm->bo_map_lock, NULL);
+    pthread_mutex_init(&drm->mapping_lock, NULL);
     
     *drmp = drm;
 
@@ -171,6 +172,7 @@ void grate_device_close(struct grate_device *drm)
     
     util_sparse_array_finish(&drm->bo_map);
     pthread_mutex_destroy(&drm->bo_map_lock);
+    pthread_mutex_destroy(&drm->mapping_lock);
 
     free(drm);
 }

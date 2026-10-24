@@ -30,6 +30,7 @@
 #include <stdint.h>
 
 #include "drm-uapi/tegra_drm.h"
+#include "util/list.h"
 #include "tegra.h"
 
 enum host1x_class {
@@ -48,10 +49,16 @@ struct drm_tegra_channel {
     uint64_t context;
 
     unsigned int cond_shift;
+
+    /* its mappings, under grate_device.mapping_lock: closing the channel
+     * ends them in the kernel, they then leave their BOs' lists */
+    struct list_head mappings;
 };
 
 struct drm_tegra_mapping {
     struct drm_tegra_channel *channel;
+    struct grate_bo *bo;
+    struct list_head link;      /* in channel->mappings */
     uint32_t id;
     uint32_t flags;
 };

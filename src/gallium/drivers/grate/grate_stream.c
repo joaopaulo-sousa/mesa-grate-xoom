@@ -255,6 +255,7 @@ __grate_stream_get_channel_mapping(struct grate_stream *stream,
    assert((flags & !DRM_TEGRA_CHANNEL_MAP_READ_WRITE) == 0);
    assert((flags & DRM_TEGRA_CHANNEL_MAP_READ_WRITE) != 0);
 
+   pthread_mutex_lock(&bo->drm->mapping_lock);
    util_dynarray_foreach(&bo->channel_maps, struct drm_tegra_mapping *, mapping) {
       if ((*mapping)->channel == stream->channel) {
          uint32_t mapping_flags = (*mapping)->flags;
@@ -267,6 +268,7 @@ __grate_stream_get_channel_mapping(struct grate_stream *stream,
    if (!bo_mapping) {
       ret = drm_tegra_channel_map(stream->channel, bo, flags, &bo_mapping);
       if (ret < 0) {
+         pthread_mutex_unlock(&bo->drm->mapping_lock);
          stream->status = GRATE_STREAM_CONSTRUCTION_FAILED;
          grate_loge("drm_tegra_channel_map() failed: %d\n", ret);
          return ret;
@@ -275,6 +277,8 @@ __grate_stream_get_channel_mapping(struct grate_stream *stream,
       util_dynarray_append_typed(&bo->channel_maps, struct drm_tegra_mapping *, bo_mapping);
    }
    
+   pthread_mutex_unlock(&bo->drm->mapping_lock);
+
    if (ret == 0)
       *mapping = bo_mapping;
    

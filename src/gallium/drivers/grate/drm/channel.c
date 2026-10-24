@@ -71,6 +71,7 @@ drm_tegra_channel_open(struct grate_device *drm,
         return -ENOMEM;
 
     channel->drm = drm;
+    list_inithead(&channel->mappings);
 
     memset(&args, 0, sizeof(args));
     args.host1x_class = class;
@@ -120,6 +121,17 @@ int drm_tegra_channel_close(struct drm_tegra_channel *channel)
 
     drm = channel->drm;
 
+    /* the kernel drops the channel's mappings with it: forget them, the
+     * BOs may outlive the channel */
+    pthread_mutex_lock(&drm->mapping_lock);
+    list_for_each_entry_safe(struct drm_tegra_mapping, map, &channel->mappings, link) {
+        util_dynarray_delete_unordered(&map->bo->channel_maps,
+                                       struct drm_tegra_mapping *, map);
+        list_del(&map->link);
+        free(map);
+    }
+    pthread_mutex_unlock(&drm->mapping_lock);
+
     memset(&args, 0, sizeof(args));
     args.context = channel->context;
 
@@ -167,8 +179,10 @@ drm_tegra_channel_map(struct drm_tegra_channel *channel,
     }
 
     map->channel = channel;
+    map->bo = bo;
     map->id = args.mapping;
     map->flags = flags;
+    list_addtail(&map->link, &channel->mappings);
     *mapp = map;
 
     return 0;
@@ -190,9 +204,9 @@ drm_tegra_channel_unmap(struct drm_tegra_mapping *map)
     args.mapping = map->id;
 
     err = ioctl(drm->fd, DRM_IOCTL_TEGRA_CHANNEL_UNMAP, &args);
+    list_del(&map->link);
+    free(map);
     if (err < 0)
         return -errno;
-
-    free(map);
     return 0;
 }

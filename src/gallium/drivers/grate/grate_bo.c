@@ -56,10 +56,12 @@ static void grate_bo_free(struct grate_bo *bo)
 
     drmCloseBufferHandle(drm->fd, bo->handle);
     
+    pthread_mutex_lock(&drm->mapping_lock);
     util_dynarray_foreach(&bo->channel_maps, struct drm_tegra_mapping *, mapping) {
        drm_tegra_channel_unmap(*mapping);
     }
     util_dynarray_fini(&bo->channel_maps);
+    pthread_mutex_unlock(&drm->mapping_lock);
 
     //Clear BO as GEM handles are reused and we are not removing from bo_map
     memset(bo, 0, sizeof(*bo));

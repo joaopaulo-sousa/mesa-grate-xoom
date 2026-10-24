@@ -42,6 +42,11 @@ struct grate_device {
 
    pthread_mutex_t bo_map_lock;
    struct util_sparse_array bo_map;
+
+   /* the channel mappings of the BOs (grate_bo.channel_maps) and of the
+    * channels (drm_tegra_channel.mappings): BOs outlive the contexts whose
+    * channels mapped them */
+   pthread_mutex_t mapping_lock;
    
    // Identifies the SoC that this GPU belongs to
    enum drm_tegra_soc_id soc_id;
