@@ -6,6 +6,7 @@
 #include "util/u_draw.h"
 #include "util/u_helpers.h"
 #include "util/u_prim.h"
+#include "util/u_split_draw.h"
 
 #include "grate_common.h"
 #include "grate_context.h"
@@ -310,6 +311,10 @@ grate_init_state(struct grate_context *context, uint32_t **ptrp)
 }
 
 static void
+grate_draw_range(struct grate_context *context, const struct pipe_draw_info *info,
+                 const struct pipe_draw_start_count_bias *draws);
+
+static void
 grate_draw_vbo(struct pipe_context *pcontext,
                const struct pipe_draw_info *info,
                unsigned drawid_offset,
@@ -317,11 +322,7 @@ grate_draw_vbo(struct pipe_context *pcontext,
                const struct pipe_draw_start_count_bias *draws,
                unsigned num_draws)
 {
-   int err;
-   uint32_t value;
    struct grate_context *context = grate_context(pcontext);
-   struct grate_stream *stream = &context->gr3d->stream;
-   uint32_t *ptr;
 
    if (num_draws > 1) {
       util_draw_multi(pcontext, info, drawid_offset, indirect, draws, num_draws);
@@ -351,6 +352,34 @@ grate_draw_vbo(struct pipe_context *pcontext,
       }
       fprintf(stderr, "\n");
    }
+
+   /*
+    * The vertex count of a draw has 11 bits: larger draws go in parts, an
+    * even count of whole triangles each, so that a strip's next part keeps
+    * the winding (u_split_draw repeats the two vertices it continues from)
+    */
+   static const uint32_t max_verts = 2046;
+   struct pipe_draw_start_count_bias part = draws[0];
+   uint32_t left = draws[0].count;
+   while (left) {
+      uint32_t count = left, step;
+      u_split_draw(info, max_verts, &count, &step);
+      part.count = count;
+      grate_draw_range(context, info, &part);
+      part.start += step;
+      left -= step;
+   }
+}
+
+/* One draw of at most 2048 vertices */
+static void
+grate_draw_range(struct grate_context *context, const struct pipe_draw_info *info,
+                 const struct pipe_draw_start_count_bias *draws)
+{
+   struct pipe_context *pcontext = &context->base;
+   struct grate_stream *stream = &context->gr3d->stream;
+   uint32_t *ptr, value;
+   int err;
 
    err = grate_stream_begin(stream, &ptr);
    if (err < 0) {
@@ -428,7 +457,7 @@ grate_draw_vbo(struct pipe_context *pcontext,
    }
 
    unsigned count = draws[0].count;
-   assert(count > 0 && count < (1 << 11));
+   assert(count > 0 && count <= (1 << 11));
    value  = TGR3D_IDX_DRAW_PRIM_VTX_COUNT(count - 1);
    value |= TGR3D_IDX_DRAW_PRIM_START_VTX(offset);
    GRATE_PUSHBUF_WORD(ptr, host1x_opcode_incr(REG_TGR3D_IDX_DRAW_PRIM, 1));
