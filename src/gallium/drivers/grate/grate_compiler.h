@@ -84,6 +84,13 @@ struct grate_fp_spec {
                             * as a CMP condition */
 };
 
+/*
+ * Loops whose exit depends on uniforms only (a count given by the
+ * application) are compiled for the values of those uniforms at a draw
+ * (grate_fp_key.flow): unrolled exactly, as the fragment unit cannot jump.
+ */
+#define GRATE_FP_MAX_FLOW 4
+
 /* linker (SU) instructions: up to 32 */
 #define GRATE_FP_MAX_LINKS 32
 
@@ -119,6 +126,8 @@ struct grate_fp_info {
    int num_pre;
    struct grate_fp_spec spec[GRATE_FP_MAX_SPEC];
    int num_spec;
+   uint8_t flow_user[GRATE_FP_MAX_FLOW];   /* user uniforms loops exit by */
+   int num_flow;
    bool failed;             /* did not fit: the program draws magenta */
 };
 
@@ -155,12 +164,15 @@ grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi);
  */
 struct grate_fp_key {
    uint32_t spec_bits;
+   float flow[GRATE_FP_MAX_FLOW];            /* values of flow_user[] */
+   uint8_t flow_user[GRATE_FP_MAX_FLOW];
    uint8_t blend;
    uint8_t rgb_func, rgb_src, rgb_dst;       /* PIPE_BLEND_*, PIPE_BLENDFACTOR_* */
    uint8_t alpha_func, alpha_src, alpha_dst;
    uint8_t colormask;                        /* PIPE_MASK_R.. bits */
    uint8_t spec;
-   uint8_t pad[3];
+   uint8_t num_flow;
+   uint8_t pad[2];
 };
 
 void

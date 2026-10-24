@@ -105,6 +105,27 @@ struct fp_seq_exec {
    int num_packets;
 };
 
+/*
+ * Control flow (fp_run): the fragment unit cannot jump, so both sides of
+ * an IF run and loops are unrolled; a write merges with the old value by
+ * the predicate of the pixels it is for (-1.0 for those, 0.0 for others).
+ * A pixel leaving a loop keeps the values it has then (fp_flow.exit), so
+ * writes in a loop need not test whether a pixel is still in it.
+ */
+enum fp_pred_kind {
+   FP_PRED_ALWAYS,
+   FP_PRED_NEVER,
+   FP_PRED_VALUE,
+};
+
+struct fp_pred {
+   enum fp_pred_kind kind;
+   struct fp_opnd v;
+};
+
+#define FP_MAX_FLOW_DEPTH 16
+#define FP_MAX_LOOP_ITERATIONS 32
+
 struct fp_compiler {
    struct grate_fp_shader *fp;
    struct fp_unit units[FP_MAX_UNITS];
@@ -113,6 +134,23 @@ struct fp_compiler {
    bool temp_written[FP_MAX_TEMPS][4];
    struct fp_dw_instr dw;
    bool failed;
+
+   struct fp_pred pred;    /* pixels the current writes are for */
+   struct fp_pred pred_full;  /* ... that have not left a loop either */
+   struct fp_flow {
+      bool loop;
+      struct fp_pred cond;            /* IF: of the side being run */
+      struct fp_pred alive, iter;     /* loop: not left by BRK, CONT */
+      /* loop: values of the pixels that left it */
+      struct fp_opnd exit[FP_MAX_TEMPS][4], exit_outv[4];
+      bool exit_written[FP_MAX_TEMPS][4], exit_outv_written[4];
+   } flow[FP_MAX_FLOW_DEPTH];
+   int flow_depth;
+   bool needs_flow;        /* a loop exits by uniforms: compile per value */
+   int8_t eval[FP_MAX_UNITS];        /* fp_eval: 1 known, -1 not, 0 unseen */
+   float eval_v[FP_MAX_UNITS];
+   int8_t dep[FP_MAX_UNITS];         /* fp_deps: 1 uniforms only, -1 pixel */
+   uint64_t dep_users[FP_MAX_UNITS];
 
    /* TGSI inputs: semantic; TRAM layout, input * 4 + component per row and
     * column (-1: free) */

@@ -179,7 +179,7 @@ grate_fs_compile(enum drm_tegra_soc_id soc_id, const struct tgsi_token *tokens,
 
    /* say which shader draws magenta, to have something to work from (not
     * the generic version of one that gets specialized at draw time) */
-   if (fp.info.failed && (!fp.info.num_spec || (key && key->spec))) {
+   if (fp.info.failed && !fp.info.num_flow && (!fp.info.num_spec || (key && key->spec))) {
       fprintf(stderr, "GRATE FRAG: failed shader (blend %d: rgb %d %d %d, "
               "alpha %d %d %d, colormask 0x%x):\n",
               key ? key->blend : 0, key ? key->rgb_func : 0,
@@ -411,13 +411,23 @@ grate_fs_update(struct grate_context *context)
    if (!so)
       return;
 
-   struct grate_fs_variant *v = grate_fs_variant(context, so, &key);
-   if (v->info.num_spec) {
-      const struct pipe_constant_buffer *cb =
-         &context->constant_buffer[MESA_SHADER_FRAGMENT];
-      const float *user = cb->user_buffer;
-      unsigned user_len = user ? cb->buffer_size / sizeof(float) : 0;
+   const struct pipe_constant_buffer *cb =
+      &context->constant_buffer[MESA_SHADER_FRAGMENT];
+   const float *user = cb->user_buffer;
+   unsigned user_len = user ? cb->buffer_size / sizeof(float) : 0;
 
+   struct grate_fs_variant *v = grate_fs_variant(context, so, &key);
+   if (v->info.num_flow) {
+      /* loops counted by uniforms: the variant for their values */
+      key.num_flow = v->info.num_flow;
+      for (int i = 0; i < v->info.num_flow; i++) {
+         unsigned u = v->info.flow_user[i];
+         key.flow_user[i] = u;
+         key.flow[i] = u < user_len ? user[u] : 0.0f;
+      }
+      v = grate_fs_variant(context, so, &key);
+   }
+   if (v->info.num_spec) {
       key.spec = 1;
       key.spec_bits = grate_fp_eval_spec(&v->info, user, user_len);
       v = grate_fs_variant(context, so, &key);

@@ -7,6 +7,7 @@
 
 #include "tgsi/tgsi_parse.h"
 
+#include "util/bitscan.h"
 #include "util/blend.h"
 #include "util/u_memory.h"
 
@@ -319,6 +320,17 @@ fp_src(struct fp_compiler *c, const struct tgsi_src_register *src, int chan)
    }
 
    case TGSI_FILE_CONSTANT:
+      /* a uniform a loop exits by, in a variant for its value */
+      for (int i = 0; i < c->key->num_flow; i++) {
+         if (c->key->flow_user[i] != src->Index * 4 + comp)
+            continue;
+         float value = c->key->flow[i];
+         if (src->Absolute)
+            value = fabsf(value);
+         if (src->Negate)
+            value = -value;
+         return fp_opnd_uniform(fp_const_slot(c, value));
+      }
       o = fp_opnd_uniform(fp_uniform_slot(c, src->Index, comp));
       break;
 
@@ -341,6 +353,20 @@ fp_src(struct fp_compiler *c, const struct tgsi_src_register *src, int chan)
    return fp_opnd_modify(o, src->Negate, src->Absolute);
 }
 
+static struct fp_opnd
+fp_val(struct fp_compiler *c, enum fp_alu_op op, struct fp_opnd a,
+       struct fp_opnd b, struct fp_opnd cc);
+
+/* A value written under a predicate: the old one for the other pixels (a
+ * temporary not written yet is 0) */
+static struct fp_opnd
+fp_merge(struct fp_compiler *c, struct fp_opnd v, bool written, struct fp_opnd old)
+{
+   if (c->pred.kind != FP_PRED_VALUE)
+      return v;
+   return fp_val(c, FP_ALU_OP_CSEL, c->pred.v, v, written ? old : fp_opnd_zero(c, false));
+}
+
 /* Unit writing "chan" of a TGSI destination; returns whether it is a colour
  * write. A temporary channel becomes the unit's value. */
 static bool
@@ -354,7 +380,8 @@ fp_dst(struct fp_compiler *c, struct fp_unit *u,
       c->dw.stencil_write = 0;
       c->dw.src_regs = FP_DW_REGS_R2_R3;
       if (c->redirect_output) {
-         c->outv[chan] = fp_opnd_value(c, u);
+         c->outv[chan] = fp_merge(c, fp_opnd_value(c, u), c->outv_written[chan],
+                                  c->outv[chan]);
          c->outv_written[chan] = true;
          return false;
       }
@@ -366,7 +393,9 @@ fp_dst(struct fp_compiler *c, struct fp_unit *u,
          fp_fail(c, "too many temporaries");
          return false;
       }
-      c->temps[dst->Index][chan] = fp_opnd_value(c, u);
+      c->temps[dst->Index][chan] = fp_merge(c, fp_opnd_value(c, u),
+                                            c->temp_written[dst->Index][chan],
+                                            c->temps[dst->Index][chan]);
       c->temp_written[dst->Index][chan] = true;
       return false;
 
@@ -392,7 +421,8 @@ fp_set_dst_opnd(struct fp_compiler *c, const struct tgsi_dst_register *dst,
                 int chan, struct fp_opnd o)
 {
    if (dst->File == TGSI_FILE_TEMPORARY && dst->Index < FP_MAX_TEMPS) {
-      c->temps[dst->Index][chan] = o;
+      c->temps[dst->Index][chan] = fp_merge(c, o, c->temp_written[dst->Index][chan],
+                                            c->temps[dst->Index][chan]);
       c->temp_written[dst->Index][chan] = true;
       return true;
    }
@@ -400,7 +430,7 @@ fp_set_dst_opnd(struct fp_compiler *c, const struct tgsi_dst_register *dst,
       c->dw.enable = 1;
       c->dw.index = GRATE_RT_COLOR;
       c->dw.src_regs = FP_DW_REGS_R2_R3;
-      c->outv[chan] = o;
+      c->outv[chan] = fp_merge(c, o, c->outv_written[chan], c->outv[chan]);
       c->outv_written[chan] = true;
       return true;
    }
@@ -419,9 +449,6 @@ fp_unit_op(struct fp_unit_slot *s, enum fp_alu_op op, struct fp_opnd a,
 }
 
 /* Component-wise instruction: one unit per written channel */
-static struct fp_opnd
-fp_val(struct fp_compiler *c, enum fp_alu_op op, struct fp_opnd a,
-       struct fp_opnd b, struct fp_opnd cc);
 
 static void
 emit_componentwise(struct fp_compiler *c,
@@ -762,7 +789,8 @@ emit_sfu(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
    const struct tgsi_dst_register *dst = &inst->Dst[0].Register;
    unsigned opcode = inst->Instruction.Opcode;
    struct fp_opnd s[4][2], r = { 0 };
-   bool scalar = opcode != TGSI_OPCODE_FRC && opcode != TGSI_OPCODE_FLR;
+   bool scalar = opcode != TGSI_OPCODE_FRC && opcode != TGSI_OPCODE_FLR &&
+                 opcode != TGSI_OPCODE_TRUNC;
 
    for (int i = 0; i < 4; i++) {
       if (!(dst->WriteMask & (1 << i)))
@@ -790,6 +818,14 @@ emit_sfu(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
             r = fp_val(c, FP_ALU_OP_MAD, s[i][0], fp_opnd_one(c, false),
                        fp_opnd_modify(fp_sfu(c, FP_SFU_OP_FRC, s[i][0]), true, false));
             break;
+         case TGSI_OPCODE_TRUNC: {
+            /* t = |x| - fract(|x|), x < 0 ? -t : t */
+            struct fp_opnd a = fp_opnd_modify(s[i][0], false, true);
+            struct fp_opnd t = fp_val(c, FP_ALU_OP_MAD, a, fp_opnd_one(c, false),
+                                      fp_opnd_modify(fp_sfu(c, FP_SFU_OP_FRC, a), true, false));
+            r = fp_val(c, FP_ALU_OP_CSEL, s[i][0], fp_opnd_modify(t, true, false), t);
+            break;
+         }
          case TGSI_OPCODE_POW: {
             /* x^y = 2^(y * log2(x)) */
             struct fp_opnd l = fp_sfu(c, FP_SFU_OP_LG2, s[i][0]);
@@ -864,6 +900,10 @@ emit_kill(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
 {
    struct fp_opnd one = fp_opnd_one(c, false), zero = fp_opnd_zero(c, false);
 
+   /* only the pixels the instruction is for */
+   if (c->pred_full.kind == FP_PRED_VALUE)
+      one = fp_val(c, FP_ALU_OP_CSEL, c->pred_full.v, one, zero);
+
    if (inst->Instruction.Opcode == TGSI_OPCODE_KILL) {
       struct fp_unit *u = fp_new_unit(c);
       u->kill = true;
@@ -924,6 +964,7 @@ emit_tgsi_instr(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
    case TGSI_OPCODE_COS:
    case TGSI_OPCODE_FRC:
    case TGSI_OPCODE_FLR:
+   case TGSI_OPCODE_TRUNC:
    case TGSI_OPCODE_POW:
       emit_sfu(c, inst);
       break;
@@ -1442,12 +1483,426 @@ emit_tgsi_declaration(struct fp_compiler *c, const struct tgsi_full_declaration 
 }
 
 
+/*
+ * Control flow. The fragment unit has no jumps: an IF runs both sides, the
+ * writes of each merged by its condition (fp_merge), and a loop is unrolled
+ * until it is known to have ended. Its exit has to be known when compiling:
+ * from constants, or from uniforms, which then make variants compiled for
+ * their values (grate_fp_key.flow); a loop left by a test on the pixel runs
+ * every iteration up to FP_MAX_LOOP_ITERATIONS, each pixel keeping the
+ * values of its last one.
+ */
+
+static bool fp_eval_unit(struct fp_compiler *c, int i, float *v);
+
+/* The value of an operand if it is known when compiling */
+static bool
+fp_eval(struct fp_compiler *c, struct fp_opnd o, float *v)
+{
+   float x;
+
+   switch (o.kind) {
+   case FP_OPND_ZERO:
+      x = 0.0f;
+      break;
+   case FP_OPND_ONE:
+      x = 1.0f;
+      break;
+   case FP_OPND_UNIFORM:
+      if (!BITSET_TEST(c->fp->info.imm_mask, o.index))
+         return false;
+      x = fp20_to_float(c->fp->info.consts[o.index]);
+      break;
+   case FP_OPND_VALUE:
+      if (!fp_eval_unit(c, o.index, &x))
+         return false;
+      break;
+   default:
+      return false;
+   }
+   if (o.absolute)
+      x = fabsf(x);
+   if (o.negate)
+      x = -x;
+   *v = x;
+   return true;
+}
+
+static bool
+fp_eval_unit(struct fp_compiler *c, int i, float *v)
+{
+   struct fp_unit *u = &c->units[i];
+   struct fp_unit_slot *s = &u->slots[0];
+   float a, b, cc, x;
+   bool ok = false;
+
+   if (c->eval[i]) {
+      *v = c->eval_v[i];
+      return c->eval[i] > 0;
+   }
+
+   if (u->kill || u->output_chan >= 0) {
+      ok = false;
+   } else if (u->num_slots == 0) {
+      ok = fp_eval(c, s->src[0], &a);
+      switch (u->sfu) {
+      case FP_SFU_OP_RCP:  x = 1.0f / a; break;
+      case FP_SFU_OP_RSQ:  x = 1.0f / sqrtf(a); break;
+      case FP_SFU_OP_SQRT: x = sqrtf(a); break;
+      case FP_SFU_OP_LG2:  x = log2f(a); break;
+      case FP_SFU_OP_FRC:  x = a - floorf(a); break;
+      default:             ok = false; break;
+      }
+   } else if (u->num_slots == 1 && !s->accumulate_this && !s->accumulate_other &&
+              !s->square_c) {
+      switch (s->op) {
+      case FP_ALU_OP_CSEL:
+         ok = fp_eval(c, s->src[0], &a) && fp_eval(c, s->src[a < 0.0f ? 1 : 2], &x);
+         break;
+      case FP_ALU_OP_MAD:
+      case FP_ALU_OP_MIN:
+      case FP_ALU_OP_MAX:
+         ok = fp_eval(c, s->src[0], &a) && fp_eval(c, s->src[1], &b) &&
+              fp_eval(c, s->src[2], &cc);
+         x = s->op == FP_ALU_OP_MAD ? a * b + cc :
+             s->op == FP_ALU_OP_MIN ? fminf(a * b, cc) : fmaxf(a * b, cc);
+         break;
+      default:
+         break;
+      }
+   }
+   if (ok && u->saturate)
+      x = CLAMP(x, 0.0f, 1.0f);
+
+   c->eval[i] = ok ? 1 : -1;
+   c->eval_v[i] = ok ? x : 0.0f;
+   *v = x;
+   return ok;
+}
+
+/* Whether an operand depends on uniforms only; *users: which */
+static bool
+fp_deps(struct fp_compiler *c, struct fp_opnd o, uint64_t *users)
+{
+   switch (o.kind) {
+   case FP_OPND_ZERO:
+   case FP_OPND_ONE:
+      return true;
+   case FP_OPND_UNIFORM:
+      if (BITSET_TEST(c->fp->info.user_mask, o.index))
+         *users |= 1ull << c->fp->info.user_index[o.index];
+      return true;
+   case FP_OPND_VALUE:
+      break;
+   default:
+      return false;
+   }
+
+   int i = o.index;
+   if (!c->dep[i]) {
+      struct fp_unit *u = &c->units[i];
+      uint64_t mask = 0;
+      bool uniform = true;
+      fp_unit_foreach_src(u, k, j)
+         uniform &= fp_deps(c, u->slots[k].src[j], &mask);
+      c->dep[i] = uniform ? 1 : -1;
+      c->dep_users[i] = mask;
+   }
+   *users |= c->dep_users[i];
+   return c->dep[i] > 0;
+}
+
+/* A predicate of value p (-1.0: true, 0.0: false), constant if known */
+static struct fp_pred
+fp_pred_value(struct fp_compiler *c, struct fp_opnd p)
+{
+   float v;
+
+   if (fp_eval(c, p, &v))
+      return (struct fp_pred) { v < 0.0f ? FP_PRED_ALWAYS : FP_PRED_NEVER };
+   return (struct fp_pred) { FP_PRED_VALUE, p };
+}
+
+static struct fp_opnd
+fp_opnd_minus_one(struct fp_compiler *c)
+{
+   return fp_opnd_modify(fp_opnd_one(c, false), true, false);
+}
+
+/* IF x: x != 0, as -|x| < 0 */
+static struct fp_pred
+fp_pred_cond(struct fp_compiler *c, struct fp_opnd x)
+{
+   float v;
+
+   if (fp_eval(c, x, &v))
+      return (struct fp_pred) { v != 0.0f ? FP_PRED_ALWAYS : FP_PRED_NEVER };
+   return fp_pred_value(c, fp_val(c, FP_ALU_OP_CSEL, fp_opnd_modify(x, true, true),
+                                  fp_opnd_minus_one(c), fp_opnd_zero(c, false)));
+}
+
+static struct fp_pred
+fp_pred_not(struct fp_compiler *c, struct fp_pred a)
+{
+   if (a.kind != FP_PRED_VALUE)
+      return (struct fp_pred) { a.kind == FP_PRED_ALWAYS ? FP_PRED_NEVER : FP_PRED_ALWAYS };
+   return fp_pred_value(c, fp_val(c, FP_ALU_OP_CSEL, a.v, fp_opnd_zero(c, false),
+                                  fp_opnd_minus_one(c)));
+}
+
+static struct fp_pred
+fp_pred_and(struct fp_compiler *c, struct fp_pred a, struct fp_pred b)
+{
+   if (a.kind != FP_PRED_VALUE)
+      return a.kind == FP_PRED_ALWAYS ? b : a;
+   if (b.kind != FP_PRED_VALUE)
+      return b.kind == FP_PRED_ALWAYS ? a : b;
+   return fp_pred_value(c, fp_val(c, FP_ALU_OP_CSEL, a.v, b.v, fp_opnd_zero(c, false)));
+}
+
+/* The predicate of the flow entries from "first" on; full: also whether
+ * the pixels are still in the loops */
+static struct fp_pred
+fp_pred_from(struct fp_compiler *c, int first, bool full)
+{
+   struct fp_pred p = { FP_PRED_ALWAYS };
+
+   for (int i = first; i < c->flow_depth; i++) {
+      if (c->flow[i].loop) {
+         if (full)
+            p = fp_pred_and(c, p, c->flow[i].alive);
+         p = fp_pred_and(c, p, c->flow[i].iter);
+      } else {
+         p = fp_pred_and(c, p, c->flow[i].cond);
+      }
+   }
+   return p;
+}
+
+static void
+fp_update_pred(struct fp_compiler *c)
+{
+   c->pred = fp_pred_from(c, 0, false);
+   c->pred_full = fp_pred_from(c, 0, true);
+}
+
+/* Pixels of q (in loop f) leave it with the values they have now */
+static void
+fp_keep_exit(struct fp_compiler *c, struct fp_flow *f, struct fp_pred q)
+{
+   for (int t = 0; t < FP_MAX_TEMPS; t++)
+      for (int ch = 0; ch < 4; ch++) {
+         if (!c->temp_written[t][ch])
+            continue;
+         struct fp_opnd old = f->exit_written[t][ch] ? f->exit[t][ch] : fp_opnd_zero(c, false);
+         f->exit[t][ch] = q.kind == FP_PRED_ALWAYS ? c->temps[t][ch] :
+                          fp_val(c, FP_ALU_OP_CSEL, q.v, c->temps[t][ch], old);
+         f->exit_written[t][ch] = true;
+      }
+   for (int ch = 0; ch < 4; ch++) {
+      if (!c->outv_written[ch])
+         continue;
+      struct fp_opnd old = f->exit_outv_written[ch] ? f->exit_outv[ch] : fp_opnd_zero(c, false);
+      f->exit_outv[ch] = q.kind == FP_PRED_ALWAYS ? c->outv[ch] :
+                         fp_val(c, FP_ALU_OP_CSEL, q.v, c->outv[ch], old);
+      f->exit_outv_written[ch] = true;
+   }
+}
+
+/* BRK or CONT: the pixels running it leave the loop (iteration) */
+static void
+fp_leave_loop(struct fp_compiler *c, bool brk)
+{
+   int l = c->flow_depth - 1;
+   while (l >= 0 && !c->flow[l].loop)
+      l--;
+   if (l < 0) {
+      fp_fail(c, "BRK/CONT outside a loop");
+      return;
+   }
+
+   /* the pixels running it: in the IFs it is in, inside the loop */
+   struct fp_pred q = fp_pred_and(c, c->flow[l].iter, fp_pred_from(c, l + 1, false));
+   if (q.kind == FP_PRED_VALUE && brk) {
+      uint64_t users = 0;
+      if (fp_deps(c, q.v, &users) && users) {
+         /* the loop count comes from uniforms: compile for their values */
+         struct grate_fp_info *info = &c->fp->info;
+         u_foreach_bit64(user, users) {
+            bool have = false;
+            for (int i = 0; i < info->num_flow; i++)
+               have |= info->flow_user[i] == user;
+            if (!have && info->num_flow < GRATE_FP_MAX_FLOW)
+               info->flow_user[info->num_flow++] = user;
+         }
+         c->needs_flow = true;
+         c->failed = true;
+         return;
+      }
+   }
+
+   struct fp_pred stay = fp_pred_not(c, q);
+   if (brk) {
+      if (q.kind != FP_PRED_NEVER)
+         fp_keep_exit(c, &c->flow[l], fp_pred_and(c, c->flow[l].alive, q));
+      c->flow[l].alive = fp_pred_and(c, c->flow[l].alive, stay);
+   } else {
+      c->flow[l].iter = fp_pred_and(c, c->flow[l].iter, stay);
+   }
+   fp_update_pred(c);
+}
+
+struct fp_program {
+   struct tgsi_full_instruction *insts;
+   int *match;          /* IF: ELSE or ENDIF, ELSE: ENDIF, BGNLOOP: ENDLOOP */
+   int num;
+};
+
+static void
+fp_run(struct fp_compiler *c, const struct fp_program *p, int start, int end)
+{
+   for (int pc = start; pc < end && !c->failed; pc++) {
+      const struct tgsi_full_instruction *inst = &p->insts[pc];
+
+      switch (inst->Instruction.Opcode) {
+      case TGSI_OPCODE_IF:
+      case TGSI_OPCODE_UIF: {
+         int els = p->match[pc];
+         if (els < 0) {
+            fp_fail(c, "unmatched IF");
+            return;
+         }
+         bool has_else = p->insts[els].Instruction.Opcode == TGSI_OPCODE_ELSE;
+         int endif = has_else ? p->match[els] : els;
+
+         if (c->pred_full.kind != FP_PRED_NEVER) {
+            if (c->flow_depth == FP_MAX_FLOW_DEPTH) {
+               fp_fail(c, "control flow too deep");
+               return;
+            }
+            struct fp_pred cond = fp_pred_cond(c, fp_src(c, &inst->Src[0].Register, 0));
+            int d = c->flow_depth++;
+            c->flow[d].loop = false;
+            c->flow[d].cond = cond;
+            fp_update_pred(c);
+            fp_run(c, p, pc + 1, els);
+            if (has_else) {
+               c->flow[d].cond = fp_pred_not(c, cond);
+               fp_update_pred(c);
+               fp_run(c, p, els + 1, endif);
+            }
+            c->flow_depth--;
+            fp_update_pred(c);
+         }
+         pc = endif;
+         break;
+      }
+
+      case TGSI_OPCODE_BGNLOOP: {
+         int endloop = p->match[pc];
+         if (endloop < 0) {
+            fp_fail(c, "unmatched BGNLOOP");
+            return;
+         }
+
+         if (c->pred_full.kind != FP_PRED_NEVER) {
+            if (c->flow_depth == FP_MAX_FLOW_DEPTH) {
+               fp_fail(c, "control flow too deep");
+               return;
+            }
+            int d = c->flow_depth++;
+            struct fp_flow *f = &c->flow[d];
+            f->loop = true;
+            f->alive = (struct fp_pred) { FP_PRED_ALWAYS };
+            memset(f->exit_written, 0, sizeof(f->exit_written));
+            memset(f->exit_outv_written, 0, sizeof(f->exit_outv_written));
+            for (int n = 0; ; n++) {
+               if (n == FP_MAX_LOOP_ITERATIONS) {
+                  fp_fail(c, "loop runs too long to unroll");
+                  return;
+               }
+               c->flow[d].iter = (struct fp_pred) { FP_PRED_ALWAYS };
+               fp_update_pred(c);
+               fp_run(c, p, pc + 1, endloop);
+               if (c->failed || f->alive.kind == FP_PRED_NEVER)
+                  break;
+            }
+            /* every pixel has left: with the values it had then */
+            memcpy(c->temps, f->exit, sizeof(c->temps));
+            memcpy(c->temp_written, f->exit_written, sizeof(c->temp_written));
+            memcpy(c->outv, f->exit_outv, sizeof(c->outv));
+            memcpy(c->outv_written, f->exit_outv_written, sizeof(c->outv_written));
+            c->flow_depth--;
+            fp_update_pred(c);
+         }
+         pc = endloop;
+         break;
+      }
+
+      case TGSI_OPCODE_BRK:
+      case TGSI_OPCODE_CONT:
+         if (c->pred_full.kind != FP_PRED_NEVER)
+            fp_leave_loop(c, inst->Instruction.Opcode == TGSI_OPCODE_BRK);
+         break;
+
+      default:
+         if (c->pred_full.kind != FP_PRED_NEVER)
+            emit_tgsi_instr(c, inst);
+         break;
+      }
+   }
+}
+
+/* Pair the control flow instructions; false if they are not nested right */
+static bool
+fp_match_flow(struct fp_program *p)
+{
+   int stack[FP_MAX_FLOW_DEPTH * 2], depth = 0;
+   bool flow = false;
+
+   for (int pc = 0; pc < p->num; pc++) {
+      p->match[pc] = -1;
+      switch (p->insts[pc].Instruction.Opcode) {
+      case TGSI_OPCODE_IF:
+      case TGSI_OPCODE_UIF:
+      case TGSI_OPCODE_BGNLOOP:
+         if (depth == ARRAY_SIZE(stack))
+            return false;
+         stack[depth++] = pc;
+         flow = true;
+         break;
+      case TGSI_OPCODE_ELSE:
+         if (!depth)
+            return false;
+         p->match[stack[depth - 1]] = pc;
+         stack[depth - 1] = pc;
+         break;
+      case TGSI_OPCODE_ENDIF:
+      case TGSI_OPCODE_ENDLOOP:
+         if (!depth)
+            return false;
+         p->match[stack[--depth]] = pc;
+         break;
+      case TGSI_OPCODE_BRK:
+      case TGSI_OPCODE_CONT:
+         flow = true;
+         break;
+      }
+   }
+   return !depth && flow;
+}
+
 void
 grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
                  const struct grate_fp_key *key)
 {
+   static const struct grate_fp_key key_none = { .colormask = 0xf };
    struct fp_compiler *c = CALLOC_STRUCT(fp_compiler);
+   struct fp_program prog = { 0 };
+   int max_insts = 0;
 
+   if (!key)
+      key = &key_none;
    c->key = key;
    c->out_pair = 1;
    c->redirect_output = key && (key->blend || (key->colormask & 0xf) != 0xf);
@@ -1464,6 +1919,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    BITSET_ZERO(fp->info.user_mask);
    fp->info.sampler_mask = 0;
    fp->info.num_pre = 0;
+   fp->info.num_flow = 0;
    fp->num_immediates = 0;
 
    c->fp = fp;
@@ -1489,10 +1945,28 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
       case TGSI_TOKEN_TYPE_INSTRUCTION:
          if (tgsi->FullToken.FullInstruction.Instruction.Opcode == TGSI_OPCODE_END)
             break;
-         emit_tgsi_instr(c, &tgsi->FullToken.FullInstruction);
+         if (prog.num == max_insts) {
+            max_insts = MAX2(64, max_insts * 2);
+            prog.insts = REALLOC(prog.insts, prog.num * sizeof(*prog.insts),
+                                 max_insts * sizeof(*prog.insts));
+         }
+         prog.insts[prog.num++] = tgsi->FullToken.FullInstruction;
          break;
       }
    }
+
+   prog.match = MALLOC(MAX2(prog.num, 1) * sizeof(int));
+   if (fp_match_flow(&prog)) {
+      /* colour writes are merged as values too */
+      c->redirect_output = true;
+   }
+   c->pred = c->pred_full = (struct fp_pred) { FP_PRED_ALWAYS };
+   fp_run(c, &prog, 0, prog.num);
+   FREE(prog.match);
+   FREE(prog.insts);
+   /* the generic version of a program compiled per loop count: unused */
+   if (c->needs_flow)
+      fp->info.failed = true;
 
    if (c->redirect_output && !c->failed)
       emit_blend(c);
