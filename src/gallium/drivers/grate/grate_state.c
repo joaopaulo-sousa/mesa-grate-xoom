@@ -343,11 +343,13 @@ grate_cull_face(int cull_face, bool front_ccw)
    case PIPE_FACE_NONE:
       return TGR3D_CULL_NONE;
 
+   /* measured: CULL_NEG drops the counter-clockwise triangles (gratetest
+    * GRATETEST_CULL, facetest.sh) */
    case PIPE_FACE_FRONT:
-      return front_ccw ? TGR3D_CULL_POS : TGR3D_CULL_NEG;
+      return front_ccw ? TGR3D_CULL_NEG : TGR3D_CULL_POS;
 
    case PIPE_FACE_BACK:
-      return front_ccw ? TGR3D_CULL_NEG : TGR3D_CULL_POS;
+      return front_ccw ? TGR3D_CULL_POS : TGR3D_CULL_NEG;
 
    case PIPE_FACE_FRONT_AND_BACK:
       return TGR3D_CULL_BOTH;
