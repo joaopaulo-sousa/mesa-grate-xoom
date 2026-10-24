@@ -41,7 +41,9 @@ static void
 fp_assign_inputs(struct fp_compiler *c)
 {
    memset(c->fetch_exec, -1, sizeof(c->fetch_exec));
+   memset(c->fetch_col, -1, sizeof(c->fetch_col));
    memset(c->exec_input, -1, sizeof(c->exec_input));
+   memset(c->exec_comp, -1, sizeof(c->exec_comp));
 
    /*
     * Texture fetches first, one EXEC each: the coordinate pair is fetched by
@@ -82,9 +84,13 @@ fp_assign_inputs(struct fp_compiler *c)
       int p = c->tex[n].pair, in = c->tex[n].input;
       c->tex[n].exec = e;
       for (int k = 0; k < 2; k++) {
+         int comp = c->tex[n].coord[k].comp;
          c->exec_input[e][2 * p + k] = in;
-         if (c->fetch_exec[in][2 * p + k] < 0)
-            c->fetch_exec[in][2 * p + k] = e;
+         c->exec_comp[e][2 * p + k] = comp;
+         if (c->fetch_exec[in][comp] < 0) {
+            c->fetch_exec[in][comp] = e;
+            c->fetch_col[in][comp] = 2 * p + k;
+         }
          c->exec_input[e][2 * (1 - p) + k] = -2;
       }
       e++;
@@ -106,7 +112,9 @@ fp_assign_inputs(struct fp_compiler *c)
             return;
          }
          c->exec_input[e][o->comp] = o->index;
+         c->exec_comp[e][o->comp] = o->comp;
          c->fetch_exec[o->index][o->comp] = e;
+         c->fetch_col[o->index][o->comp] = o->comp;
       }
    }
 
@@ -142,7 +150,7 @@ static int
 fp_opnd_reg(struct fp_compiler *c, const struct fp_opnd *o)
 {
    if (o->kind == FP_OPND_INPUT)
-      return 4 * c->fetch_exec[o->index][o->comp] + o->comp;
+      return 4 * c->fetch_exec[o->index][o->comp] + c->fetch_col[o->index][o->comp];
    if (o->kind == FP_OPND_DST)
       return 4 * c->dst_exec + 2 * c->dst_pair + fp_output_half(o->comp) / 2;
    assert(o->kind == FP_OPND_TEXEL);
@@ -552,7 +560,8 @@ fp_emit_rows(struct fp_compiler *c)
             if (c->exec_input[e][k] < 0)
                continue;
             mfu->var[k].op = FP_VAR_OP_FP20;
-            mfu->var[k].tram_row = fp_tram_row(c, c->exec_input[e][k], k, k);
+            mfu->var[k].tram_row = fp_tram_row(c, c->exec_input[e][k],
+                                               c->exec_comp[e][k], k);
          }
          if (e == 0)
             fp_mfu_bary_setup(mfu);

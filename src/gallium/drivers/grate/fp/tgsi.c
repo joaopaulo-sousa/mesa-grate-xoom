@@ -648,15 +648,15 @@ fp_val(struct fp_compiler *c, enum fp_alu_op op, struct fp_opnd a,
  * TEX with varying coordinates: one texture fetch per EXEC, the texel
  * channels become fixed10 operands. A colour destination gets copies.
  */
-/* Texture coordinates a multi-row program can fetch with: a varying .xy
- * or .zw, interpolated straight into a register pair */
+/* Texture coordinates a multi-row program can fetch with: two components
+ * of a varying, interpolated straight into a register pair (the TRAM layout
+ * puts any component in any column) */
 static bool
 fp_tex_varying(const struct fp_opnd *s, const struct fp_opnd *t)
 {
    return s->kind == FP_OPND_INPUT && t->kind == FP_OPND_INPUT &&
           s->index == t->index && !s->negate && !s->absolute &&
-          !t->negate && !t->absolute && !(s->comp & 1) &&
-          t->comp == s->comp + 1;
+          !t->negate && !t->absolute;
 }
 
 static void
@@ -676,8 +676,8 @@ emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
       return;
    }
 
-   /* coordinates other than a varying .xy/.zw (a dependent read) need a
-    * sequential program: the ALU computes them in an earlier pass */
+   /* coordinates other than two varying components (a dependent read)
+    * need a sequential program: the ALU computes them in an earlier pass */
    bool varying = fp_tex_varying(&s, &t);
    if (!varying) {
       /* the TEX reads fp20 coordinates from a register pair: anything but
@@ -699,7 +699,8 @@ emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
    c->tex[n].coord[0] = s;
    c->tex[n].coord[1] = t;
    c->tex[n].input = varying ? s.index : -1;
-   c->tex[n].pair = varying ? s.comp / 2 : 0;
+   /* the pair of the components, when they are .xy or .zw */
+   c->tex[n].pair = varying && !(s.comp & 1) && t.comp == s.comp + 1 ? s.comp / 2 : 0;
    c->tex[n].sampler = inst->Src[1].Register.Index;
    c->tex[n].exec = -1;
    c->tex[n].live = false;

@@ -157,9 +157,13 @@ struct fp_compiler {
    uint16_t input_semantic[FP_MAX_INPUTS];
    int tram[FP_TRAM_ROWS][4];
 
-   /* EXEC whose MFU fetches TGSI input i component c, and the reverse */
+   /* EXEC whose MFU fetches TGSI input i component c, into which column
+    * (register of the row; the component's own but for texture coordinates,
+    * which must be a pair), and the reverse */
    int fetch_exec[FP_MAX_INPUTS][4];
+   int fetch_col[FP_MAX_INPUTS][4];
    int exec_input[FP_MAX_EXECS][4];
+   int exec_comp[FP_MAX_EXECS][4];
    int fetch_reg[FP_MAX_INPUTS][4];   /* sequential: register it goes to */
 
    /* blending: colour writes become outv[] values, combined with the
