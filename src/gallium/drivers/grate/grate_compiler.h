@@ -23,6 +23,7 @@ struct grate_vp_shader {
    uint16_t output_semantic[16];
    float immediates[GRATE_VP_MAX_IMMEDIATES][4];
    int num_immediates;
+   int num_instructions;
 };
 
 /* ALU uniform registers 32..63, loaded from TGR3D_ALU_GLOBALS(0..31). The

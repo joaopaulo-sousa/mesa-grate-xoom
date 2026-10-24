@@ -177,7 +177,7 @@ src_negated(struct vp_src_operand src)
    return src;
 }
 
-static void
+static struct vp_instr *
 emit_packed(struct grate_vp_shader *vp, struct vp_vec_instr vec,
             struct vp_scalar_instr scalar)
 {
@@ -186,6 +186,8 @@ emit_packed(struct grate_vp_shader *vp, struct vp_vec_instr vec,
    ret->vec = vec;
    ret->scalar = scalar;
    list_addtail(&ret->link, &vp->instructions);
+   vp->num_instructions++;
+   return ret;
 }
 
 static struct vp_dst_operand
@@ -316,6 +318,118 @@ emit_cmp(struct grate_vp_shader *vp, struct vp_dst_operand dst,
 }
 
 /*
+ * Control flow, by BRA: a jump to an instruction index, taken when the
+ * predicate on condition register 0 passes (vertex-shader-isa.md,
+ * "Branching"). IF sets the condition from its operand and jumps over the
+ * block when it is zero; ELSE, ENDLOOP, BRK and CONT jump unconditionally.
+ * Forward jumps are patched when their target is reached.
+ */
+#define VP_MAX_FLOW 16
+#define VP_MAX_BREAKS 16
+
+struct vp_flow {
+   struct {
+      bool loop;
+      int start;                         /* loop: first instruction */
+      struct vp_instr *jump;             /* if: the jump to else/endif */
+      struct vp_instr *breaks[VP_MAX_BREAKS];
+      int num_breaks;
+   } stack[VP_MAX_FLOW];
+   int depth;
+   int last_target;
+};
+
+static struct vp_instr *
+emit_branch(struct grate_vp_shader *vp, struct vp_flow *flow, int target,
+            unsigned cond_test)
+{
+   struct vp_scalar_instr bra = emit_sNOP();
+   bra.op = VP_SCALAR_OP_BRA;
+   bra.target = target;
+   bra.cond_test = cond_test;
+   bra.cond_swz = VP_SWZ_X;
+   flow->last_target = MAX2(flow->last_target, target);
+   return emit_packed(vp, emit_vNOP(), bra);
+}
+
+static void
+patch_branch(struct grate_vp_shader *vp, struct vp_flow *flow, struct vp_instr *bra)
+{
+   bra->scalar.target = vp->num_instructions;
+   flow->last_target = MAX2(flow->last_target, vp->num_instructions);
+}
+
+static bool
+tgsi_flow_to_vp(struct grate_vp_shader *vp, struct vp_flow *flow,
+                const struct tgsi_full_instruction *inst)
+{
+   unsigned opcode = inst->Instruction.Opcode;
+   int loop = flow->depth - 1;
+
+   while (loop >= 0 && !flow->stack[loop].loop)
+      loop--;
+
+   switch (opcode) {
+   case TGSI_OPCODE_IF:
+   case TGSI_OPCODE_UIF: {
+      struct vp_src_operand c = tgsi_src_to_vp(vp, &inst->Src[0].Register);
+      struct vp_vec_instr set = emit_vec(VP_VEC_OP_MOV, dst_temp(VP_SCRATCH0, 0x1, false),
+                                         c, src_undef(), src_undef());
+      set.cond_set = true;
+      emit_packed(vp, set, emit_sNOP());
+      assert(flow->depth < VP_MAX_FLOW);
+      flow->stack[flow->depth].loop = false;
+      flow->stack[flow->depth].jump = emit_branch(vp, flow, 0, VP_COND_EQ);
+      flow->depth++;
+      return true;
+   }
+
+   case TGSI_OPCODE_ELSE: {
+      assert(flow->depth > 0 && !flow->stack[flow->depth - 1].loop);
+      struct vp_instr *to_endif = emit_branch(vp, flow, 0, 0);
+      patch_branch(vp, flow, flow->stack[flow->depth - 1].jump);
+      flow->stack[flow->depth - 1].jump = to_endif;
+      return true;
+   }
+
+   case TGSI_OPCODE_ENDIF:
+      assert(flow->depth > 0 && !flow->stack[flow->depth - 1].loop);
+      patch_branch(vp, flow, flow->stack[--flow->depth].jump);
+      return true;
+
+   case TGSI_OPCODE_BGNLOOP:
+      assert(flow->depth < VP_MAX_FLOW);
+      flow->stack[flow->depth].loop = true;
+      flow->stack[flow->depth].start = vp->num_instructions;
+      flow->stack[flow->depth].num_breaks = 0;
+      flow->depth++;
+      return true;
+
+   case TGSI_OPCODE_ENDLOOP:
+      assert(flow->depth > 0 && flow->stack[flow->depth - 1].loop);
+      flow->depth--;
+      emit_branch(vp, flow, flow->stack[flow->depth].start, 0);
+      for (int i = 0; i < flow->stack[flow->depth].num_breaks; i++)
+         patch_branch(vp, flow, flow->stack[flow->depth].breaks[i]);
+      return true;
+
+   case TGSI_OPCODE_BRK:
+      assert(loop >= 0 && flow->stack[loop].num_breaks < VP_MAX_BREAKS);
+      flow->stack[loop].breaks[flow->stack[loop].num_breaks++] =
+         emit_branch(vp, flow, 0, 0);
+      return true;
+
+   case TGSI_OPCODE_CONT:
+      assert(loop >= 0);
+      emit_branch(vp, flow, flow->stack[loop].start, 0);
+      return true;
+
+   default:
+      return false;
+   }
+}
+
+/*
  * An instruction fetches one attribute and one constant (immediates are
  * constants too): sources reading another one are moved to a temporary
  * first, keeping their swizzle and modifiers.
@@ -342,9 +456,13 @@ vp_fetch_once(struct grate_vp_shader *vp, struct vp_src_operand *src, int num)
 }
 
 static bool
-tgsi_to_vp(struct grate_vp_shader *vp, const struct tgsi_full_instruction *inst)
+tgsi_to_vp(struct grate_vp_shader *vp, struct vp_flow *flow,
+           const struct tgsi_full_instruction *inst)
 {
    unsigned opcode = inst->Instruction.Opcode;
+   if (tgsi_flow_to_vp(vp, flow, inst))
+      return true;
+
    bool saturate = inst->Instruction.Saturate != 0;
    struct vp_dst_operand dst = tgsi_dst_to_vp(vp, &inst->Dst[0].Register, saturate);
    struct vp_src_operand src[3];
@@ -424,9 +542,12 @@ tgsi_to_vp(struct grate_vp_shader *vp, const struct tgsi_full_instruction *inst)
 void
 grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi)
 {
+   struct vp_flow flow = { .depth = 0, .last_target = -1 };
+
    list_inithead(&vp->instructions);
    vp->output_mask = 0;
    vp->num_immediates = 0;
+   vp->num_instructions = 0;
    memset(vp->output_semantic, 0xff, sizeof(vp->output_semantic));
 
    while (!tgsi_parse_end_of_tokens(tgsi)) {
@@ -453,10 +574,15 @@ grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi)
       }
       case TGSI_TOKEN_TYPE_INSTRUCTION:
          if (tgsi->FullToken.FullInstruction.Instruction.Opcode != TGSI_OPCODE_END) {
-            if (!tgsi_to_vp(vp, &tgsi->FullToken.FullInstruction))
+            if (!tgsi_to_vp(vp, &flow, &tgsi->FullToken.FullInstruction))
                assert(!"unsupported vertex opcode");
          }
          break;
       }
    }
+
+   /* a jump past the last instruction lands on one more, which ends the
+    * program */
+   if (flow.last_target >= vp->num_instructions)
+      emit_packed(vp, emit_vNOP(), emit_sNOP());
 }

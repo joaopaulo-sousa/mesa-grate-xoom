@@ -213,6 +213,22 @@ grate_vp_pack(uint32_t *dst, struct vp_instr *instr, bool end_of_program)
       tmp.rC_absolute = instr->scalar.src.absolute;
    }
 
+   if (instr->scalar.op == VP_SCALAR_OP_BRA) {
+      /* the branch is taken when the predicate passes: all three states
+       * for an unconditional one */
+      unsigned test = instr->scalar.cond_test ? instr->scalar.cond_test :
+                      VP_COND_LT | VP_COND_EQ | VP_COND_GT;
+      enum vp_swz swz = instr->scalar.cond_swz;
+      tmp.condition_check = 1;
+      tmp.predicate_lt = !!(test & VP_COND_LT);
+      tmp.predicate_eq = !!(test & VP_COND_EQ);
+      tmp.predicate_gt = !!(test & VP_COND_GT);
+      tmp.predicate_swizzle = swz << 6 | swz << 4 | swz << 2 | swz;
+      /* IADDR is in the rC swizzle field */
+      assert(instr->scalar.target >= 0 && instr->scalar.target < 256);
+      tmp.rC = instr->scalar.target << 8;
+   }
+
    tmp.end_of_program = end_of_program;
 
    /* copy packed instruction into destination */

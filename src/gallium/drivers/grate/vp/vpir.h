@@ -109,6 +109,11 @@ struct vp_scalar_instr {
    enum vp_scalar_op op;
    struct vp_dst_operand dst;
    struct vp_src_operand src;
+   /* BRA: jump to instruction target when component cond_swz of condition
+    * register 0 is in one of the states cond_test (0: always) */
+   int target;
+   unsigned cond_test;
+   enum vp_swz cond_swz;
 };
 
 struct vp_instr {
