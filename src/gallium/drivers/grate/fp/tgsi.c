@@ -705,13 +705,24 @@ emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
    c->tex[n].exec = -1;
    c->tex[n].live = false;
 
+   /* the sampler view's swizzle: e.g. alpha 1 for BGRX, luminance */
+   unsigned sampler = inst->Src[1].Register.Index;
+   unsigned swizzle = GRATE_SWIZZLE_IDENTITY;
+   if (sampler < GRATE_FP_MAX_SWIZZLED)
+      swizzle ^= c->key->tex_swizzle[sampler];
+
    for (int i = 0; i < 4; i++) {
       if (!(dst->WriteMask & (1 << i)))
          continue;
-      struct fp_opnd texel = { .kind = FP_OPND_TEXEL, .index = n, .comp = i };
+      bool output = fp_color_write(c, dst);
+      unsigned sw = (swizzle >> (3 * i)) & 7;
+      struct fp_opnd texel = { .kind = FP_OPND_TEXEL, .index = n, .comp = sw };
+      if (sw == PIPE_SWIZZLE_0)
+         texel = fp_opnd_zero(c, output);
+      else if (sw == PIPE_SWIZZLE_1)
+         texel = fp_opnd_one(c, output);
       if (!inst->Instruction.Saturate && fp_set_dst_opnd(c, dst, i, texel))
          continue;
-      bool output = fp_color_write(c, dst);
       struct fp_unit *m = fp_new_unit(c);
       m->saturate = inst->Instruction.Saturate != 0;
       fp_unit_op(&m->slots[0], FP_ALU_OP_MAD, texel, fp_opnd_one(c, output),

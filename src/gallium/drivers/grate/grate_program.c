@@ -413,6 +413,14 @@ grate_fs_key(struct grate_context *context)
    memset(&key, 0, sizeof(key));
    key.colormask = 0xf;
 
+   for (unsigned i = 0; i < GRATE_FP_MAX_SWIZZLED; i++) {
+      const struct pipe_sampler_view *view = context->sampler_views[i];
+      if (view)
+         key.tex_swizzle[i] = (view->swizzle_r | view->swizzle_g << 3 |
+                               view->swizzle_b << 6 | view->swizzle_a << 9) ^
+                              GRATE_SWIZZLE_IDENTITY;
+   }
+
    if (!blend)
       return key;
 

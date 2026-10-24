@@ -219,6 +219,9 @@ grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi,
  * values spec_bits of grate_fp_info.spec. Zeroed + colormask 0xf = none.
  * No implicit padding: keys are compared with memcmp.
  */
+#define GRATE_FP_MAX_SWIZZLED 8
+#define GRATE_SWIZZLE_IDENTITY (0 | 1 << 3 | 2 << 6 | 3 << 9)
+
 struct grate_fp_key {
    uint32_t spec_bits;
    float flow[GRATE_FP_MAX_FLOW];            /* values of flow_user[] */
@@ -231,6 +234,9 @@ struct grate_fp_key {
    uint8_t num_flow;
    uint8_t move;                             /* grate_fp_info.moved */
    uint8_t pad[1];
+   /* sampler view swizzles (PIPE_SWIZZLE_* r | g << 3 | b << 6 | a << 9),
+    * xor GRATE_SWIZZLE_IDENTITY: 0 is none */
+   uint16_t tex_swizzle[GRATE_FP_MAX_SWIZZLED];
 };
 
 void
