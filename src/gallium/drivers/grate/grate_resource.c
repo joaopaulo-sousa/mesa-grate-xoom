@@ -641,7 +641,7 @@ pack_color(enum pipe_format format, const float *rgba)
 
 static void
 fill(struct grate_stream *stream, uint32_t **ptrp,
-           struct grate_resource *dst,
+           struct grate_resource *dst, unsigned level,
            uint32_t fill_value, int blocksize,
            unsigned dstx, unsigned dsty,
            unsigned width, unsigned height)
@@ -684,8 +684,10 @@ fill(struct grate_stream *stream, uint32_t **ptrp,
    GRATE_PUSHBUF_WORD(ptr, 0x000000cc);      /* 0x020 - ropfade */
 
    GRATE_PUSHBUF_WORD(ptr, host1x_opcode_mask(0x2b, 0x09));
-   grate_stream_push_reloc(stream, &ptr, dst->bo, 0, true); /* 0x02b - dstba */
-   GRATE_PUSHBUF_WORD(ptr, dst->pitch);      /* 0x02e - dstst */
+   /* a mip level: where grate_screen_resource_create put it */
+   level = MIN2(level, GRATE_MAX_MIP_LEVELS - 1);
+   grate_stream_push_reloc(stream, &ptr, dst->bo, dst->level_offset[level], true); /* 0x02b - dstba */
+   GRATE_PUSHBUF_WORD(ptr, level ? dst->level_pitch[level] : dst->pitch); /* 0x02e - dstst */
 
    GRATE_PUSHBUF_WORD(ptr, host1x_opcode_nonincr(0x35, 1));
 
@@ -714,12 +716,12 @@ fill_zs(struct grate_stream *stream, uint32_t **ptrp, struct pipe_surface *dst,
 
    if (res->stencil) {
       if (clear_depth)
-         fill(stream, ptrp, res, util_pack_z(PIPE_FORMAT_Z16_UNORM, depth), 2,
+         fill(stream, ptrp, res, dst->level, util_pack_z(PIPE_FORMAT_Z16_UNORM, depth), 2,
               x, y, width, height);
       if (clear_stencil)
-         fill(stream, ptrp, res->stencil, stencil, 1, x, y, width, height);
+         fill(stream, ptrp, res->stencil, dst->level, stencil, 1, x, y, width, height);
    } else if (clear_depth || clear_stencil) {
-      fill(stream, ptrp, res, util_pack_z_stencil(dst->format, depth, stencil),
+      fill(stream, ptrp, res, dst->level, util_pack_z_stencil(dst->format, depth, stencil),
            util_format_get_blocksize(dst->format), x, y, width, height);
    }
 }
@@ -764,8 +766,8 @@ grate_clear(struct pipe_context *pcontext, unsigned int buffers,
       int i;
       for (i = 0; i < fb->nr_cbufs; ++i) {
          struct pipe_surface *dst = &fb->cbufs[i];
-         fill(stream, &ptr, 
-                  grate_resource(dst->texture),
+         fill(stream, &ptr,
+                  grate_resource(dst->texture), dst->level,
                   pack_color(dst->format, color->f),
                   util_format_get_blocksize(dst->format),
                   x, y, w, h);
@@ -802,7 +804,7 @@ grate_clear_render_target(struct pipe_context *pipe,
    }
    
    fill(&context->gr2d->stream, &ptr,
-        grate_resource(dst->texture),
+        grate_resource(dst->texture), dst->level,
         pack_color(dst->format, color->f),
         util_format_get_blocksize(dst->format),
         dstx, dsty, width, height);

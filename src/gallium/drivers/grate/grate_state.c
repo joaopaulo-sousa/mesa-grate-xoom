@@ -39,16 +39,21 @@ grate_set_constant_buffer(struct pipe_context *pcontext, enum mesa_shader_stage 
 
 static void
 grate_set_render_target(struct grate_context *context, unsigned slot,
-                        const struct grate_resource *res)
+                        const struct grate_resource *res, unsigned level)
 {
    uint32_t rt_params;
 
+   /* a mip level: where grate_screen_resource_create put it */
+   level = MIN2(level, GRATE_MAX_MIP_LEVELS - 1);
+   uint32_t pitch = level ? res->level_pitch[level] : res->pitch;
+
    rt_params  = TGR3D_GLOBAL_SURFDESC_SURF_FORMAT(res->format);
-   rt_params |= TGR3D_GLOBAL_SURFDESC_ARRAY_STRIDE(res->pitch);
+   rt_params |= TGR3D_GLOBAL_SURFDESC_ARRAY_STRIDE(pitch);
    rt_params |= TGR3D_GLOBAL_SURFDESC_STRUCTURE(res->tiled);
 
    context->framebuffer.rt_params[slot] = rt_params;
    context->framebuffer.rt_bos[slot] = res->bo;
+   context->framebuffer.rt_offsets[slot] = res->level_offset[level];
    context->framebuffer.rt_present |= 1 << slot;
 }
 
@@ -65,17 +70,20 @@ grate_set_framebuffer_state(struct pipe_context *pcontext,
    assert(framebuffer->nr_cbufs <= 1);
    if (framebuffer->nr_cbufs && framebuffer->cbufs[0].texture)
       grate_set_render_target(context, GRATE_RT_COLOR,
-                              grate_resource(framebuffer->cbufs[0].texture));
+                              grate_resource(framebuffer->cbufs[0].texture),
+                              framebuffer->cbufs[0].level);
 
    if (framebuffer->zsbuf.texture) {
       struct grate_resource *zs = grate_resource(framebuffer->zsbuf.texture);
       const struct util_format_description *desc =
          util_format_description(framebuffer->zsbuf.format);
 
+      unsigned level = framebuffer->zsbuf.level;
       if (util_format_has_depth(desc))
-         grate_set_render_target(context, GRATE_RT_DEPTH, zs);
+         grate_set_render_target(context, GRATE_RT_DEPTH, zs, level);
       if (util_format_has_stencil(desc))
-         grate_set_render_target(context, GRATE_RT_STENCIL, zs->stencil ? zs->stencil : zs);
+         grate_set_render_target(context, GRATE_RT_STENCIL, zs->stencil ? zs->stencil : zs,
+                                 level);
    }
 
    /* prepare the scissor-registers for the non-scissor case */
@@ -670,7 +678,7 @@ emit_render_targets(struct grate_context *context, uint32_t **ptrp)
       GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_GLOBAL_SURFDESC(i), 1));
       GRATE_PUSHBUF_WORD(*ptrp, fb->rt_params[i]);
       GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_GLOBAL_SURFADDR(i), 1));
-      grate_stream_push_reloc(stream, ptrp, fb->rt_bos[i], 0, true);
+      grate_stream_push_reloc(stream, ptrp, fb->rt_bos[i], fb->rt_offsets[i], true);
    }
 
    GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_DW_ST_ENABLE, 1));

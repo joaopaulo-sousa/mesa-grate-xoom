@@ -17,6 +17,7 @@ struct grate_framebuffer_state {
    uint32_t rt_present;   /* surfaces bound, by GRATE_RT_* slot */
    struct grate_bo *rt_bos[REG_TGR3D_GLOBAL_SURFDESC_LENGTH];
    uint32_t rt_params[REG_TGR3D_GLOBAL_SURFDESC_LENGTH];
+   uint32_t rt_offsets[REG_TGR3D_GLOBAL_SURFDESC_LENGTH];   /* of the level */
 };
 
 struct grate_channel {
