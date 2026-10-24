@@ -837,6 +837,14 @@ void st_init_extensions(struct pipe_screen *screen,
 
    /* Required: sampler support */
    static const struct st_extension_format_mapping texture_mapping[] = {
+      { { o(OES_depth_texture) },
+        { PIPE_FORMAT_Z16_UNORM,
+          PIPE_FORMAT_Z24X8_UNORM,
+          PIPE_FORMAT_X8Z24_UNORM,
+          PIPE_FORMAT_Z32_UNORM,
+          PIPE_FORMAT_Z32_FLOAT },
+        GL_TRUE }, /* at least one format must be supported */
+
       { { o(OES_texture_float) },
         { PIPE_FORMAT_R32G32B32A32_FLOAT } },
 

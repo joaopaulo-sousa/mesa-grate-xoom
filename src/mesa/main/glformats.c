@@ -2966,9 +2966,6 @@ _mesa_gles_check_internalformat(struct gl_context *ctx,
    case GL_RGB:
    case GL_RGBA:
 
-   /* GL_OES_depth_texture */
-   case GL_DEPTH_COMPONENT:
-
    /* GL_EXT_texture_format_BGRA8888 */
    case GL_BGRA:
    case GL_BGRA8_EXT:
@@ -2979,16 +2976,22 @@ _mesa_gles_check_internalformat(struct gl_context *ctx,
    case GL_RGBA4:
    case GL_RGB5_A1:
    case GL_RGBA8:
-   case GL_DEPTH_COMPONENT16:
-   case GL_DEPTH_COMPONENT24:
-   case GL_DEPTH_COMPONENT32:
-   case GL_DEPTH24_STENCIL8:
    case GL_RGB10:
    case GL_RGB10_A2:
    case GL_ALPHA8:
    case GL_LUMINANCE8:
    case GL_LUMINANCE8_ALPHA8:
    case GL_LUMINANCE4_ALPHA4:
+      return GL_NO_ERROR;
+
+   /* GL_OES_depth_texture, sized by GL_OES_required_internalformat */
+   case GL_DEPTH_COMPONENT:
+   case GL_DEPTH_COMPONENT16:
+   case GL_DEPTH_COMPONENT24:
+   case GL_DEPTH_COMPONENT32:
+   case GL_DEPTH24_STENCIL8:
+      if (!_mesa_has_OES_depth_texture(ctx) && !_mesa_is_gles3(ctx))
+         return GL_INVALID_VALUE;
       return GL_NO_ERROR;
 
    case GL_R8:

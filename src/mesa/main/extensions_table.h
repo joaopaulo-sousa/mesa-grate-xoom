@@ -460,7 +460,7 @@ EXT(OES_compressed_ETC1_RGB8_texture        , OES_compressed_ETC1_RGB8_texture  
 EXT(OES_compressed_paletted_texture         , dummy_true                             ,  x ,  x , ES1,  x , 2003)
 EXT(OES_copy_image                          , OES_copy_image                         ,  x ,  x ,  x ,  30, 2014)
 EXT(OES_depth24                             , dummy_true                             ,  x ,  x , ES1, ES2, 2005)
-EXT(OES_depth_texture                       , dummy_true                             ,  x ,  x ,  x , ES2, 2006)
+EXT(OES_depth_texture                       , OES_depth_texture                      ,  x ,  x ,  x , ES2, 2006)
 EXT(OES_depth_texture_cube_map              , OES_depth_texture_cube_map             ,  x ,  x ,  x , ES2, 2012)
 EXT(OES_draw_buffers_indexed                , ARB_draw_buffers_blend                 ,  x ,  x ,  x ,  30, 2014)
 EXT(OES_draw_elements_base_vertex           , ARB_draw_elements_base_vertex          ,  x ,  x ,  x , ES2, 2014)
