@@ -479,6 +479,7 @@ fp_resolve(struct fp_compiler *c, const struct fp_opnd *o, int packet)
 
    ret.negate = o->negate;
    ret.absolute_value = o->absolute;
+   ret.scale_by_two = o->twice;
    return ret;
 }
 
@@ -508,6 +509,7 @@ fp_emit_unit(struct fp_compiler *c, struct fp_unit *u,
          continue;
       }
 
+      a->scale = u->scale;
       a->dst.saturate = u->saturate;
       if (u->output_chan >= 0) {
          int o = fp_output_half(u->output_chan);

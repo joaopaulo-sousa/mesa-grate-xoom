@@ -58,6 +58,7 @@ struct fp_opnd {
    int comp;       /* input component, texel channel */
    bool negate;
    bool absolute;
+   bool twice;     /* operand modifier: scaled by two (fp_fold_scales) */
 };
 
 struct fp_unit_slot {
@@ -74,6 +75,7 @@ struct fp_unit {
    bool sfu_copy;          /* MOV giving an SFU operand a register of its own */
    bool kill;              /* writes the kill register: no value, always live */
    bool saturate;
+   enum fp_scale scale;    /* result scaled by 2, 4 or 1/2 before saturating */
    int output_chan;        /* colour channel written, or -1: defines a value */
    bool forward;           /* the next packet may read the result as aluN */
    bool live;
@@ -189,6 +191,7 @@ uint32_t fp_tex_word(const struct fp_compiler *c, int n, int coord_pair);
 /* fx10.c */
 void fp_mark_fx10(struct fp_compiler *c);
 void fp_reassociate(struct fp_compiler *c);
+void fp_fold_scales(struct fp_compiler *c);
 bool fp_opnd_is_const(struct fp_compiler *c, const struct fp_opnd *o, float v);
 
 /* preshader.c */

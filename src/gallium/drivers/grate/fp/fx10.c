@@ -122,6 +122,8 @@ fx10_opnd_range(struct fp_compiler *c, const struct fx10_range *value,
    default:
       return fx10_unknown;
    }
+   if (o->twice)
+      r = (struct fx10_range) { 2.0f * r.lo, 2.0f * r.hi };
    if (o->absolute)
       r = (struct fx10_range) { r.lo >= 0.0f ? r.lo : r.hi <= 0.0f ? -r.hi : 0.0f,
                                 MAX2(fabsf(r.lo), fabsf(r.hi)) };
@@ -168,6 +170,8 @@ fx10_unit_range(struct fp_compiler *c, const struct fx10_range *value,
    default:
       return fx10_unknown;
    }
+   static const float scale[] = { 1.0f, 2.0f, 4.0f, 0.5f };
+   r = (struct fx10_range) { r.lo * scale[u->scale], r.hi * scale[u->scale] };
    if (u->saturate)
       r = (struct fx10_range) { CLAMP(r.lo, 0.0f, 1.0f), CLAMP(r.hi, 0.0f, 1.0f) };
    if (isnan(r.lo) || isnan(r.hi))

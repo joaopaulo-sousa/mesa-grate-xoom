@@ -1103,7 +1103,7 @@ static bool
 fp_opnd_equal(const struct fp_opnd *a, const struct fp_opnd *b)
 {
    return a->kind == b->kind && a->index == b->index && a->comp == b->comp &&
-          a->negate == b->negate && a->absolute == b->absolute;
+          a->negate == b->negate && a->absolute == b->absolute && a->twice == b->twice;
 }
 
 /*
@@ -1465,6 +1465,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    fp_preshade(c);
    fp_specialize(c);
    fp_fuse_mad(c);
+   fp_fold_scales(c);
    fp_dead_code(c);
    fp_fold_sfu_copies(c);
    fp_relayout(c);

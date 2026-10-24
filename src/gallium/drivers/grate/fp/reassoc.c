@@ -16,6 +16,7 @@
  *
  * Runs before fp_preshade, which takes the uniform-only units out.
  */
+#include <math.h>
 #include <string.h>
 
 #include "fp_compiler.h"
@@ -139,6 +140,49 @@ fp_negated(struct fp_opnd o, bool negate)
    return o;
 }
 
+/* The value of a constant operand: 0, 1 or an immediate */
+static bool
+fp_opnd_known(struct fp_compiler *c, const struct fp_opnd *o, float *v)
+{
+   if (o->kind == FP_OPND_ZERO)
+      *v = 0.0f;
+   else if (o->kind == FP_OPND_ONE)
+      *v = 1.0f;
+   else if (o->kind == FP_OPND_UNIFORM && BITSET_TEST(c->fp->info.imm_mask, o->index))
+      *v = fp20_to_float(c->fp->info.consts[o->index]);
+   else
+      return false;
+   if (o->twice)
+      *v *= 2.0f;
+   if (o->absolute)
+      *v = fabsf(*v);
+   if (o->negate)
+      *v = -*v;
+   return true;
+}
+
+/*
+ * a * b + cc: an immediate when all three are constants, else a new unit
+ * put at *pos, before the unit being rewritten (*pos moves on with it)
+ */
+static struct fp_opnd
+fp_mad_value(struct fp_compiler *c, struct fp_opnd a, struct fp_opnd b,
+             struct fp_opnd cc, int *pos)
+{
+   float va, vb, vc;
+
+   if (fp_opnd_known(c, &a, &va) && fp_opnd_known(c, &b, &vb) &&
+       fp_opnd_known(c, &cc, &vc))
+      return fp_opnd_const(c, va * vb + vc);
+
+   struct fp_unit *n = fp_new_unit(c);
+   if (c->failed)
+      return fp_opnd_zero(c, false);
+   fp_unit_op(&n->slots[0], FP_ALU_OP_MAD, a, b, cc);
+   fp_move_last_unit(c, *pos);
+   return fp_opnd_value(c, &c->units[(*pos)++]);
+}
+
 /*
  * (x * y + k) * w + z  -> x * (y * w) + (k * w + z)
  * (a * b + x) * w + z  -> x * w + (a * b * w + z)
@@ -167,41 +211,20 @@ fp_fold_affine(struct fp_compiler *c, struct fp_reassoc *r, int i)
       /* the sign of the folded operand goes with w */
       w = fp_negated(w, s->src[at].negate);
       struct fp_opnd x = vs->src[pixel], z = s->src[2];
-      struct fp_opnd p0, p1, k;      /* x * (p0 * p1) + (k * w + z) */
-      if (pixel == 2) {
-         p0 = w;
-         p1 = fp_opnd_one(c, false);
-         k = vs->src[0];   /* k * w is a * b * w: a, then b * w below */
-      } else {
-         p0 = vs->src[1 - pixel];
-         p1 = w;
-         k = vs->src[2];
-      }
+      struct fp_opnd a0 = vs->src[0], a1 = vs->src[1], a2 = vs->src[2];
+      struct fp_opnd zero = fp_opnd_zero(c, false), factor, term;
+      int pos = i;   /* the rewritten unit, after the units put before it */
 
-      /* new units before this one, w may come after the inner unit, which
-       * is left unread: the factor of x, and the constant term */
-      struct fp_unit *n = fp_new_unit(c);
-      if (c->failed)
-         return false;
-      fp_unit_op(&n->slots[0], FP_ALU_OP_MAD, p0, p1, fp_opnd_zero(c, false));
-      fp_move_last_unit(c, i);
-      int at_unit = i + 1;
       if (pixel == 2) {
-         /* b * w first, then a * (b * w) + z */
-         n = fp_new_unit(c);
-         if (c->failed)
-            return false;
-         fp_unit_op(&n->slots[0], FP_ALU_OP_MAD, vs->src[1], w, fp_opnd_zero(c, false));
-         fp_move_last_unit(c, at_unit++);
-         w = fp_opnd_value(c, &c->units[at_unit - 1]);
+         /* (a * b + x) * w + z = x * w + (a * (b * w) + z) */
+         factor = w;
+         term = fp_mad_value(c, a0, fp_mad_value(c, a1, w, zero, &pos), z, &pos);
+      } else {
+         /* (x * y + k) * w + z = x * (y * w) + (k * w + z) */
+         factor = fp_mad_value(c, pixel ? a0 : a1, w, zero, &pos);
+         term = fp_mad_value(c, a2, w, z, &pos);
       }
-      n = fp_new_unit(c);
-      if (c->failed)
-         return false;
-      fp_unit_op(&n->slots[0], FP_ALU_OP_MAD, k, w, z);
-      fp_move_last_unit(c, at_unit);
-      fp_unit_op(&c->units[at_unit + 1].slots[0], FP_ALU_OP_MAD, x,
-                 fp_opnd_value(c, &c->units[i]), fp_opnd_value(c, &c->units[at_unit]));
+      fp_unit_op(&c->units[pos].slots[0], FP_ALU_OP_MAD, x, factor, term);
       return true;
    }
    return false;
@@ -228,20 +251,15 @@ fp_regroup_product(struct fp_compiler *c, struct fp_reassoc *r, int i)
       if (dd <= fp_opnd_depth(r, &f[1 - deepest]) || dd <= fp_opnd_depth(r, &f[2]))
          continue;
 
-      /* the pair goes into a new unit before this one (the outer factor
-       * may come after the inner unit) */
-      struct fp_opnd p0 = f[deepest == 0 ? 1 : 0], p1 = f[2];
-      struct fp_unit *n = fp_new_unit(c);
-      if (c->failed)
-         return false;
-      fp_unit_op(&n->slots[0], FP_ALU_OP_MAD, fp_negated(p0, negate), p1,
-                 fp_opnd_zero(c, false));
-      fp_move_last_unit(c, i);
+      /* the pair goes before this one (the outer factor may come after
+       * the inner unit) */
       struct fp_opnd d = f[deepest];
+      int pos = i;
+      struct fp_opnd pair = fp_mad_value(c, fp_negated(f[deepest == 0 ? 1 : 0], negate), f[2],
+                                         fp_opnd_zero(c, false), &pos);
       if (d.kind == FP_OPND_VALUE && d.index >= i)
-         d.index++;
-      fp_unit_op(&c->units[i + 1].slots[0], FP_ALU_OP_MAD,
-                 fp_opnd_value(c, &c->units[i]), d, fp_opnd_zero(c, false));
+         d.index += pos - i;
+      fp_unit_op(&c->units[pos].slots[0], FP_ALU_OP_MAD, pair, d, fp_opnd_zero(c, false));
       return true;
    }
    return false;
@@ -260,6 +278,126 @@ fp_reassociate(struct fp_compiler *c)
          if (!fp_plain_mad(&r, c, i) || r.uniform[i])
             continue;
          progress = fp_fold_affine(c, &r, i) || fp_regroup_product(c, &r, i);
+      }
+   }
+}
+
+/*
+ * Scaling by 2, 4 or 1/2 is free on Tegra20: an ALU instruction scales its
+ * result (fragment-shader-isa.md, "scale result") and an operand can be
+ * read doubled ("scale by two"). After the preshader, a multiply x * k by
+ * such a constant becomes
+ * - the scaled instruction computing x, when nothing else reads x: one
+ *   operation fewer on the path;
+ * - for k = 2, x read doubled by every reader of the product, when those
+ *   are all ALU operations: e.g. a texel * 2 - 1 is one MAD.
+ */
+static bool
+fp_scale_const(struct fp_compiler *c, const struct fp_opnd *o, enum fp_scale *scale)
+{
+   if (fp_opnd_is_const(c, o, 2.0f))
+      *scale = FP_SCALE_MUL2;
+   else if (fp_opnd_is_const(c, o, 4.0f))
+      *scale = FP_SCALE_MUL4;
+   else if (fp_opnd_is_const(c, o, 0.5f))
+      *scale = FP_SCALE_DIV2;
+   else
+      return false;
+   return true;
+}
+
+/* The product's result scale moved into the unit computing x */
+static bool
+fp_scale_result(struct fp_compiler *c, struct fp_reassoc *r, int i,
+                const struct fp_opnd *x, enum fp_scale scale)
+{
+   struct fp_unit *u = &c->units[i];
+
+   if (x->kind != FP_OPND_VALUE || x->absolute || r->readers[x->index] != 1)
+      return false;
+   struct fp_unit *v = &c->units[x->index];
+   struct fp_unit_slot s = v->slots[0];
+   if (!r->alive[x->index] || !fp_unit_has_value(v) || v->num_slots != 1 || v->sfu ||
+       v->sfu_copy || v->saturate || v->scale != FP_SCALE_NONE ||
+       s.accumulate_this || s.accumulate_other)
+      return false;
+   if (x->negate) {
+      /* -(a * b + c) = -a * b - c; MIN, MAX and CSEL do not turn */
+      if (s.op != FP_ALU_OP_MAD)
+         return false;
+      s.src[0].negate = !s.src[0].negate;
+      s.src[2].negate = !s.src[2].negate;
+   }
+   u->slots[0] = s;
+   u->scale = scale;
+   return true;
+}
+
+/* x read doubled by the readers of the product i */
+static bool
+fp_scale_operand(struct fp_compiler *c, struct fp_reassoc *r, int i, const struct fp_opnd *x)
+{
+   const struct fp_unit *u = &c->units[i];
+
+   if (!fp_unit_has_value(u) || u->saturate || x->absolute || x->twice ||
+       r->readers[i] == 0)
+      return false;
+   for (int n = 0; n < c->num_tex; n++)
+      for (int k = 0; k < 2; k++)
+         if (c->tex[n].coord[k].kind == FP_OPND_VALUE && c->tex[n].coord[k].index == i)
+            return false;
+   for (int n = i + 1; n < c->num_units; n++) {
+      const struct fp_unit *v = &c->units[n];
+      if (!r->alive[n])
+         continue;
+      fp_unit_foreach_src(v, k, j)
+         if (v->slots[k].src[j].kind == FP_OPND_VALUE && v->slots[k].src[j].index == i &&
+             (v->sfu || v->sfu_copy || v->slots[k].src[j].twice))
+            return false;
+   }
+   for (int n = i + 1; n < c->num_units; n++) {
+      struct fp_unit *v = &c->units[n];
+      if (!r->alive[n])
+         continue;
+      fp_unit_foreach_src(v, k, j) {
+         struct fp_opnd *o = &v->slots[k].src[j];
+         if (o->kind != FP_OPND_VALUE || o->index != i)
+            continue;
+         /* |2 * +-x| = |2 * x|, - (2 * -x) = 2 * x */
+         bool negate = o->negate ^ (o->absolute ? false : x->negate);
+         bool absolute = o->absolute;
+         *o = *x;
+         o->twice = true;
+         o->negate = negate;
+         o->absolute = absolute;
+      }
+   }
+   return true;
+}
+
+void
+fp_fold_scales(struct fp_compiler *c)
+{
+   struct fp_reassoc r;
+   bool progress = true;
+
+   while (progress && !c->failed) {
+      progress = false;
+      fp_reassoc_scan(c, &r);
+      for (int i = 0; i < c->num_units && !progress; i++) {
+         struct fp_unit *u = &c->units[i];
+         struct fp_unit_slot *s = &u->slots[0];
+         enum fp_scale scale;
+         if (!fp_plain_mad(&r, c, i) || u->kill || u->scale != FP_SCALE_NONE ||
+             !fp_opnd_is_const(c, &s->src[2], 0.0f))
+            continue;
+         for (int a = 0; a < 2 && !progress; a++) {
+            if (!fp_scale_const(c, &s->src[1 - a], &scale))
+               continue;
+            struct fp_opnd x = s->src[a];
+            progress = fp_scale_result(c, &r, i, &x, scale) ||
+                       (scale == FP_SCALE_MUL2 && fp_scale_operand(c, &r, i, &x));
+         }
       }
    }
 }
