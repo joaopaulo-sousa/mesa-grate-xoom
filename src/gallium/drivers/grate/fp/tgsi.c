@@ -857,6 +857,50 @@ fp_opnd_is_const(struct fp_compiler *c, const struct fp_opnd *o, float v)
           c->fp->info.consts[o->index] == grate_float_to_fp20(v);
 }
 
+/*
+ * Plain copies (x * 1 + 0, as specialization leaves of a product by a
+ * known 1) are read as what they copy: a copied texel channel otherwise
+ * takes an fp20 register of its own instead of its fixed10 half. SFU units
+ * keep theirs, they work in place on a register.
+ */
+static void
+fp_fold_copies(struct fp_compiler *c)
+{
+   for (int i = 0; i < c->num_units; i++) {
+      struct fp_unit *u = &c->units[i];
+      if (u->sfu)
+         continue;
+      fp_unit_foreach_src(u, k, j) {
+         struct fp_opnd *o = &u->slots[k].src[j];
+         if (o->kind != FP_OPND_VALUE || o->twice || o->minus_one)
+            continue;
+         struct fp_unit *m = &c->units[o->index];
+         struct fp_unit_slot *ms = &m->slots[0];
+         if (!fp_unit_has_value(m) || m->num_slots != 1 || m->sfu || m->sfu_copy ||
+             m->saturate || m->scale || m->condition || m->blend_inv ||
+             ms->op != FP_ALU_OP_MAD || ms->accumulate_this ||
+             ms->accumulate_other || ms->square_c ||
+             !fp_opnd_is_const(c, &ms->src[2], 0.0f))
+            continue;
+         int x = fp_opnd_is_const(c, &ms->src[1], 1.0f) ? 0 :
+                 fp_opnd_is_const(c, &ms->src[0], 1.0f) ? 1 : -1;
+         if (x < 0 || ms->src[x].twice || ms->src[x].minus_one)
+            continue;
+         struct fp_opnd y = ms->src[x];
+         if (ms->src[1 - x].negate)
+            y.negate = !y.negate;
+         /* abs(-y) = abs(y); -(y) composes */
+         if (o->absolute) {
+            y.absolute = true;
+            y.negate = o->negate;
+         } else {
+            y.negate ^= o->negate;
+         }
+         *o = y;
+      }
+   }
+}
+
 /* An SFU operand copy is unnecessary when it copies a plain value nothing
  * else reads: the SFU can then work on that value's register directly */
 static void
@@ -1994,6 +2038,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    fp_cse(c);
    fp_preshade(c);
    fp_specialize(c);
+   fp_fold_copies(c);
    fp_fuse_mad(c);
    fp_fold_scales(c);
    fp_fold_conditions(c);
