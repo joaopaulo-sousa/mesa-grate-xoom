@@ -959,6 +959,9 @@ seq_resolve(struct fp_compiler *c, const struct fp_opnd *o, int e, int p)
    case FP_OPND_UNIFORM:
       ret = fp_alu_src_uniform(o->index);
       break;
+   case FP_OPND_SPECIAL:
+      ret = fp_alu_src_special(o->index);
+      break;
    case FP_OPND_INPUT:
       ret = fp_alu_src_row(c->fetch_reg[o->index][o->comp]);
       break;

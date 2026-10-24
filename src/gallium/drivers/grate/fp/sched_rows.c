@@ -453,6 +453,9 @@ fp_resolve(struct fp_compiler *c, const struct fp_opnd *o, int packet)
    case FP_OPND_UNIFORM:
       ret = fp_alu_src_uniform(o->index);
       break;
+   case FP_OPND_SPECIAL:
+      ret = fp_alu_src_special(o->index);
+      break;
    case FP_OPND_INPUT:
       ret = fp_alu_src_row(fp_opnd_reg(c, o));
       break;

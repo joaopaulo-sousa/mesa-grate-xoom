@@ -121,6 +121,17 @@ fp_alu_src_zero(void)
    return src;
 }
 
+/* A register the hardware fills (FP_REG_*) */
+struct fp_alu_src_operand
+fp_alu_src_special(int index)
+{
+   struct fp_alu_src_operand src = {
+      .index = index,
+      .datatype = index == FP_REG_FACE ? FP_DATATYPE_FIXED10 : FP_DATATYPE_FP20,
+   };
+   return src;
+}
+
 struct fp_alu_src_operand
 fp_alu_src_one(void)
 {
@@ -230,6 +241,50 @@ fp_opnd_const(struct fp_compiler *c, float value)
    return fp_opnd_uniform(fp_const_slot(c, value));
 }
 
+/*
+ * The fragment position and the polygon face are registers, not varyings
+ * (grate fragment-shader-isa.md). Measured: the position registers hold
+ * 8192 plus the pixel's column and row from the top, integers; with the
+ * pixel centre added that is the upper left, half integer convention the
+ * screen asks for (the frontend flips y where needed). The face is 1.0 in
+ * the low fixed10 half for front faces (SU_PARAM FRONT_FACE), 0.0 for back
+ * ones; TGSI wants it positive and negative.
+ */
+static bool
+fp_special_input(struct fp_compiler *c, int input, int comp, struct fp_opnd *o)
+{
+   unsigned name = c->input_semantic[input] >> 8;
+   struct fp_unit *u;
+
+   if (name == TGSI_SEMANTIC_FACE) {
+      struct fp_opnd face = { .kind = FP_OPND_SPECIAL, .index = FP_REG_FACE };
+      u = fp_new_unit(c);
+      fp_unit_op(&u->slots[0], FP_ALU_OP_MAD, face, fp_opnd_const(c, 2.0f),
+                 fp_opnd_const(c, -1.0f));
+      *o = fp_opnd_value(c, u);
+      return true;
+   }
+   if (name != TGSI_SEMANTIC_POSITION)
+      return false;
+   if (comp > 1) {
+      /* z and w need the linker's help (fragment-shader-isa.md), not done */
+      *o = comp == 3 ? fp_opnd_one(c, false) : fp_opnd_zero(c, false);
+      return true;
+   }
+
+   struct fp_opnd reg = { .kind = FP_OPND_SPECIAL,
+                          .index = comp ? FP_REG_POSITION_Y : FP_REG_POSITION_X };
+   /* in two steps: 8191.5 is no fp20 */
+   u = fp_new_unit(c);
+   fp_unit_op(&u->slots[0], FP_ALU_OP_MAD, reg, fp_opnd_one(c, false),
+              fp_opnd_const(c, -8192.0f));
+   struct fp_unit *centre = fp_new_unit(c);
+   fp_unit_op(&centre->slots[0], FP_ALU_OP_MAD, fp_opnd_value(c, u), fp_opnd_one(c, false),
+              fp_opnd_const(c, 0.5f));
+   *o = fp_opnd_value(c, centre);
+   return true;
+}
+
 static struct fp_opnd
 fp_src(struct fp_compiler *c, const struct tgsi_src_register *src, int chan)
 {
@@ -246,6 +301,8 @@ fp_src(struct fp_compiler *c, const struct tgsi_src_register *src, int chan)
          fp_fail(c, "too many inputs");
          break;
       }
+      if (fp_special_input(c, src->Index, comp, &o))
+         break;
       o.kind = FP_OPND_INPUT;
       o.index = src->Index;
       o.comp = comp;

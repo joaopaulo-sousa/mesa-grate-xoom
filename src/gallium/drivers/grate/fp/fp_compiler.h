@@ -43,7 +43,14 @@ enum fp_opnd_kind {
    FP_OPND_DST,           /* destination colour channel (PSEQ load) */
    FP_OPND_ZERO,          /* fixed10 0 and 1 of r31, for fixed10 results */
    FP_OPND_ONE,
+   FP_OPND_SPECIAL,       /* a register the hardware fills, index FP_REG_* */
 };
+
+/* Registers with the fragment position (fp20, 8192 + the pixel's integer
+ * coordinate) and the polygon face (fixed10 low half: 1 front, 0 back) */
+#define FP_REG_POSITION_X 72
+#define FP_REG_POSITION_Y 73
+#define FP_REG_FACE 75
 
 struct fp_opnd {
    enum fp_opnd_kind kind;
@@ -173,6 +180,7 @@ struct fp_alu_src_operand fp_alu_src_row(int index);
 struct fp_alu_src_operand fp_alu_src_uniform(int index);
 struct fp_alu_src_operand fp_alu_src_zero(void);
 struct fp_alu_src_operand fp_alu_src_one(void);
+struct fp_alu_src_operand fp_alu_src_special(int index);
 struct fp_alu_instr fp_alu_nop(void);
 void fp_mfu_bary_setup(struct fp_mfu_instr *mfu);
 uint32_t fp_pseq_word(const struct fp_compiler *c, int pair);

@@ -369,13 +369,15 @@ grate_create_rasterizer_state(struct pipe_context *pcontext,
 
    so->draw_params = TGR3D_IDX_SET_PRIM_FLAT_VTX(!template->flatshade_first);
 
-   /* normal */
-   so->cull_face[0] = TGR3D_SU_PARAM_FRONT_FACE(!template->front_ccw);
+   /* normal; FRONT_FACE also says which faces the fragment program's face
+    * register calls front (measured), the culling goes by the sign of the
+    * area */
+   so->cull_face[0] = TGR3D_SU_PARAM_FRONT_FACE(template->front_ccw);
    so->cull_face[0] |= TGR3D_SU_PARAM_CULL(grate_cull_face(template->cull_face,
                                            template->front_ccw));
 
    /* y-inverted */
-   so->cull_face[1] = TGR3D_SU_PARAM_FRONT_FACE(template->front_ccw);
+   so->cull_face[1] = TGR3D_SU_PARAM_FRONT_FACE(!template->front_ccw);
    so->cull_face[1] |= TGR3D_SU_PARAM_CULL(grate_cull_face(template->cull_face,
                                            !template->front_ccw));
 
