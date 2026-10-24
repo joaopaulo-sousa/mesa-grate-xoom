@@ -637,16 +637,16 @@ vp_emit_moved(struct grate_vp_shader *vp, const struct grate_moved *moved,
                                s[0], s[1], s[2]), emit_sNOP());
    }
 
-   for (int k = 0; k < moved->num_coords; k++) {
+   for (int k = 0; k < moved->num_outs; k++) {
       int e = 1;
       while (e < 16 && (vp->output_semantic[e] != 0xffff || (vp->output_mask & (1 << e))))
          e++;
       if (e == 16)
          return false;
       vp->output_semantic[e] = GRATE_MOVED_SEMANTIC(k);
-      for (int j = 0; j < 2; j++) {
+      for (int j = 0; j < moved->out[k].num_roots; j++) {
          struct vp_src_operand s;
-         if (!vp_moved_src(vp, &moved->coord[k].root[j], node_reg, imm_slot, &s))
+         if (!vp_moved_src(vp, &moved->out[k].root[j], node_reg, imm_slot, &s))
             return false;
          emit_packed(vp, emit_vec(VP_VEC_OP_MOV, emit_output(vp, e, 1 << j, false),
                                   s, src_undef(), src_undef()), emit_sNOP());
@@ -670,7 +670,7 @@ grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi,
    vp->fs_const_base = -1;
    memset(vp->output_semantic, 0xff, sizeof(vp->output_semantic));
    memset(vp->shadow, -1, sizeof(vp->shadow));
-   if (moved && !moved->num_coords)
+   if (moved && !moved->num_outs)
       moved = NULL;
 
    while (!tgsi_parse_end_of_tokens(tgsi)) {
@@ -704,10 +704,12 @@ grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi,
           * coordinates read get a temporary */
          if (moved && !shadowed) {
             shadowed = true;
-            for (int i = 0; i < moved->num_nodes * 3 + moved->num_coords * 2; i++) {
-               const struct grate_moved_src *m = i < moved->num_nodes * 3 ?
-                  &moved->nodes[i / 3][i % 3] :
-                  &moved->coord[(i - moved->num_nodes * 3) / 2].root[i % 2];
+            for (int i = 0; i < moved->num_nodes * 3 + moved->num_outs * 4; i++) {
+               int r = i - moved->num_nodes * 3;
+               const struct grate_moved_src *m = r < 0 ? &moved->nodes[i / 3][i % 3] :
+                  r % 4 < moved->out[r / 4].num_roots ? &moved->out[r / 4].root[r % 4] : NULL;
+               if (!m)
+                  continue;
                int o = m->kind == GRATE_MOVED_OUTPUT ? vp_output_of(vp, m->semantic) : -1;
                if (m->kind == GRATE_MOVED_OUTPUT && o < 0)
                   return false;

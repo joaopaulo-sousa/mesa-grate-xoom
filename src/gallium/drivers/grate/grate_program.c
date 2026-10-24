@@ -502,7 +502,7 @@ grate_fs_update(struct grate_context *context)
    if (vv && v->info.can_move) {
       key.move = 1;
       struct grate_fs_variant *mv = grate_fs_select(context, so, key, user, user_len);
-      struct grate_vs_variant *mvv = !mv->info.failed && mv->info.moved.num_coords ?
+      struct grate_vs_variant *mvv = !mv->info.failed && mv->info.moved.num_outs ?
                                      grate_vs_variant(vs, &mv->info.moved) : NULL;
       if (mvv) {
          v = mv;

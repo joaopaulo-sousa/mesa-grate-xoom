@@ -38,7 +38,7 @@
 /* Give every varying component read an MFU of the earliest EXEC that has its
  * component slot free, in order of first use */
 static void
-fp_assign_inputs(struct fp_compiler *c)
+fp_assign_inputs(struct fp_compiler *c, bool packed)
 {
    memset(c->fetch_exec, -1, sizeof(c->fetch_exec));
    memset(c->fetch_col, -1, sizeof(c->fetch_col));
@@ -104,17 +104,33 @@ fp_assign_inputs(struct fp_compiler *c)
          struct fp_opnd *o = &u->slots[k].src[j];
          if (o->kind != FP_OPND_INPUT || c->fetch_exec[o->index][o->comp] >= 0)
             continue;
-         for (e = 0; e < FP_MAX_EXECS; e++)
-            if (c->exec_input[e][o->comp] == -1)
-               break;
-         if (e == FP_MAX_EXECS) {
-            fp_fail(c, "too many varyings");
+         /* the earliest EXEC with the component's own column free; or,
+          * packed, the earliest with any: one beside a taken one first,
+          * keeping free pairs for the destination colour */
+         int col = -1;
+         for (e = 0; e < FP_MAX_EXECS && col < 0; e++) {
+            int *x = c->exec_input[e];
+            if (x[o->comp] == -1)
+               col = o->comp;
+            for (int k = 0; k < 4 && col < 0 && packed; k++)
+               if (x[k] == -1 && x[k ^ 1] != -1)
+                  col = k;
+            for (int k = 0; k < 4 && col < 0 && packed; k++)
+               if (x[k] == -1)
+                  col = k;
+         }
+         if (col < 0) {
+            if (packed)
+               fp_fail(c, "too many varyings");
+            else
+               c->failed = true;
             return;
          }
-         c->exec_input[e][o->comp] = o->index;
-         c->exec_comp[e][o->comp] = o->comp;
+         e--;
+         c->exec_input[e][col] = o->index;
+         c->exec_comp[e][col] = o->comp;
          c->fetch_exec[o->index][o->comp] = e;
-         c->fetch_col[o->index][o->comp] = o->comp;
+         c->fetch_col[o->index][o->comp] = col;
       }
    }
 
@@ -128,7 +144,10 @@ fp_assign_inputs(struct fp_compiler *c)
                c->exec_input[e][2 * p] = c->exec_input[e][2 * p + 1] = -2;
                return;
             }
-      fp_fail(c, "no registers left for the destination colour");
+      if (packed)
+         fp_fail(c, "no registers left for the destination colour");
+      else
+         c->failed = true;
    }
 }
 
@@ -629,22 +648,31 @@ fp_sched_rows(struct fp_compiler *c)
 {
    int min_rows = 1;
 
-   fp_assign_inputs(c);
-   if (c->failed)
-      return false;
-
    if (getenv("GRATE_FP_ROWS"))
       min_rows = CLAMP(atoi(getenv("GRATE_FP_ROWS")), 1, FP_MAX_EXECS);
-   for (int limit = 16; limit > 0; limit--) {
-      if (!fp_schedule(c, limit))
+
+   /* varyings in their own columns; packed into earlier EXECs if that
+    * does not fit (the destination colour and what reads them get room) */
+   for (int packed = 0; packed < 2; packed++) {
+      fp_assign_inputs(c, packed);
+      if (c->failed && !packed) {
+         c->failed = false;
          continue;
-      fp_pad_execs(c, min_rows);
-      for (;;) {
-         if (fp_alloc_regs(c))
-            return true;
-         if (c->num_execs == FP_MAX_EXECS)
-            break;
-         fp_pad_execs(c, c->num_execs + 1);
+      }
+      if (c->failed)
+         return false;
+
+      for (int limit = 16; limit > 0; limit--) {
+         if (!fp_schedule(c, limit))
+            continue;
+         fp_pad_execs(c, min_rows);
+         for (;;) {
+            if (fp_alloc_regs(c))
+               return true;
+            if (c->num_execs == FP_MAX_EXECS)
+               break;
+            fp_pad_execs(c, c->num_execs + 1);
+         }
       }
    }
    return false;

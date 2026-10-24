@@ -1382,14 +1382,14 @@ fp_compact_uniforms(struct fp_compiler *c)
             BITSET_SET(read, u->slots[k].src[j].index);
    }
    /* the vertex shader reads those of the moved coordinates */
-   struct grate_moved_src *msrc[GRATE_MOVED_MAX_NODES * 3 + GRATE_MOVED_MAX * 2];
+   struct grate_moved_src *msrc[GRATE_MOVED_MAX_NODES * 3 + GRATE_MOVED_MAX * 4];
    int num_msrc = 0;
    for (int i = 0; i < info->moved.num_nodes; i++)
       for (int k = 0; k < 3; k++)
          msrc[num_msrc++] = &info->moved.nodes[i][k];
-   for (int i = 0; i < info->moved.num_coords; i++)
-      for (int k = 0; k < 2; k++)
-         msrc[num_msrc++] = &info->moved.coord[i].root[k];
+   for (int i = 0; i < info->moved.num_outs; i++)
+      for (int k = 0; k < info->moved.out[i].num_roots; k++)
+         msrc[num_msrc++] = &info->moved.out[i].root[k];
    for (int i = 0; i < num_msrc; i++)
       if (msrc[i]->kind == GRATE_MOVED_UNIFORM)
          BITSET_SET(read, msrc[i]->index);

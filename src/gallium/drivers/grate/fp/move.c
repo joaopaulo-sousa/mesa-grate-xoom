@@ -1,23 +1,39 @@
 /*
- * Texture coordinates computed in the vertex shader (see grate_moved in
+ * Values computed in the vertex shader (see grate_moved in
  * grate_compiler.h). Run late, when the preshader has turned what depends
- * on uniforms only into uniform slots: the coordinates of a dependent read
- * are then a chain of MADs over varyings, uniform slots and constants, and
- * they are linear in the varyings when no product has a varying on both
- * sides. Interpolating such an expression gives the same as computing it
- * from the interpolated varyings (all of them perspective-correct, the
- * expression's uniform parts the same over the primitive), so the vertex
- * shader can compute it as an extra output.
+ * on uniforms only into uniform slots: a value is then a chain of MADs over
+ * varyings, uniform slots and constants, and it is linear in the varyings
+ * when no product has a varying on both sides. Interpolating such an
+ * expression gives the same as computing it from the interpolated varyings
+ * (all of them perspective-correct, the uniform parts the same over the
+ * primitive), so the vertex shader can compute it as an extra output.
+ *
+ * Moved are the coordinates of dependent texture reads (they then need no
+ * sequential program), and the linear values the ALU reads when that takes
+ * fewer varying components to interpolate (a component is a register
+ * column of an EXEC: e.g. a sum of two varyings takes one instead of two).
  */
 #include <string.h>
 
 #include "fp_compiler.h"
 
 #include "pipe/p_shader_tokens.h"
+#include "util/u_memory.h"
+
+#define FP_MOVE_MAX_UNDO 1024
 
 struct fp_move {
    struct grate_moved *m;
-   int node_of[FP_MAX_UNITS];     /* unit -> node, -1 if not one yet */
+   int node_of[FP_MAX_UNITS];     /* unit -> node | pixel << 16, -1: none yet */
+   int num_declared;              /* inputs not moved ones */
+
+   /* operands changed, to undo them */
+   struct {
+      struct fp_opnd *at;
+      struct fp_opnd old;
+   } undo[FP_MOVE_MAX_UNDO];
+   int num_undo;
+   bool full;                     /* the undo log is: change nothing more */
 };
 
 static bool
@@ -43,7 +59,8 @@ fp_move_src(struct fp_compiler *c, struct fp_move *mv, struct fp_opnd o,
       return true;
    case FP_OPND_INPUT: {
       unsigned name = c->input_semantic[o.index] >> 8;
-      if (c->input_interp[o.index] != TGSI_INTERPOLATE_PERSPECTIVE ||
+      if (o.index >= mv->num_declared ||
+          c->input_interp[o.index] != TGSI_INTERPOLATE_PERSPECTIVE ||
           (name != TGSI_SEMANTIC_GENERIC && name != TGSI_SEMANTIC_TEXCOORD))
          return false;
       out->kind = GRATE_MOVED_OUTPUT;
@@ -80,9 +97,7 @@ fp_move_src(struct fp_compiler *c, struct fp_move *mv, struct fp_opnd o,
       if (m->num_nodes == GRATE_MOVED_MAX_NODES)
          return false;
       memcpy(m->nodes[m->num_nodes], src, sizeof(src));
-      mv->node_of[i] = m->num_nodes++;
-      /* whether it depends on a varying, in the same array */
-      mv->node_of[i] |= (p[0] || p[1] || p[2]) << 16;
+      mv->node_of[i] = m->num_nodes++ | (p[0] || p[1] || p[2]) << 16;
    }
    out->kind = GRATE_MOVED_NODE;
    out->index = mv->node_of[i] & 0xffff;
@@ -90,58 +105,199 @@ fp_move_src(struct fp_compiler *c, struct fp_move *mv, struct fp_opnd o,
    return true;
 }
 
+static void
+fp_move_set(struct fp_move *mv, struct fp_opnd *at, struct fp_opnd o)
+{
+   if (mv->num_undo == FP_MOVE_MAX_UNDO) {
+      mv->full = true;
+      return;
+   }
+   mv->undo[mv->num_undo].at = at;
+   mv->undo[mv->num_undo].old = *at;
+   mv->num_undo++;
+   *at = o;
+}
+
+static void
+fp_move_undo(struct fp_move *mv, int to)
+{
+   while (mv->num_undo > to) {
+      mv->num_undo--;
+      *mv->undo[mv->num_undo].at = mv->undo[mv->num_undo].old;
+   }
+}
+
+/* Varying components the program interpolates (the live code's) */
+static int
+fp_count_inputs(struct fp_compiler *c, bool *live)
+{
+   bool tex_live[FP_MAX_TEXTURES] = { false };
+   BITSET_DECLARE(read, FP_MAX_INPUTS * 4);
+
+   BITSET_ZERO(read);
+   memset(live, 0, c->num_units * sizeof(*live));
+   for (int i = c->num_units - 1; i >= 0; i--) {
+      struct fp_unit *u = &c->units[i];
+      if (u->output_chan >= 0 || u->kill)
+         live[i] = true;
+      if (!live[i])
+         continue;
+      fp_unit_foreach_src(u, k, j) {
+         struct fp_opnd *o = &u->slots[k].src[j];
+         if (o->kind == FP_OPND_VALUE)
+            live[o->index] = true;
+         else if (o->kind == FP_OPND_INPUT)
+            BITSET_SET(read, o->index * 4 + o->comp);
+         else if (o->kind == FP_OPND_TEXEL && !tex_live[o->index]) {
+            tex_live[o->index] = true;
+            for (int t = 0; t < 2; t++) {
+               struct fp_opnd *x = &c->tex[o->index].coord[t];
+               if (x->kind == FP_OPND_VALUE)
+                  live[x->index] = true;
+               else if (x->kind == FP_OPND_INPUT)
+                  BITSET_SET(read, x->index * 4 + x->comp);
+            }
+         }
+      }
+   }
+   return __bitset_count(read, BITSET_WORDS(FP_MAX_INPUTS * 4));
+}
+
+/* Replace every read of unit i's value by component comp of input */
+static void
+fp_move_reads(struct fp_compiler *c, struct fp_move *mv, int i, int input, int comp)
+{
+   for (int n = 0; n < c->num_units; n++) {
+      struct fp_unit *u = &c->units[n];
+      fp_unit_foreach_src(u, k, j) {
+         struct fp_opnd *o = &u->slots[k].src[j];
+         if (o->kind != FP_OPND_VALUE || o->index != i)
+            continue;
+         struct fp_opnd x = { .kind = FP_OPND_INPUT, .index = input, .comp = comp,
+                              .negate = o->negate, .absolute = o->absolute };
+         fp_move_set(mv, o, x);
+      }
+   }
+   for (int n = 0; n < c->num_tex; n++)
+      for (int t = 0; t < 2; t++) {
+         struct fp_opnd *o = &c->tex[n].coord[t];
+         if (o->kind == FP_OPND_VALUE && o->index == i)
+            fp_move_set(mv, o, (struct fp_opnd) { .kind = FP_OPND_INPUT, .index = input,
+                                                  .comp = comp, .negate = o->negate,
+                                                  .absolute = o->absolute });
+      }
+}
+
 /*
- * Find the dependent reads the vertex shader could compute the coordinates
- * of: info.can_move. For grate_fp_key.move, also make them so: the
- * coordinates become new inputs, what computed them dies (fp_relayout).
+ * Find what the vertex shader could compute: info.can_move. For
+ * grate_fp_key.move also make it so: the values become new inputs and what
+ * computed them dies (fp_relayout).
  */
 void
 fp_move_coords(struct fp_compiler *c)
 {
    struct grate_fp_info *info = &c->fp->info;
-   struct fp_move mv = { .m = &info->moved };
+   struct grate_moved *m = &info->moved;
+   struct fp_move *mv = CALLOC_STRUCT(fp_move);
    int input = c->num_inputs;
 
-   memset(&info->moved, 0, sizeof(info->moved));
-   memset(mv.node_of, -1, sizeof(mv.node_of));
+   mv->m = m;
+   mv->num_declared = c->num_inputs;
+   memset(m, 0, sizeof(*m));
+   memset(mv->node_of, -1, sizeof(mv->node_of));
    info->can_move = false;
 
+   /* the coordinates of dependent reads */
    for (int n = 0; n < c->num_tex; n++) {
-      struct grate_moved *m = &info->moved;
-      if (c->tex[n].input >= 0 || m->num_coords == GRATE_MOVED_MAX ||
+      if (c->tex[n].input >= 0 || m->num_outs == GRATE_MOVED_MAX ||
           input == FP_MAX_INPUTS)
          continue;
 
       /* both coordinates, or none: drop what a failed one added */
       struct grate_moved saved = *m;
       int saved_node_of[FP_MAX_UNITS];
-      memcpy(saved_node_of, mv.node_of, sizeof(saved_node_of));
+      memcpy(saved_node_of, mv->node_of, sizeof(saved_node_of));
       struct grate_moved_src root[2];
       bool p[2];
-      if (!fp_move_src(c, &mv, c->tex[n].coord[0], &root[0], &p[0]) ||
-          !fp_move_src(c, &mv, c->tex[n].coord[1], &root[1], &p[1])) {
+      if (!fp_move_src(c, mv, c->tex[n].coord[0], &root[0], &p[0]) ||
+          !fp_move_src(c, mv, c->tex[n].coord[1], &root[1], &p[1])) {
          *m = saved;
-         memcpy(mv.node_of, saved_node_of, sizeof(saved_node_of));
+         memcpy(mv->node_of, saved_node_of, sizeof(saved_node_of));
          continue;
       }
 
-      info->can_move = true;
-      int k = m->num_coords++;
-      m->coord[k].root[0] = root[0];
-      m->coord[k].root[1] = root[1];
-      m->coord[k].input = input;
-      if (c->key->move) {
-         c->input_semantic[input] = GRATE_MOVED_SEMANTIC(k);
-         c->input_interp[input] = TGSI_INTERPOLATE_PERSPECTIVE;
-         for (int j = 0; j < 2; j++)
-            c->tex[n].coord[j] = (struct fp_opnd) {
-               .kind = FP_OPND_INPUT, .index = input, .comp = j };
-      }
+      if (mv->num_undo + 2 > FP_MOVE_MAX_UNDO)
+         break;
+      int k = m->num_outs++;
+      m->out[k].root[0] = root[0];
+      m->out[k].root[1] = root[1];
+      m->out[k].num_roots = 2;
+      m->out[k].input = input;
+      for (int j = 0; j < 2; j++)
+         fp_move_set(mv, &c->tex[n].coord[j], (struct fp_opnd) {
+            .kind = FP_OPND_INPUT, .index = input, .comp = j });
       input++;
    }
 
-   if (!c->key->move)
-      memset(&info->moved, 0, sizeof(info->moved));
-   else
+   /* linear values the ALU reads, outermost first, while that saves
+    * varying components */
+   bool *live = MALLOC(FP_MAX_UNITS * sizeof(*live));
+   int count = fp_count_inputs(c, live);
+   int alu = -1;           /* moved input taking them */
+   for (int i = c->num_units - 1; i >= 0; i--) {
+      struct fp_unit *u = &c->units[i];
+      if (!live[i] || !fp_unit_has_value(u))
+         continue;
+      if (alu < 0 && (m->num_outs == GRATE_MOVED_MAX || input == FP_MAX_INPUTS))
+         break;
+
+      struct grate_moved saved = *m;
+      int saved_node_of[FP_MAX_UNITS];
+      memcpy(saved_node_of, mv->node_of, sizeof(saved_node_of));
+      int undo = mv->num_undo;
+      struct grate_moved_src root;
+      bool pixel;
+      if (!fp_move_src(c, mv, (struct fp_opnd) { .kind = FP_OPND_VALUE, .index = i },
+                       &root, &pixel) ||
+          !pixel || root.kind != GRATE_MOVED_NODE) {
+         *m = saved;
+         memcpy(mv->node_of, saved_node_of, sizeof(saved_node_of));
+         continue;
+      }
+
+      int k = alu >= 0 ? alu : m->num_outs;
+      int in = alu >= 0 ? m->out[k].input : input;
+      int comp = alu >= 0 ? m->out[k].num_roots : 0;
+      fp_move_reads(c, mv, i, in, comp);
+      int now = fp_count_inputs(c, live);
+      if (now >= count || mv->full) {
+         fp_move_undo(mv, undo);
+         *m = saved;
+         memcpy(mv->node_of, saved_node_of, sizeof(saved_node_of));
+         fp_count_inputs(c, live);
+         continue;
+      }
+      count = now;
+      if (alu < 0) {
+         alu = m->num_outs++;
+         m->out[alu].input = input++;
+      }
+      m->out[alu].root[m->out[alu].num_roots++] = root;
+      if (m->out[alu].num_roots == 4)
+         alu = -1;
+   }
+   FREE(live);
+
+   info->can_move = m->num_outs > 0;
+   if (c->key->move) {
+      for (int k = 0; k < m->num_outs; k++) {
+         c->input_semantic[m->out[k].input] = GRATE_MOVED_SEMANTIC(k);
+         c->input_interp[m->out[k].input] = TGSI_INTERPOLATE_PERSPECTIVE;
+      }
       c->num_inputs = input;
+   } else {
+      fp_move_undo(mv, 0);
+      memset(m, 0, sizeof(*m));
+   }
+   FREE(mv);
 }

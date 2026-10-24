@@ -97,18 +97,18 @@ struct grate_fp_spec {
 #define GRATE_FP_MAX_FLOW 4
 
 /*
- * Texture coordinates computed in the vertex shader (fp/move.c): a dependent
- * read whose coordinates are linear in the varyings (vtc + offset, as blur
- * kernels and scrolling textures do) forces a one-row sequential program
- * with four registers. Interpolation is linear, so the vertex shader can
- * compute them instead and the fragment program fetches with a varying.
- * Coordinate pair n becomes FS input "input" (.xy, semantic
- * GRATE_MOVED_SEMANTIC(n)), root[0] and root[1] of a small program of MADs
- * the vertex shader runs after its own: the leaves are its outputs (by
- * semantic), FS uniform slots (copied into VS constants at each draw) and
- * the constants 0 and 1.
+ * Values computed in the vertex shader (fp/move.c). A dependent read whose
+ * coordinates are linear in the varyings (vtc + offset, as blur kernels and
+ * scrolling textures do) forces a one-row sequential program with four
+ * registers; a sum of varyings takes the interpolation of each. Interpolation
+ * is linear, so the vertex shader can compute such values instead and the
+ * fragment program reads them as varyings. Moved input n becomes FS input
+ * "input" (components 0..num_roots-1, semantic GRATE_MOVED_SEMANTIC(n)):
+ * root[] of a small program of MADs the vertex shader runs after its own,
+ * whose leaves are its outputs (by semantic), FS uniform slots (copied into
+ * VS constants at each draw) and the constants 0 and 1.
  */
-#define GRATE_MOVED_MAX 4
+#define GRATE_MOVED_MAX 6
 #define GRATE_MOVED_MAX_NODES 24
 #define GRATE_MOVED_SEMANTIC(n) GRATE_SEMANTIC(5 /* TGSI_SEMANTIC_GENERIC */, 200 + (n))
 
@@ -134,10 +134,11 @@ struct grate_moved {
    struct grate_moved_src nodes[GRATE_MOVED_MAX_NODES][3];   /* a * b + c */
    int num_nodes;
    struct {
-      struct grate_moved_src root[2];
+      struct grate_moved_src root[4];
+      int num_roots;
       int input;
-   } coord[GRATE_MOVED_MAX];
-   int num_coords;
+   } out[GRATE_MOVED_MAX];
+   int num_outs;
 };
 
 /* linker (SU) instructions: up to 32 */
