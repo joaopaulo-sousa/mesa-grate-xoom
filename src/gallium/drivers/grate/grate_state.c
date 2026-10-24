@@ -884,8 +884,7 @@ grate_wrap_clamps(unsigned wrap)
 }
 
 /*
- * Texture descriptors of the samplers the fragment shader reads: linear
- * level 0 only. The TEX unit derives the pitch from the width (rows aligned
+ * Texture descriptors of the samplers the fragment shader reads: linear. The TEX unit derives the pitch from the width (rows aligned
  * to 64 bytes, see grate_screen_resource_create).
  */
 static void
@@ -921,10 +920,26 @@ emit_textures(struct grate_context *context, uint32_t **ptrp)
             lo |= TGR3D_TEX_TEXDESC_LO_MIRROR_T(TGR3D_STATE_ENABLED);
       }
 
-      /* bit 7: sample the base level only (no mipmaps yet) */
-      hi = TGR3D_TEX_TEXDESC_HI_BASE_LEVEL_ONLY(TGR3D_STATE_ENABLED);
-      if (util_is_power_of_two_nonzero(width) &&
-          util_is_power_of_two_nonzero(height))
+      /*
+       * Mipmaps for power-of-two textures, as libgrate: the levels follow
+       * each other in the BO, rows aligned to 16 bytes (as
+       * grate_screen_resource_create lays them out), LOD_MAX in 4.4 fixed
+       * point. Otherwise the base level only.
+       */
+      bool pot = util_is_power_of_two_nonzero(width) &&
+                 util_is_power_of_two_nonzero(height);
+      unsigned levels = view->texture->last_level;
+      bool mip = pot && levels && view->u.tex.first_level == 0 && sampler &&
+                 sampler->min_mip_filter != PIPE_TEX_MIPFILTER_NONE;
+      if (mip) {
+         levels = MIN2(levels, view->u.tex.last_level);
+         hi = TGR3D_TEX_TEXDESC_HI_LOD_MAX(levels << 4);
+         if (sampler->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR)
+            lo |= TGR3D_TEX_TEXDESC_LO_LERP_MIP;
+      } else {
+         hi = TGR3D_TEX_TEXDESC_HI_BASE_LEVEL_ONLY(TGR3D_STATE_ENABLED);
+      }
+      if (pot)
          hi |= TGR3D_TEX_TEXDESC_HI_LOG2_WIDTH(util_logbase2(width)) |
                TGR3D_TEX_TEXDESC_HI_LOG2_HEIGHT(util_logbase2(height));
       else

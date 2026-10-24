@@ -1,3 +1,4 @@
+#include <math.h>
 #include <stdlib.h>
 #include <stdio.h>
 
@@ -452,6 +453,94 @@ grate_resource_copy_region(struct pipe_context *pcontext,
                              src, src_level, box);
 }
 
+/* Colour of the source box at (x, y) of it, 0..1 across (bilinear or
+ * nearest), from the mapped rows */
+static void
+blit_sample(const struct pipe_blit_info *info, const uint8_t *map, unsigned stride,
+            float x, float y, float *rgba)
+{
+   enum pipe_format format = info->src.format;
+   unsigned bs = util_format_get_blocksize(format);
+   int w = abs(info->src.box.width), h = abs(info->src.box.height);
+   float fx = x * w - 0.5f, fy = y * h - 0.5f;
+
+   if (info->filter != PIPE_TEX_FILTER_LINEAR) {
+      int ix = CLAMP((int)(x * w), 0, w - 1), iy = CLAMP((int)(y * h), 0, h - 1);
+      util_format_unpack_rgba(format, rgba, map + iy * stride + ix * bs, 1);
+      return;
+   }
+
+   int x0 = CLAMP((int)floorf(fx), 0, w - 1), y0 = CLAMP((int)floorf(fy), 0, h - 1);
+   int x1 = MIN2(x0 + 1, w - 1), y1 = MIN2(y0 + 1, h - 1);
+   float ax = CLAMP(fx - floorf(fx), 0.0f, 1.0f), ay = CLAMP(fy - floorf(fy), 0.0f, 1.0f);
+   float t[4][4];
+   util_format_unpack_rgba(format, t[0], map + y0 * stride + x0 * bs, 1);
+   util_format_unpack_rgba(format, t[1], map + y0 * stride + x1 * bs, 1);
+   util_format_unpack_rgba(format, t[2], map + y1 * stride + x0 * bs, 1);
+   util_format_unpack_rgba(format, t[3], map + y1 * stride + x1 * bs, 1);
+   for (int c = 0; c < 4; c++)
+      rgba[c] = (t[0][c] * (1 - ax) + t[1][c] * ax) * (1 - ay) +
+                (t[2][c] * (1 - ax) + t[3][c] * ax) * ay;
+}
+
+/*
+ * Blits the 2D engine cannot do (it copies bytes, same size, level 0):
+ * scaling (mipmap generation), flips, other levels, format conversion. On
+ * the CPU, colour only.
+ */
+static void
+grate_blit_cpu(struct pipe_context *pcontext, const struct pipe_blit_info *info)
+{
+   struct pipe_transfer *st, *dt;
+   const struct pipe_box *sb = &info->src.box, *db = &info->dst.box;
+
+   if (!(info->mask & PIPE_MASK_RGBA) || util_format_is_depth_or_stencil(info->dst.format) ||
+       util_format_is_compressed(info->src.format) || util_format_is_compressed(info->dst.format)) {
+      grate_loge("blit %s -> %s unsupported\n", util_format_short_name(info->src.format),
+                 util_format_short_name(info->dst.format));
+      return;
+   }
+
+   struct pipe_box sbox = *sb, dbox = *db;
+   /* map the boxes the right way up, flip in the sampling */
+   if (sbox.width < 0) { sbox.x += sbox.width; sbox.width = -sbox.width; }
+   if (sbox.height < 0) { sbox.y += sbox.height; sbox.height = -sbox.height; }
+   if (dbox.width < 0) { dbox.x += dbox.width; dbox.width = -dbox.width; }
+   if (dbox.height < 0) { dbox.y += dbox.height; dbox.height = -dbox.height; }
+   sbox.depth = dbox.depth = 1;
+
+   const uint8_t *smap = pcontext->texture_map(pcontext, info->src.resource, info->src.level,
+                                               PIPE_MAP_READ, &sbox, &st);
+   uint8_t *dmap = pcontext->texture_map(pcontext, info->dst.resource, info->dst.level,
+                                         PIPE_MAP_WRITE, &dbox, &dt);
+   if (smap && dmap) {
+      unsigned dbs = util_format_get_blocksize(info->dst.format);
+      bool sflip_x = sb->width < 0, sflip_y = sb->height < 0;
+      bool dflip_x = db->width < 0, dflip_y = db->height < 0;
+      const struct pipe_scissor_state *sc = &info->scissor;
+      for (int y = 0; y < dbox.height; y++) {
+         for (int x = 0; x < dbox.width; x++) {
+            if (info->scissor_enable &&
+                (dbox.x + x < sc->minx || dbox.x + x >= sc->maxx ||
+                 dbox.y + y < sc->miny || dbox.y + y >= sc->maxy))
+               continue;
+            float u = (x + 0.5f) / dbox.width, v = (y + 0.5f) / dbox.height;
+            if (sflip_x != dflip_x)
+               u = 1.0f - u;
+            if (sflip_y != dflip_y)
+               v = 1.0f - v;
+            float rgba[4];
+            blit_sample(info, smap, st->stride, u, v, rgba);
+            util_format_pack_rgba(info->dst.format, dmap + y * dt->stride + x * dbs, rgba, 1);
+         }
+      }
+   }
+   if (smap)
+      pcontext->texture_unmap(pcontext, st);
+   if (dmap)
+      pcontext->texture_unmap(pcontext, dt);
+}
+
 static void
 grate_blit(struct pipe_context *pcontext, const struct pipe_blit_info *info)
 {
@@ -464,6 +553,16 @@ grate_blit(struct pipe_context *pcontext, const struct pipe_blit_info *info)
 
    dst = grate_resource(info->dst.resource);
    src = grate_resource(info->src.resource);
+
+   /* the 2D engine copies bytes, same size, at level 0 */
+   if (info->src.level || info->dst.level || info->src.format != info->dst.format ||
+       info->src.box.width != info->dst.box.width ||
+       info->src.box.height != info->dst.box.height ||
+       info->src.box.width < 0 || info->src.box.height < 0 || info->scissor_enable ||
+       util_format_is_compressed(info->src.format)) {
+      grate_blit_cpu(pcontext, info);
+      return;
+   }
 
    err = grate_stream_begin(&gr2d->stream, &ptr);
    if (err < 0) {
