@@ -381,6 +381,9 @@ grate_draw_range(struct grate_context *context, const struct pipe_draw_info *inf
    uint32_t *ptr, value;
    int err;
 
+   if (grate_stream_batch_full(stream))
+      grate_stream_flush(stream, false);
+
    err = grate_stream_begin(stream, &ptr);
    if (err < 0) {
       grate_loge("grate_stream_begin() failed: %d\n", err);
@@ -464,8 +467,6 @@ grate_draw_range(struct grate_context *context, const struct pipe_draw_info *inf
    GRATE_PUSHBUF_WORD(ptr, value);
 
    grate_stream_end(stream, &ptr);
-
-   grate_stream_flush(stream, false);
 }
 
 void

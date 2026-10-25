@@ -50,6 +50,8 @@ struct grate_stream {
    struct drm_tegra_syncpoint *syncpt;
 
    struct drm_tegra_pushbuf *pushbuf;
+   /* words of the open job's pushbuf already covered by gathers */
+   unsigned gathered;
 
    int num_words;
 
@@ -72,10 +74,17 @@ struct grate_stream {
    struct grate_stream *peer;
    uint32_t peer_waited;
 
-   /* BOs of the job under construction (referenced), stamped with its
-    * fence on submit */
+   /* BOs of the job under construction (referenced once each, see
+    * grate_bo.batch), stamped with its fence on submit */
    struct util_dynarray bos;
 };
+
+/*
+ * Jobs are batched: grate_stream_begin() opens a job or continues the open
+ * one, grate_stream_end() closes the commands of one operation, and only
+ * grate_stream_flush() submits. GRATE_BATCH=0 submits after every operation.
+ */
+bool grate_stream_batch_full(struct grate_stream *stream);
 
 enum {
    GRATE_STREAM_2D,

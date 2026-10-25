@@ -47,6 +47,10 @@ struct grate_bo {
     /* Last job of each stream (GRATE_STREAM_2D/3D) that used this BO;
      * drm is NULL once it is known to have completed */
     struct drm_tegra_fence fence[2];
+
+    /* Stream (per GRATE_STREAM_2D/3D) whose open job references this BO,
+     * not submitted yet: its fence is not stamped, a wait must submit it */
+    struct grate_stream *batch[2];
 };
 
 struct grate_device;

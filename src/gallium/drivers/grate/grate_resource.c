@@ -181,8 +181,10 @@ grate_resource_transfer_map(struct pipe_context *pcontext,
     * a readback otherwise races the GPU still writing the render target, and
     * an upload overwrites a texture a draw is still sampling.
     */
-   if (!(usage & PIPE_MAP_UNSYNCHRONIZED))
+   if (!(usage & PIPE_MAP_UNSYNCHRONIZED)) {
+      grate_context_submit_bo(context, resource->bo);
       grate_bo_wait(resource->bo);
+   }
 
    ptrans = slab_alloc(&context->transfer_pool);
    if (!ptrans)
@@ -907,6 +909,7 @@ grate_flush_resource(struct pipe_context *ctx, struct pipe_resource *resource)
     * it nothing else waits for the GPU on that path, and the compositor would
     * flip a frame that is still being drawn.
     */
+   grate_context_submit_bo(grate_context(ctx), grate_resource(resource)->bo);
    if (grate_context(ctx)->drm->implicit_sync != 1)
       grate_bo_wait(grate_resource(resource)->bo);
 }

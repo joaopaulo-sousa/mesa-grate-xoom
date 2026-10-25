@@ -77,6 +77,13 @@ struct pipe_fence_handle {
 void
 grate_context_flush_streams(struct grate_context *context);
 
+void
+grate_context_submit(struct grate_context *context);
+
+struct grate_bo;
+void
+grate_context_submit_bo(struct grate_context *context, struct grate_bo *bo);
+
 struct pipe_context *
 grate_screen_context_create(struct pipe_screen *pscreen,
                             void *priv, unsigned flags);

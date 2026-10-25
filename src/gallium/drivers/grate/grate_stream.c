@@ -53,6 +53,32 @@
 #include "grate_device.h"
 #include "grate_bo.h"
 #include "grate_stream.h"
+#include "util/u_debug.h"
+
+/*
+ * The kernel takes at most 16383 words per gather; a job may have several.
+ * A batch gets a new gather once the words since the last one pass this.
+ */
+#define GRATE_GATHER_WORDS 12288
+
+/* Cover the pushbuf words up to ptr with a gather of the open job */
+static int
+grate_stream_gather(struct grate_stream *stream, uint32_t *ptr)
+{
+   unsigned words = ptr - stream->pushbuf->start;
+   struct drm_tegra_submit_cmd *cmd;
+
+   if (words == stream->gathered)
+      return 0;
+
+   cmd = drm_tegra_job_add_command(stream->job, DRM_TEGRA_SUBMIT_CMD_GATHER_UPTR, 0);
+   if (!cmd)
+      return -ENOMEM;
+   cmd->gather_uptr.words = words - stream->gathered;
+   stream->gathered = words;
+   stream->pushbuf->ptr = ptr;
+   return 0;
+}
 
 /*
  * grate_stream_create(channel)
@@ -94,6 +120,8 @@ grate_stream_release_bos(struct grate_stream *stream, bool submitted)
    util_dynarray_foreach(&stream->bos, struct grate_bo *, bo) {
       if (submitted)
          (*bo)->fence[stream->slot] = stream->last_fence;
+      if ((*bo)->batch[stream->slot] == stream)
+         (*bo)->batch[stream->slot] = NULL;
       grate_bo_unref(*bo);
    }
    util_dynarray_clear(&stream->bos);
@@ -138,8 +166,21 @@ grate_stream_flush(struct grate_stream *stream, bool wait)
    if (stream->status == GRATE_STREAM_FREE)
       return 0;
 
+   /* close the open job: the last syncpoint increment and its one gather */
+   if (stream->status == GRATE_STREAM_CONSTRUCT) {
+      uint32_t *ptr = stream->pushbuf->ptr;
+
+      if (drm_tegra_pushbuf_begin(stream->pushbuf, 2, &ptr) == 0 &&
+          grate_stream_push_sync_cond(stream, &ptr, DRM_TEGRA_SYNC_COND_OP_DONE) == 0 &&
+          grate_stream_gather(stream, ptr) == 0)
+         stream->status = GRATE_STREAM_READY;
+      else
+         stream->status = GRATE_STREAM_CONSTRUCTION_FAILED;
+   }
+
    /* Return error if stream is constructed badly */
    if (stream->status != GRATE_STREAM_READY) {
+      grate_stream_release_bos(stream, false);
       result = -1;
       goto cleanup;
    }
@@ -195,8 +236,25 @@ grate_stream_begin(struct grate_stream *stream, uint32_t **ptrp)
 {
    int ret;
 
-   /* check stream and its state */
-   if (!(stream && stream->status == GRATE_STREAM_FREE)) {
+   if (!stream)
+      return -1;
+
+   /* the peer channel's open job first: this one waits for it below */
+   if (stream->peer && stream->peer->status != GRATE_STREAM_FREE)
+      grate_stream_flush(stream->peer, false);
+
+   /* continue the open job */
+   if (stream->status == GRATE_STREAM_CONSTRUCT) {
+      ret = drm_tegra_pushbuf_begin(stream->pushbuf, stream->num_words, ptrp);
+      if (ret != 0) {
+         grate_loge("drm_tegra_pushbuf_begin() failed %d\n", ret);
+         stream->status = GRATE_STREAM_CONSTRUCTION_FAILED;
+         return -1;
+      }
+      return 0;
+   }
+
+   if (stream->status != GRATE_STREAM_FREE) {
       grate_loge("Stream status isn't FREE\n");
       return -1;
    }
@@ -206,6 +264,7 @@ grate_stream_begin(struct grate_stream *stream, uint32_t **ptrp)
       grate_loge("drm_tegra_job_new() failed %d\n", ret);
       return -1;
    }
+   stream->gathered = 0;
 
    struct grate_stream *peer = stream->peer;
    if (peer && peer->fence_pending &&
@@ -311,7 +370,10 @@ grate_stream_push_reloc(struct grate_stream *stream, uint32_t **ptrp,
       return ret;
    }
 
-   util_dynarray_append_typed(&stream->bos, struct grate_bo *, grate_bo_ref(bo));
+   if (bo->batch[stream->slot] != stream) {
+      bo->batch[stream->slot] = stream;
+      util_dynarray_append_typed(&stream->bos, struct grate_bo *, grate_bo_ref(bo));
+   }
 
    return ret;
 }
@@ -334,43 +396,48 @@ int grate_stream_push_sync_cond(struct grate_stream *stream, uint32_t **ptrp,
 /*
  * grate_stream_end(stream)
  *
- * Mark end of stream. This function pushes last syncpoint increment for
- * marking end of stream.
+ * End the commands of one operation. The job stays open for the next one;
+ * grate_stream_flush() closes and submits it.
  */
- 
+
 int
 grate_stream_end(struct grate_stream *stream, uint32_t **ptrp)
 {
-   int ret;
-
    if (!(stream && stream->status == GRATE_STREAM_CONSTRUCT)) {
       grate_loge("Stream status isn't CONSTRUCT\n");
       return -1;
    }
-   
-   ret = grate_stream_push_sync_cond(stream, ptrp, DRM_TEGRA_SYNC_COND_OP_DONE);
-   if (ret < 0) {
-      grate_loge("grate_stream_push_sync_cond() failed: %d\n", ret);
-      return ret;
-   }
-   
+
    if (*ptrp >= stream->pushbuf->end) {
       grate_loge("pushbuf ptr overflow %p pushbuf end %p\n", *ptrp, stream->pushbuf->end);
-      return 1;
-   }
-   assert(stream->pushbuf->start < *ptrp);
-
-   ret = drm_tegra_pushbuf_end(stream->pushbuf, *ptrp);
-   *ptrp = 0;
-   if (ret != 0) {
       stream->status = GRATE_STREAM_CONSTRUCTION_FAILED;
-      grate_loge("drm_tegra_pushbuf_sync() failed %d\n", ret);
       return -1;
    }
+   assert(stream->pushbuf->ptr < *ptrp);
 
-   stream->status = GRATE_STREAM_READY;
+   stream->pushbuf->ptr = *ptrp;
+   if (stream->pushbuf->ptr - stream->pushbuf->start - stream->gathered >= GRATE_GATHER_WORDS &&
+       grate_stream_gather(stream, stream->pushbuf->ptr) != 0)
+      stream->status = GRATE_STREAM_CONSTRUCTION_FAILED;
+   *ptrp = NULL;
 
    return 0;
+}
+
+/*
+ * Whether the open job should be submitted before another operation: the
+ * kernel takes at most 16 KiB of buffer references per job, and the gather
+ * is copied into one coherent allocation.
+ */
+bool
+grate_stream_batch_full(struct grate_stream *stream)
+{
+   if (stream->status != GRATE_STREAM_CONSTRUCT)
+      return false;
+   if (!debug_get_bool_option("GRATE_BATCH", true))
+      return true;
+   return stream->job->num_buffers > 0x4000 / sizeof(struct drm_tegra_submit_buf) - 64 ||
+          stream->pushbuf->ptr - stream->pushbuf->start > 4 * GRATE_GATHER_WORDS;
 }
 
 /*

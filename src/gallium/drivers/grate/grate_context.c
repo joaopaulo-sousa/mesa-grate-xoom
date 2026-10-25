@@ -9,6 +9,7 @@
 
 #include "grate_common.h"
 #include "grate_device.h"
+#include "grate_bo.h"
 #include "grate_context.h"
 #include "grate_twopass.h"
 #include "grate_draw.h"
@@ -80,12 +81,35 @@ grate_context_destroy(struct pipe_context *pcontext)
    struct grate_context *context = grate_context(pcontext);
    grate_trace();
 
+   grate_context_submit(context);
    grate_twopass_destroy(context, context->twopass);
    slab_destroy_child(&context->transfer_pool);
 
    grate_channel_delete(context->gr3d);
    grate_channel_delete(context->gr2d);
    FREE(context);
+}
+
+void
+grate_context_submit(struct grate_context *context)
+{
+   if (context->gr3d)
+      grate_stream_flush(&context->gr3d->stream, false);
+   if (context->gr2d)
+      grate_stream_flush(&context->gr2d->stream, false);
+}
+
+/* Submit the open job of this context that references bo, if any */
+void
+grate_context_submit_bo(struct grate_context *context, struct grate_bo *bo)
+{
+   struct grate_channel *channels[] = { context->gr2d, context->gr3d };
+
+   for (unsigned i = 0; i < ARRAY_SIZE(channels); i++) {
+      struct grate_stream *stream = channels[i] ? &channels[i]->stream : NULL;
+      if (stream && bo->batch[stream->slot] == stream)
+         grate_stream_flush(stream, false);
+   }
 }
 
 void
@@ -106,10 +130,11 @@ grate_context_flush(struct pipe_context *pcontext,
    struct grate_context *context = grate_context(pcontext);
 
    /*
-    * Jobs are submitted as they are built, so there is nothing left to send:
-    * a flush only hands out a fence. GRATE_SYNC=1 makes it wait as well, to
-    * tell synchronization bugs apart from others.
+    * Submit the open jobs (draws are batched, see grate_stream.h); the fence
+    * is then the one of the last job of each channel. GRATE_SYNC=1 makes it
+    * wait as well, to tell synchronization bugs apart from others.
     */
+   grate_context_submit(context);
    if (debug_get_bool_option("GRATE_SYNC", false))
       grate_context_flush_streams(context);
 
