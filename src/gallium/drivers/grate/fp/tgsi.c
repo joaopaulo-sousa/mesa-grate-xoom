@@ -1655,7 +1655,7 @@ fp_eval_unit(struct fp_compiler *c, int i, float *v)
 
 /* Whether an operand depends on uniforms only; *users: which */
 static bool
-fp_deps(struct fp_compiler *c, struct fp_opnd o, uint64_t *users)
+fp_deps(struct fp_compiler *c, struct fp_opnd o, BITSET_WORD *users)
 {
    switch (o.kind) {
    case FP_OPND_ZERO:
@@ -1663,7 +1663,7 @@ fp_deps(struct fp_compiler *c, struct fp_opnd o, uint64_t *users)
       return true;
    case FP_OPND_UNIFORM:
       if (BITSET_TEST(c->fp->info.user_mask, o.index))
-         *users |= 1ull << c->fp->info.user_index[o.index];
+         BITSET_SET(users, c->fp->info.user_index[o.index]);
       return true;
    case FP_OPND_VALUE:
       break;
@@ -1674,14 +1674,13 @@ fp_deps(struct fp_compiler *c, struct fp_opnd o, uint64_t *users)
    int i = o.index;
    if (!c->dep[i]) {
       struct fp_unit *u = &c->units[i];
-      uint64_t mask = 0;
       bool uniform = true;
+      BITSET_ZERO(c->dep_users[i]);
       fp_unit_foreach_src(u, k, j)
-         uniform &= fp_deps(c, u->slots[k].src[j], &mask);
+         uniform &= fp_deps(c, u->slots[k].src[j], c->dep_users[i]);
       c->dep[i] = uniform ? 1 : -1;
-      c->dep_users[i] = mask;
    }
-   *users |= c->dep_users[i];
+   __bitset_or(users, users, c->dep_users[i], BITSET_WORDS(GRATE_FP_USER_CONSTS));
    return c->dep[i] > 0;
 }
 
@@ -1797,11 +1796,13 @@ fp_leave_loop(struct fp_compiler *c, bool brk)
    /* the pixels running it: in the IFs it is in, inside the loop */
    struct fp_pred q = fp_pred_and(c, c->flow[l].iter, fp_pred_from(c, l + 1, false));
    if (q.kind == FP_PRED_VALUE && brk) {
-      uint64_t users = 0;
-      if (fp_deps(c, q.v, &users) && users) {
+      BITSET_DECLARE(users, GRATE_FP_USER_CONSTS);
+      BITSET_ZERO(users);
+      if (fp_deps(c, q.v, users) && !BITSET_IS_EMPTY(users)) {
          /* the loop count comes from uniforms: compile for their values */
          struct grate_fp_info *info = &c->fp->info;
-         u_foreach_bit64(user, users) {
+         unsigned user;
+         BITSET_FOREACH_SET(user, users, GRATE_FP_USER_CONSTS) {
             bool have = false;
             for (int i = 0; i < info->num_flow; i++)
                have |= info->flow_user[i] == user;

@@ -36,9 +36,10 @@ struct grate_vp_shader {
  * ones the final program reads (fp_compact_uniforms). */
 #define GRATE_FP_NUM_CONSTS 32
 #define GRATE_FP_MAX_SLOTS 128
-/* user uniform components a shader may declare (16 vec4, the GLES2
- * minimum); only those it reads take a register */
-#define GRATE_FP_USER_CONSTS 64
+/* user uniform components a shader may declare (64 vec4: Qt Quick's
+ * shaders declare more than the GLES2 minimum of 16); only those it reads
+ * take a register, a program reading more than there are fails to compile */
+#define GRATE_FP_USER_CONSTS 256
 #define GRATE_FP_MAX_IMMEDIATES 32
 
 /*

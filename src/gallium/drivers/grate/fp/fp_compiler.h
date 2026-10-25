@@ -150,7 +150,7 @@ struct fp_compiler {
    int8_t eval[FP_MAX_UNITS];        /* fp_eval: 1 known, -1 not, 0 unseen */
    float eval_v[FP_MAX_UNITS];
    int8_t dep[FP_MAX_UNITS];         /* fp_deps: 1 uniforms only, -1 pixel */
-   uint64_t dep_users[FP_MAX_UNITS];
+   BITSET_DECLARE(dep_users[FP_MAX_UNITS], GRATE_FP_USER_CONSTS);
 
    /* TGSI inputs: semantic; TRAM layout, input * 4 + component per row and
     * column (-1: free) */
