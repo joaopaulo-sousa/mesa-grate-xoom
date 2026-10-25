@@ -52,6 +52,10 @@ struct grate_stream {
    struct drm_tegra_pushbuf *pushbuf;
    /* words of the open job's pushbuf already covered by gathers */
    unsigned gathered;
+   /* operations of the open job, counted from 1 (grate_stream_begin), and
+    * the first one not covered by its last barrier: what earlier ones wrote
+    * is done */
+   uint32_t op, barrier_op;
 
    int num_words;
 
@@ -82,9 +86,15 @@ struct grate_stream {
 /*
  * Jobs are batched: grate_stream_begin() opens a job or continues the open
  * one, grate_stream_end() closes the commands of one operation, and only
- * grate_stream_flush() submits. GRATE_BATCH=0 submits after every operation.
+ * grate_stream_flush() submits. GRATE_BATCH=0 makes each draw submit its
+ * own job (grate_stream_batching).
  */
+bool grate_stream_batching(void);
 bool grate_stream_batch_full(struct grate_stream *stream);
+
+struct grate_bo;
+bool grate_stream_written(struct grate_stream *stream, struct grate_bo *bo);
+int grate_stream_barrier(struct grate_stream *stream, uint32_t **ptrp);
 
 enum {
    GRATE_STREAM_2D,

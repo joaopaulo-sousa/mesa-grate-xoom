@@ -51,6 +51,9 @@ struct grate_bo {
     /* Stream (per GRATE_STREAM_2D/3D) whose open job references this BO,
      * not submitted yet: its fence is not stamped, a wait must submit it */
     struct grate_stream *batch[2];
+    /* ... and the last operation of that job that wrote it (0: none,
+     * see grate_stream.op) */
+    uint32_t batch_written[2];
 };
 
 struct grate_device;

@@ -81,6 +81,37 @@ grate_stream_gather(struct grate_stream *stream, uint32_t *ptr)
 }
 
 /*
+ * Make the operation just begun wait until everything before it in the open
+ * job is done: a draw reading what an earlier draw of the job wrote (a
+ * render target sampled as a texture) would otherwise race it, as separate
+ * jobs did not. The job's syncpoint counts the operations; the kernel
+ * inserts the wait between two gathers (CMD_WAIT_SYNCPT_RELATIVE), so this
+ * goes right after grate_stream_begin(), before any command of the
+ * operation (the firewall checks every gather on its own).
+ */
+int
+grate_stream_barrier(struct grate_stream *stream, uint32_t **ptrp)
+{
+   struct drm_tegra_submit_cmd *cmd;
+   int ret;
+
+   ret = grate_stream_push_sync_cond(stream, ptrp, DRM_TEGRA_SYNC_COND_OP_DONE);
+   if (ret == 0)
+      ret = grate_stream_gather(stream, *ptrp);
+   if (ret != 0)
+      return ret;
+
+   cmd = drm_tegra_job_add_command(stream->job, DRM_TEGRA_SUBMIT_CMD_WAIT_SYNCPT_RELATIVE, 0);
+   if (!cmd)
+      return -ENOMEM;
+   cmd->wait_syncpt.id = stream->job->syncpt.id;
+   cmd->wait_syncpt.value = stream->job->syncpt.increments;
+   stream->barrier_op = stream->op;
+
+   return 0;
+}
+
+/*
  * grate_stream_create(channel)
  *
  * Create a stream for given channel. This function preallocates several
@@ -120,8 +151,10 @@ grate_stream_release_bos(struct grate_stream *stream, bool submitted)
    util_dynarray_foreach(&stream->bos, struct grate_bo *, bo) {
       if (submitted)
          (*bo)->fence[stream->slot] = stream->last_fence;
-      if ((*bo)->batch[stream->slot] == stream)
+      if ((*bo)->batch[stream->slot] == stream) {
          (*bo)->batch[stream->slot] = NULL;
+         (*bo)->batch_written[stream->slot] = 0;
+      }
       grate_bo_unref(*bo);
    }
    util_dynarray_clear(&stream->bos);
@@ -251,6 +284,7 @@ grate_stream_begin(struct grate_stream *stream, uint32_t **ptrp)
          stream->status = GRATE_STREAM_CONSTRUCTION_FAILED;
          return -1;
       }
+      stream->op++;
       return 0;
    }
 
@@ -265,6 +299,8 @@ grate_stream_begin(struct grate_stream *stream, uint32_t **ptrp)
       return -1;
    }
    stream->gathered = 0;
+   stream->op = 1;
+   stream->barrier_op = 1;
 
    struct grate_stream *peer = stream->peer;
    if (peer && peer->fence_pending &&
@@ -372,8 +408,11 @@ grate_stream_push_reloc(struct grate_stream *stream, uint32_t **ptrp,
 
    if (bo->batch[stream->slot] != stream) {
       bo->batch[stream->slot] = stream;
+      bo->batch_written[stream->slot] = 0;
       util_dynarray_append_typed(&stream->bos, struct grate_bo *, grate_bo_ref(bo));
    }
+   if (write)
+      bo->batch_written[stream->slot] = stream->op;
 
    return ret;
 }
@@ -424,18 +463,33 @@ grate_stream_end(struct grate_stream *stream, uint32_t **ptrp)
    return 0;
 }
 
+/* Whether an earlier operation of the open job, not behind a barrier yet,
+ * wrote bo */
+bool
+grate_stream_written(struct grate_stream *stream, struct grate_bo *bo)
+{
+   return bo && bo->batch[stream->slot] == stream &&
+          bo->batch_written[stream->slot] >= stream->barrier_op &&
+          bo->batch_written[stream->slot] < stream->op;
+}
+
 /*
  * Whether the open job should be submitted before another operation: the
  * kernel takes at most 16 KiB of buffer references per job, and the gather
  * is copied into one coherent allocation.
  */
 bool
+grate_stream_batching(void)
+{
+   /* GRATE_BATCH=0: every draw submits its own job, as before batching */
+   return debug_get_bool_option("GRATE_BATCH", true);
+}
+
+bool
 grate_stream_batch_full(struct grate_stream *stream)
 {
    if (stream->status != GRATE_STREAM_CONSTRUCT)
       return false;
-   if (!debug_get_bool_option("GRATE_BATCH", true))
-      return true;
    return stream->job->num_buffers > 0x4000 / sizeof(struct drm_tegra_submit_buf) - 64 ||
           stream->pushbuf->ptr - stream->pushbuf->start > 4 * GRATE_GATHER_WORDS;
 }

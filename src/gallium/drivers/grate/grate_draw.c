@@ -314,6 +314,28 @@ static void
 grate_draw_range(struct grate_context *context, const struct pipe_draw_info *info,
                  const struct pipe_draw_start_count_bias *draws);
 
+/* Whether the draw reads a BO an earlier draw of the open job wrote: its
+ * textures (a render target sampled) and vertex buffers */
+static bool
+grate_draw_reads_written(struct grate_context *context, struct grate_stream *stream)
+{
+   uint32_t mask = context->fshader ? context->fshader->info.sampler_mask : 0;
+
+   u_foreach_bit(i, mask) {
+      struct pipe_sampler_view *view = context->sampler_views[i];
+      if (view && view->texture &&
+          grate_stream_written(stream, grate_resource(view->texture)->bo))
+         return true;
+   }
+   for (unsigned i = 0; i < context->vbs.count; i++) {
+      struct pipe_resource *r = context->vbs.vb[i].buffer.resource;
+      if (!context->vbs.vb[i].is_user_buffer && r &&
+          grate_stream_written(stream, grate_resource(r)->bo))
+         return true;
+   }
+   return false;
+}
+
 static void
 grate_draw_vbo(struct pipe_context *pcontext,
                const struct pipe_draw_info *info,
@@ -387,6 +409,12 @@ grate_draw_range(struct grate_context *context, const struct pipe_draw_info *inf
    err = grate_stream_begin(stream, &ptr);
    if (err < 0) {
       grate_loge("grate_stream_begin() failed: %d\n", err);
+      return;
+   }
+
+   if (grate_draw_reads_written(context, stream) &&
+       grate_stream_barrier(stream, &ptr) < 0) {
+      grate_loge("grate_stream_barrier() failed\n");
       return;
    }
 
@@ -467,6 +495,9 @@ grate_draw_range(struct grate_context *context, const struct pipe_draw_info *inf
    GRATE_PUSHBUF_WORD(ptr, value);
 
    grate_stream_end(stream, &ptr);
+
+   if (!grate_stream_batching())
+      grate_stream_flush(stream, false);
 }
 
 void
