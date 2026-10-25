@@ -335,11 +335,14 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
       else
          /*
           * The TEX unit derives the row pitch from the width (measured with
-          * RGBA8888): power-of-two widths are aligned to 16 bytes, others to
-          * 64 bytes.
+          * RGBA8888): rows of power-of-two textures are aligned to 16 bytes,
+          * those of the others (NON_POWER_OF_TWO descriptor, see
+          * emit_textures: width or height not a power of two) to 64 bytes.
+          * A 4x30 tile read with the former had every fourth row.
           */
          resource->pitch = align(resource->pitch,
-                                 util_is_power_of_two_nonzero(template->width0) ?
+                                 util_is_power_of_two_nonzero(template->width0) &&
+                                 util_is_power_of_two_nonzero(template->height0) ?
                                  16 : 64);
 
       /*
