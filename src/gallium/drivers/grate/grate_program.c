@@ -321,7 +321,15 @@ grate_fs_compile(enum drm_tegra_soc_id soc_id, const struct tgsi_token *tokens,
    list_for_each_entry(struct fp_alu_instr_packet, instr, &fp.alu_instructions, link) {
       for (int i = 0; i < 4; ++i) {
          uint32_t words[2];
-         grate_fp_pack_alu(words, instr->slots + i);
+         if (i == 3 && instr->num_imm) {
+            /* imm0 at bits 4..23 of the first word, imm1 across bits 24..31
+             * and the next word's 0..11, imm2 at 12..31 (libgrate's layout) */
+            const uint32_t *imm = instr->imm;
+            words[0] = imm[0] << 4 | (imm[1] & 0xff) << 24;
+            words[1] = imm[1] >> 8 | imm[2] << 12;
+         } else {
+            grate_fp_pack_alu(words, instr->slots + i);
+         }
          PUSH(words[0]);
          PUSH(words[1]);
       }

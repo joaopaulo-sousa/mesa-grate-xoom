@@ -9,6 +9,7 @@
 
 #include "util/bitscan.h"
 #include "util/blend.h"
+#include "util/u_debug.h"
 #include "util/u_memory.h"
 
 struct fp_alu_src_operand
@@ -142,6 +143,66 @@ fp_alu_src_one(void)
       .sub_reg_select_high = 1
    };
    return src;
+}
+
+/*
+ * Constants of the program (immediates, not per-draw uniforms or preshader
+ * results) go into the packets that read them, as embedded constants in
+ * place of an unused slot 3 (measured on Tegra20, gpu/tools/asmtri): up to
+ * three fp20 values a packet, which its slots read as registers 28..30.
+ * When no packet reads a uniform register any more, the draw does not
+ * upload them (grate_fp_info.reads_uniforms).
+ */
+static void
+fp_embed_constants(struct grate_fp_shader *fp)
+{
+   struct grate_fp_info *info = &fp->info;
+   const struct fp_alu_instr nop = fp_alu_nop();
+   bool embed = !debug_get_bool_option("GRATE_FP_NO_EMBED", false);
+   BITSET_DECLARE(pre, GRATE_FP_MAX_SLOTS);
+
+   BITSET_ZERO(pre);
+   for (int i = 0; i < info->num_pre; i++)
+      if (info->pre[i].dst != GRATE_FP_PRE_NO_DST)
+         BITSET_SET(pre, info->pre[i].dst);
+
+   info->reads_uniforms = false;
+   list_for_each_entry(struct fp_alu_instr_packet, pk, &fp->alu_instructions, link) {
+      bool free3 = embed && !memcmp(&pk->slots[3], &nop, sizeof(nop));
+
+      for (int k = 0; k < 4; k++) {
+         struct fp_alu_instr *a = &pk->slots[k];
+         unsigned old_c = a->src[2].index;
+
+         for (int j = 0; j < 3; j++) {
+            struct fp_alu_src_operand *s = &a->src[j];
+            if (s->index < 32 || s->index >= 64)
+               continue;
+            unsigned slot = s->index - 32;
+            if (!free3 || k == 3 || s->datatype != FP_DATATYPE_FP20 ||
+                !BITSET_TEST(info->imm_mask, slot) || BITSET_TEST(pre, slot)) {
+               info->reads_uniforms = true;
+               continue;
+            }
+            unsigned e = 0;
+            while (e < pk->num_imm && pk->imm[e] != info->consts[slot])
+               e++;
+            if (e == pk->num_imm) {
+               if (pk->num_imm == 3) {
+                  info->reads_uniforms = true;
+                  continue;
+               }
+               pk->imm[pk->num_imm++] = info->consts[slot];
+            }
+            s->index = FP_EMBEDDED_REG(e);
+         }
+         /* rD repeats rC's register (or rB's): keep it on rC's */
+         if (a->src[3].index == old_c)
+            a->src[3].index = a->src[2].index;
+         else if (a->rd_enable && a->src[3].index >= 32 && a->src[3].index < 64)
+            info->reads_uniforms = true;
+      }
+   }
 }
 
 /* An ALU slot that does nothing: writes vec2(0, 1) to the read-only r31 */
@@ -2108,6 +2169,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
       fp_emit_seq(c);
    else
       fp_emit_rows(c);
+   fp_embed_constants(fp);
    fp_build_links(c);
    fp->info.num_rows = c->seq ? 1 : c->num_execs;
    fp->info.failed = c->failed;

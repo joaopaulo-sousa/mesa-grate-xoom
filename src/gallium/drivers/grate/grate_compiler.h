@@ -182,6 +182,7 @@ struct grate_fp_info {
    bool can_move;           /* texture coordinates the VS could compute */
    struct grate_moved moved;   /* ... that it does (grate_fp_key.move) */
    bool failed;             /* did not fit: the program draws magenta */
+   bool reads_uniforms;     /* the ALU reads uniform registers: upload them */
 };
 
 uint32_t

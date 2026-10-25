@@ -832,7 +832,7 @@ emit_program(struct grate_context *context, uint32_t **ptrp)
 
    /* fragment shader constants: ALU uniform registers 32.. */
    const struct grate_fp_info *fpinfo = &context->fshader->info;
-   if (!BITSET_IS_EMPTY(fpinfo->used_mask)) {
+   if (fpinfo->reads_uniforms && !BITSET_IS_EMPTY(fpinfo->used_mask)) {
       uint32_t consts[GRATE_FP_NUM_CONSTS];
       grate_fs_consts(context, consts);
 

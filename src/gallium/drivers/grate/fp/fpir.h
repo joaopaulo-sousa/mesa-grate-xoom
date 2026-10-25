@@ -145,7 +145,13 @@ struct fp_mfu_instr {
 struct fp_alu_instr_packet {
    struct list_head link;
    struct fp_alu_instr slots[4];
+   /* embedded constants imm0..imm2 (fp20, operand registers 28..30) in
+    * place of slot 3, when it is unused (fp_embed_constants) */
+   unsigned num_imm;
+   uint32_t imm[3];
 };
+
+#define FP_EMBEDDED_REG(i) (28 + (i))
 
 struct fp_sched {
    int num_instructions;
