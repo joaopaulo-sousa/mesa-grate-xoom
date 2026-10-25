@@ -100,7 +100,10 @@ drm_tegra_fence_wait(struct drm_tegra_fence *fence, unsigned long timeout)
     args.id = fence->syncpt;
     args.threshold = fence->value;
 
-    err = ioctl(drm->fd, DRM_IOCTL_TEGRA_SYNCPOINT_WAIT, &args);
+    /* the timeout is absolute: a wait a signal interrupted just goes on */
+    do {
+        err = ioctl(drm->fd, DRM_IOCTL_TEGRA_SYNCPOINT_WAIT, &args);
+    } while (err < 0 && errno == EINTR);
     if (err < 0)
         return -errno;
 

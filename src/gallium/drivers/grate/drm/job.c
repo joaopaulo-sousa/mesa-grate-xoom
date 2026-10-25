@@ -151,6 +151,20 @@ drm_tegra_job_strip_buf_flags(struct drm_tegra_job *job)
     return any;
 }
 
+/* The submit, again when a signal interrupts it (as drmIoctl does): the X
+ * server gets many */
+static int
+drm_tegra_submit_ioctl(int fd, struct drm_tegra_channel_submit *args)
+{
+    int err;
+
+    do {
+        err = ioctl(fd, DRM_IOCTL_TEGRA_CHANNEL_SUBMIT, args);
+    } while (err < 0 && (errno == EINTR || errno == EAGAIN));
+
+    return err;
+}
+
 int
 drm_tegra_job_submit(struct drm_tegra_job *job, struct drm_tegra_fence *fence)
 {
@@ -180,10 +194,10 @@ drm_tegra_job_submit(struct drm_tegra_job *job, struct drm_tegra_fence *fence)
     if (drm->implicit_sync == 0)
         drm_tegra_job_strip_buf_flags(job);
 
-    err = ioctl(drm->fd, DRM_IOCTL_TEGRA_CHANNEL_SUBMIT, &args);
+    err = drm_tegra_submit_ioctl(drm->fd, &args);
     if (err < 0 && errno == EINVAL && drm->implicit_sync < 0 &&
         drm_tegra_job_strip_buf_flags(job)) {
-        err = ioctl(drm->fd, DRM_IOCTL_TEGRA_CHANNEL_SUBMIT, &args);
+        err = drm_tegra_submit_ioctl(drm->fd, &args);
         if (err == 0)
             drm->implicit_sync = 0;
     } else if (err == 0 && drm->implicit_sync < 0 &&
@@ -220,7 +234,10 @@ drm_tegra_job_wait(struct drm_tegra_job *job, unsigned long timeout)
     args.id = job->syncpt.id;
     args.threshold = job->syncpt.fence;
 
-    err = ioctl(drm->fd, DRM_IOCTL_TEGRA_SYNCPOINT_WAIT, &args);
+    /* the timeout is absolute: a wait a signal interrupted just goes on */
+    do {
+        err = ioctl(drm->fd, DRM_IOCTL_TEGRA_SYNCPOINT_WAIT, &args);
+    } while (err < 0 && errno == EINTR);
     if (err < 0)
         return -errno;
 
