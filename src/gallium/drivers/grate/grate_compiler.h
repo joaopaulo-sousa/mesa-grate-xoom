@@ -48,7 +48,7 @@ struct grate_vp_shader {
  * slot dst to op(a[0] * b[0] + ... + a[n-1] * b[n-1], c), as the ALU would,
  * or to the special function sfu of a[0].
  */
-#define GRATE_FP_MAX_PRE 24
+#define GRATE_FP_MAX_PRE 64
 #define GRATE_FP_PRE_NO_DST 0xff
 
 enum grate_fp_pre_kind {
