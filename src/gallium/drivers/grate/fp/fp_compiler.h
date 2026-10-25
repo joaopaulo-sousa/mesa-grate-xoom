@@ -24,7 +24,7 @@
 #define FP_MAX_TEMPS 32
 #define FP_MAX_INPUTS 16
 #define FP_MAX_EXECS 4           /* multi-row programs */
-#define FP_SEQ_MAX_EXECS 16      /* one-row sequential programs */
+#define FP_SEQ_MAX_EXECS 64      /* one-row sequential programs (63 measured) */
 #ifndef FP_MAX_PACKETS_PER_EXEC   /* fphost-relaxed: how many a program needs */
 #define FP_MAX_PACKETS_PER_EXEC 3
 #endif
