@@ -235,7 +235,11 @@ struct grate_fp_key {
    uint8_t spec;
    uint8_t num_flow;
    uint8_t move;                             /* grate_fp_info.moved */
-   uint8_t pad[1];
+   /* samplers repeating a non-power-of-two texture along s / t: the TEX
+    * unit does not wrap those, the program takes fract() of the coordinate
+    * (grate_npot_repeat) */
+   uint8_t npot_s, npot_t;
+   uint8_t pad[3];
    /* sampler view swizzles (PIPE_SWIZZLE_* r | g << 3 | b << 6 | a << 9),
     * xor GRATE_SWIZZLE_IDENTITY: 0 is none */
    uint16_t tex_swizzle[GRATE_FP_MAX_SWIZZLED];

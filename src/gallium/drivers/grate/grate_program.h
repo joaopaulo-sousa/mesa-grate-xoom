@@ -77,6 +77,12 @@ grate_fs_update(struct grate_context *context);
 void
 grate_fs_consts(struct grate_context *context, uint32_t *consts);
 
+struct pipe_sampler_view;
+struct pipe_sampler_state;
+bool
+grate_npot_repeat(const struct pipe_sampler_view *view,
+                  const struct pipe_sampler_state *sampler, int axis);
+
 void
 grate_context_program_init(struct pipe_context *pcontext);
 

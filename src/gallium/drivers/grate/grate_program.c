@@ -412,6 +412,24 @@ grate_create_fs_state(struct pipe_context *pcontext,
 }
 
 /* Variant key of the bound blend state (render target 0) */
+/*
+ * Whether sampler view + state repeat a non-power-of-two texture along s
+ * (axis 0) or t: measured on Tegra20 (gpu/tools/xrtest/xsmalltile), such a
+ * texture does not wrap right whatever axis is non-power-of-two, so the
+ * program wraps the coordinate itself and the TEX unit clamps.
+ */
+bool
+grate_npot_repeat(const struct pipe_sampler_view *view,
+                  const struct pipe_sampler_state *sampler, int axis)
+{
+   if (!view || !view->texture || !sampler)
+      return false;
+   unsigned wrap = axis ? sampler->wrap_t : sampler->wrap_s;
+   return wrap == PIPE_TEX_WRAP_REPEAT &&
+          !(util_is_power_of_two_nonzero(view->texture->width0) &&
+            util_is_power_of_two_nonzero(view->texture->height0));
+}
+
 static struct grate_fp_key
 grate_fs_key(struct grate_context *context)
 {
@@ -435,6 +453,11 @@ grate_fs_key(struct grate_context *context)
          bits |= sw[c] << (3 * c);
       }
       key.tex_swizzle[i] = bits ^ GRATE_SWIZZLE_IDENTITY;
+
+      if (grate_npot_repeat(view, context->samplers[i], 0))
+         key.npot_s |= 1u << i;
+      if (grate_npot_repeat(view, context->samplers[i], 1))
+         key.npot_t |= 1u << i;
    }
 
    if (!blend)

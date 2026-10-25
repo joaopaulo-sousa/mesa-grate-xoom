@@ -921,9 +921,9 @@ emit_textures(struct grate_context *context, uint32_t **ptrp)
             lo |= TGR3D_TEX_TEXDESC_LO_LERP_MAG;
          if (sampler->min_img_filter == PIPE_TEX_FILTER_LINEAR)
             lo |= TGR3D_TEX_TEXDESC_LO_LERP_MIN;
-         if (grate_wrap_clamps(sampler->wrap_s))
+         if (grate_wrap_clamps(sampler->wrap_s) || grate_npot_repeat(view, sampler, 0))
             lo |= TGR3D_TEX_TEXDESC_LO_CLAMP_S(TGR3D_CLAMP_CLAMP);
-         if (grate_wrap_clamps(sampler->wrap_t))
+         if (grate_wrap_clamps(sampler->wrap_t) || grate_npot_repeat(view, sampler, 1))
             lo |= TGR3D_TEX_TEXDESC_LO_CLAMP_T(TGR3D_CLAMP_CLAMP);
          if (sampler->wrap_s == PIPE_TEX_WRAP_MIRROR_REPEAT)
             lo |= TGR3D_TEX_TEXDESC_LO_MIRROR_S(TGR3D_STATE_ENABLED);

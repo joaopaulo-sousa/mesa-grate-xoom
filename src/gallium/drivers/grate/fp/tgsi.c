@@ -709,6 +709,9 @@ fp_val(struct fp_compiler *c, enum fp_alu_op op, struct fp_opnd a,
  * TEX with varying coordinates: one texture fetch per EXEC, the texel
  * channels become fixed10 operands. A colour destination gets copies.
  */
+static struct fp_opnd
+fp_sfu(struct fp_compiler *c, enum fp_sfu_op op, struct fp_opnd x);
+
 /* Texture coordinates a multi-row program can fetch with: two components
  * of a varying, interpolated straight into a register pair (the TRAM layout
  * puts any component in any column) */
@@ -736,6 +739,14 @@ emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
       fp_fail(c, "too many texture fetches");
       return;
    }
+
+   /* repeat of a non-power-of-two texture: wrapped here, the TEX unit
+    * does not (grate_npot_repeat) */
+   unsigned smp = inst->Src[1].Register.Index;
+   if (c->key && smp < 8 && (c->key->npot_s & (1u << smp)))
+      s = fp_sfu(c, FP_SFU_OP_FRC, s);
+   if (c->key && smp < 8 && (c->key->npot_t & (1u << smp)))
+      t = fp_sfu(c, FP_SFU_OP_FRC, t);
 
    /* coordinates other than two varying components (a dependent read)
     * need a sequential program: the ALU computes them in an earlier pass */
