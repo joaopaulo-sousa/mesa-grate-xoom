@@ -17,6 +17,7 @@
  * Runs before fp_preshade, which takes the uniform-only units out.
  */
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "fp_compiler.h"
@@ -142,7 +143,7 @@ fp_negated(struct fp_opnd o, bool negate)
 }
 
 /* The value of a constant operand: 0, 1 or an immediate */
-static bool
+bool
 fp_opnd_known(struct fp_compiler *c, const struct fp_opnd *o, float *v)
 {
    if (o->kind == FP_OPND_ZERO)
@@ -380,6 +381,60 @@ fp_scale_operand(struct fp_compiler *c, struct fp_reassoc *r, int i, const struc
    return true;
 }
 
+/*
+ * A fixed10 operand x (a texel, the destination colour) read as x - 1 or
+ * 2x - 1: the operand modifiers "scale by two" then "fixed10 minus one" do
+ * it for free (the NVIDIA guide: 2x - 1 costs nothing), e.g. a normal map
+ * decoded as texel * 2 - 1. Unit i is that MAD; its readers take x with the
+ * modifiers, keeping their own absolute value and negation (applied after).
+ * rD has no scale or negate bits, so a reader there keeps the MAD, as do
+ * readers whose rD repeats an operand (squares, multiply-multiply-adds).
+ */
+static bool
+fp_fold_minus_one(struct fp_compiler *c, struct fp_reassoc *r, int i,
+                  const struct fp_opnd *x, bool twice)
+{
+   const struct fp_unit *u = &c->units[i];
+
+   if ((x->kind != FP_OPND_TEXEL && x->kind != FP_OPND_DST) || x->negate ||
+       x->absolute || x->twice || x->minus_one || u->saturate || r->readers[i] == 0)
+      return false;
+   for (int n = 0; n < c->num_tex; n++)
+      for (int k = 0; k < 2; k++)
+         if (c->tex[n].coord[k].kind == FP_OPND_VALUE && c->tex[n].coord[k].index == i)
+            return false;
+   for (int n = i + 1; n < c->num_units; n++) {
+      const struct fp_unit *v = &c->units[n];
+      if (!r->alive[n])
+         continue;
+      fp_unit_foreach_src(v, k, j) {
+         const struct fp_opnd *o = &v->slots[k].src[j];
+         if (o->kind == FP_OPND_VALUE && o->index == i &&
+             (v->sfu || v->sfu_copy || o->twice || o->minus_one || j == 3 ||
+              v->slots[k].square_c || v->slots[k].accumulate_this ||
+              v->slots[k].accumulate_other))
+            return false;
+      }
+   }
+   for (int n = i + 1; n < c->num_units; n++) {
+      struct fp_unit *v = &c->units[n];
+      if (!r->alive[n])
+         continue;
+      fp_unit_foreach_src(v, k, j) {
+         struct fp_opnd *o = &v->slots[k].src[j];
+         if (o->kind != FP_OPND_VALUE || o->index != i)
+            continue;
+         bool negate = o->negate, absolute = o->absolute;
+         *o = *x;
+         o->twice = twice;
+         o->minus_one = true;
+         o->negate = negate;
+         o->absolute = absolute;
+      }
+   }
+   return true;
+}
+
 void
 fp_fold_scales(struct fp_compiler *c)
 {
@@ -393,8 +448,17 @@ fp_fold_scales(struct fp_compiler *c)
          struct fp_unit *u = &c->units[i];
          struct fp_unit_slot *s = &u->slots[0];
          enum fp_scale scale;
-         if (!fp_plain_mad(&r, c, i) || u->kill || u->scale != FP_SCALE_NONE ||
-             !fp_opnd_is_const(c, &s->src[2], 0.0f))
+         if (!fp_plain_mad(&r, c, i) || u->kill || u->scale != FP_SCALE_NONE)
+            continue;
+         if (!getenv("GRATE_FP_NO_MINUS_ONE") && fp_opnd_is_const(c, &s->src[2], -1.0f)) {
+            for (int a = 0; a < 2 && !progress; a++) {
+               bool one = fp_opnd_is_const(c, &s->src[1 - a], 1.0f);
+               if (one || fp_opnd_is_const(c, &s->src[1 - a], 2.0f))
+                  progress = fp_fold_minus_one(c, &r, i, &s->src[a], !one);
+            }
+            continue;
+         }
+         if (!fp_opnd_is_const(c, &s->src[2], 0.0f))
             continue;
          for (int a = 0; a < 2 && !progress; a++) {
             if (!fp_scale_const(c, &s->src[1 - a], &scale))

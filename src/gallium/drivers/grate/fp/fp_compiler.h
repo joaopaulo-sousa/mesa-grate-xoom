@@ -245,6 +245,7 @@ void fp_expand_blend_inv(struct fp_compiler *c);
 void fp_fold_conditions(struct fp_compiler *c);
 void fp_move_coords(struct fp_compiler *c);
 bool fp_opnd_is_const(struct fp_compiler *c, const struct fp_opnd *o, float v);
+bool fp_opnd_known(struct fp_compiler *c, const struct fp_opnd *o, float *v);
 
 /* preshader.c */
 float fp20_to_float(uint32_t v);

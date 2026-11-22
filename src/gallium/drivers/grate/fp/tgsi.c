@@ -544,9 +544,16 @@ emit_componentwise(struct fp_compiler *c,
        * units stay in topological order */
       struct fp_opnd lrp = { 0 };
       if (opcode == TGSI_OPCODE_LRP) {
-         struct fp_opnd neg2 = s[i][2];
-         neg2.negate = !neg2.negate;
-         lrp = fp_val(c, FP_ALU_OP_MAD, s[i][1], fp_opnd_one(c, false), neg2);
+         float v1, v2;
+         if (fp_opnd_known(c, &s[i][1], &v1) && fp_opnd_known(c, &s[i][2], &v2)) {
+            /* constants: the difference as an immediate (x * 2 - 1 comes
+             * as LRP(x, 1, -1), which fp_fold_minus_one then frees) */
+            lrp = fp_opnd_const(c, v1 - v2);
+         } else {
+            struct fp_opnd neg2 = s[i][2];
+            neg2.negate = !neg2.negate;
+            lrp = fp_val(c, FP_ALU_OP_MAD, s[i][1], fp_opnd_one(c, false), neg2);
+         }
       }
 
       struct fp_unit *u = fp_new_unit(c);
