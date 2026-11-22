@@ -42,6 +42,7 @@ struct grate_context {
 
    struct grate_zsa_state *zsa;
    struct pipe_stencil_ref stencil_ref;
+   struct pipe_blend_color blend_color;
    const struct pipe_blend_state *blend;
    struct grate_rasterizer_state *rast;
 

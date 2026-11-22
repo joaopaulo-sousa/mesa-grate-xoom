@@ -473,6 +473,13 @@ grate_fs_key(struct grate_context *context)
       key.alpha_func = rt->alpha_func;
       key.alpha_src = rt->alpha_src_factor;
       key.alpha_dst = rt->alpha_dst_factor;
+
+      const uint8_t factors[] = { key.rgb_src, key.rgb_dst, key.alpha_src, key.alpha_dst };
+      for (unsigned i = 0; i < ARRAY_SIZE(factors); i++) {
+         unsigned f = util_blendfactor_without_invert(factors[i]);
+         if (f == PIPE_BLENDFACTOR_CONST_COLOR || f == PIPE_BLENDFACTOR_CONST_ALPHA)
+            memcpy(key.blend_color, context->blend_color.color, sizeof(key.blend_color));
+      }
    }
    return key;
 }

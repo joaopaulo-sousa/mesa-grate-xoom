@@ -1152,6 +1152,10 @@ fp_tex_word(const struct fp_compiler *c, int n, int coord_pair)
  * source and destination colour operands.
  */
 static struct fp_opnd
+fp_blend_factor(struct fp_compiler *c, enum pipe_blendfactor factor, int ch,
+                const struct fp_opnd *s, const struct fp_opnd *d, bool *inv);
+
+static struct fp_opnd
 fp_blend_term(struct fp_compiler *c, struct fp_opnd x, enum pipe_blendfactor factor,
               int ch, const struct fp_opnd *s, const struct fp_opnd *d, bool *zero)
 {
@@ -1167,8 +1171,13 @@ fp_blend_term(struct fp_compiler *c, struct fp_opnd x, enum pipe_blendfactor fac
    case PIPE_BLENDFACTOR_SRC_ALPHA: y = s[3]; break;
    case PIPE_BLENDFACTOR_DST_COLOR: y = d[ch]; break;
    case PIPE_BLENDFACTOR_DST_ALPHA: y = d[3]; break;
+   case PIPE_BLENDFACTOR_CONST_COLOR:
+   case PIPE_BLENDFACTOR_CONST_ALPHA:
+   case PIPE_BLENDFACTOR_SRC_ALPHA_SATURATE:
+      y = fp_blend_factor(c, factor, ch, s, d, &inv);
+      break;
    default:
-      /* constant colour, SRC1, SRC_ALPHA_SATURATE: not yet */
+      /* SRC1: not yet */
       fprintf(stderr, "GRATE FRAG: blend factor %u unsupported, using ONE\n", factor);
       return x;
    }
@@ -1194,6 +1203,26 @@ fp_blend_factor(struct fp_compiler *c, enum pipe_blendfactor factor, int ch,
    case PIPE_BLENDFACTOR_SRC_ALPHA: return s[3];
    case PIPE_BLENDFACTOR_DST_COLOR: return d[ch];
    case PIPE_BLENDFACTOR_DST_ALPHA: return d[3];
+   case PIPE_BLENDFACTOR_CONST_COLOR:
+   case PIPE_BLENDFACTOR_CONST_ALPHA: {
+      /* glBlendColor from the key, 1 - c folded in */
+      float v = c->key->blend_color[
+         util_blendfactor_without_invert(factor) == PIPE_BLENDFACTOR_CONST_ALPHA ? 3 : ch];
+      v = CLAMP(v, 0.0f, 1.0f);
+      if (*inv)
+         v = 1.0f - v;
+      *inv = false;
+      return fp_opnd_const(c, v);
+   }
+   case PIPE_BLENDFACTOR_SRC_ALPHA_SATURATE:
+      /* min(As, 1 - Ad) for colour, 1 for alpha */
+      *inv = false;
+      if (ch == 3)
+         return fp_opnd_one(c, false);
+      return fp_val(c, FP_ALU_OP_MIN, s[3], fp_opnd_one(c, false),
+                    fp_val(c, FP_ALU_OP_MAD, d[3],
+                           fp_opnd_modify(fp_opnd_one(c, false), true, false),
+                           fp_opnd_one(c, false)));
    default:
       fprintf(stderr, "GRATE FRAG: blend factor %u unsupported, using ONE\n", factor);
       *inv = false;

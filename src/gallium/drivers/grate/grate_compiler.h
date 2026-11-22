@@ -243,6 +243,9 @@ struct grate_fp_key {
    /* sampler view swizzles (PIPE_SWIZZLE_* r | g << 3 | b << 6 | a << 9),
     * xor GRATE_SWIZZLE_IDENTITY: 0 is none */
    uint16_t tex_swizzle[GRATE_FP_MAX_SWIZZLED];
+   /* glBlendColor, while a blend factor reads it (else 0): compiled in as
+    * immediates, a change of colour selects another variant */
+   float blend_color[4];
 };
 
 void

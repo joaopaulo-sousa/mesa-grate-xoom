@@ -209,7 +209,7 @@ static void
 grate_set_blend_color(struct pipe_context *pctx,
                       const struct pipe_blend_color *blend_color)
 {
-   grate_unimplemented();
+   grate_context(pctx)->blend_color = *blend_color;
 }
 
 static void
