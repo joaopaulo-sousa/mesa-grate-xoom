@@ -277,7 +277,14 @@ grate_init_state(struct grate_context *context, uint32_t **ptrp)
    GRATE_PUSHBUF_WORD(ptr, host1x_opcode_imm(REG_TGR3D_DW_ST_ENABLE, 0));
 
    GRATE_PUSHBUF_WORD(ptr, host1x_opcode_incr(REG_TGR3D_FDC_CONTROL, 13));
-   GRATE_PUSHBUF_WORD(ptr, 0x00000e00); // REG_TGR3D_FDC_CONTROL
+   /*
+    * Bit 0 invalidates the FDC, the cache the rasterizer, PSEQ and DW share
+    * (libgrate's grate_3d_init sets it): without it a draw reads stencil and
+    * depth lines cached before the 2D engine cleared them. Only in the first
+    * draw of a job: 2D work ends the 3D job (grate_stream_begin), and
+    * invalidating behind earlier draws of the same job hung the channel.
+    */
+   GRATE_PUSHBUF_WORD(ptr, context->gr3d->stream.op == 1 ? 0x00000e01 : 0x00000e00); // REG_TGR3D_FDC_CONTROL
    GRATE_PUSHBUF_WORD(ptr, 0x00000000); // REG_TGR3D_FDC_STATUS
    GRATE_PUSHBUF_WORD(ptr, 0x000001ff); // REG_TGR3D_FDC_MAX_QZ_LINES
    GRATE_PUSHBUF_WORD(ptr, 0x000001ff); // REG_TGR3D_FDC_MAX_QV_LINES
