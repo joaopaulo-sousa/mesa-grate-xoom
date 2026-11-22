@@ -425,6 +425,7 @@ grate_compare_func(enum pipe_compare_func func)
    case PIPE_FUNC_LEQUAL: return TGR3D_FUNC_LEQUAL;
    case PIPE_FUNC_GREATER: return TGR3D_FUNC_GREATER;
    case PIPE_FUNC_NOTEQUAL: return TGR3D_FUNC_NOTEQUAL;
+   case PIPE_FUNC_GEQUAL: return TGR3D_FUNC_GEQUAL;
    case PIPE_FUNC_ALWAYS: return TGR3D_FUNC_ALWAYS;
    default: UNREACHABLE("unknown pipe_compare_func");
    }
