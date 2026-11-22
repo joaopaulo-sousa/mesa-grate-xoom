@@ -132,8 +132,18 @@ grate_set_viewport_states(struct pipe_context *pcontext,
    context->viewport[5] = u_bitcast_f2u(viewports[0].scale[1] * 16.0f);
    context->viewport[6] = u_bitcast_f2u(viewports[0].scale[2] - zeps);
 
-   uint32_t depth_near = (viewports[0].translate[2] - viewports[0].scale[2]) * hw_scale;
-   uint32_t depth_far = (viewports[0].translate[2] + viewports[0].scale[2]) * hw_scale;
+   /* the range the depth unit keeps (Z_CLAMP_KILL clips to it): from the
+    * nearer to the farther, whichever glDepthRange puts first */
+   float z0 = viewports[0].translate[2] - viewports[0].scale[2];
+   float z1 = viewports[0].translate[2] + viewports[0].scale[2];
+   uint32_t depth_near = MIN2(z0, z1) * hw_scale;
+   uint32_t depth_far = MAX2(z0, z1) * hw_scale;
+   /* an empty range (glDepthRange(z, z)) keeps nothing after rounding:
+    * one step either side */
+   if (depth_far - depth_near < 2) {
+      depth_near = depth_near ? depth_near - 1 : 0;
+      depth_far = MIN2(depth_far + 1, hw_scale);
+   }
    context->viewport[7] = host1x_opcode_incr(REG_TGR3D_QR_Z_MIN, 2);
    context->viewport[8] = depth_near;
    context->viewport[9] = depth_far;
@@ -663,6 +673,19 @@ grate_depth_test(const struct grate_context *context)
 }
 
 /*
+ * Whether the depth unit runs although the depth test is off: with a depth
+ * buffer it always does, as ALWAYS without depth writes, because its range
+ * check (Z_CLAMP_KILL) is what clips primitives to the near and far planes;
+ * the clipper itself only clips to the guard band.
+ */
+static bool
+grate_depth_clip_only(const struct grate_context *context)
+{
+   return !grate_depth_test(context) &&
+          (context->framebuffer.rt_present & (1 << GRATE_RT_DEPTH));
+}
+
+/*
  * The colour surface, and the depth and stencil ones while their tests are
  * on, as libgrate does: the units use surfaces 0 and 2 whenever enabled.
  */
@@ -673,7 +696,7 @@ emit_render_targets(struct grate_context *context, uint32_t **ptrp)
    const struct grate_framebuffer_state *fb = &context->framebuffer;
    uint32_t enable = fb->rt_present & (1 << GRATE_RT_COLOR);
 
-   if (grate_depth_test(context))
+   if (grate_depth_test(context) || grate_depth_clip_only(context))
       enable |= 1 << GRATE_RT_DEPTH | GRATE_DW_ST_DEPTH_BUFFER;
    if (grate_stencil_test(context))
       enable |= 1 << GRATE_RT_STENCIL;
@@ -743,11 +766,18 @@ emit_zsa_state(struct grate_context *context, uint32_t **ptrp)
    int n = context->zsa->num_commands;
 
    memcpy(commands, context->zsa->commands, n * sizeof(commands[0]));
-   /* without a depth buffer there is nothing to test or write */
-   if (!grate_depth_test(context))
+   if (grate_depth_clip_only(context)) {
+      for (int i = 1; i < n; i += 2)
+         commands[i] = (commands[i] & ~(TGR3D_QR_Z_TEST_Z_FUNC__MASK |
+                                        TGR3D_QR_Z_TEST_QRAST_FB_WRITE__MASK)) |
+                       TGR3D_QR_Z_TEST_Z_ENABLE(TGR3D_STATE_ENABLED) |
+                       TGR3D_QR_Z_TEST_Z_FUNC(TGR3D_FUNC_ALWAYS);
+   } else if (!grate_depth_test(context)) {
+      /* without a depth buffer there is nothing to test or write */
       for (int i = 1; i < n; i += 2)
          commands[i] &= ~(TGR3D_QR_Z_TEST_Z_ENABLE__MASK |
                           TGR3D_QR_Z_TEST_QRAST_FB_WRITE__MASK);
+   }
    grate_stream_push_words(stream, ptrp, commands, n, 0);
 
    if (grate_stencil_test(context)) {
