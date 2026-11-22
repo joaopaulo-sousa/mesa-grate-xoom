@@ -1090,6 +1090,35 @@ emit_tgsi_instr(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
       emit_tex(c, inst);
       break;
 
+   case TGSI_OPCODE_TXB: {
+      /*
+       * The bias goes into the sampler's texture descriptor (constant
+       * biases, as the NVIDIA guide recommends); the TEX instruction can
+       * also read one per pixel from the row registers, not done yet.
+       */
+      struct fp_opnd b = fp_src(c, &inst->Src[0].Register, 3);
+      unsigned smp = inst->Src[1].Register.Index;
+      float v;
+      if (smp < 16 && fp_opnd_known(c, &b, &v)) {
+         int16_t bias = (int16_t)lroundf(CLAMP(v, -16.0f, 15.9375f) * 16.0f);
+         struct grate_fp_info *info = &c->fp->info;
+         if ((info->lod_bias_mask & (1u << smp)) && info->lod_bias[smp] != bias) {
+            fp_fail(c, "different LOD biases on one sampler");
+            break;
+         }
+         info->lod_bias[smp] = bias;
+         info->lod_bias_mask |= 1u << smp;
+      } else {
+         static bool warned;
+         if (!warned) {
+            warned = true;
+            fprintf(stderr, "GRATE FRAG: non-constant LOD bias ignored\n");
+         }
+      }
+      emit_tex(c, inst);
+      break;
+   }
+
    case TGSI_OPCODE_RCP:
    case TGSI_OPCODE_RSQ:
    case TGSI_OPCODE_SQRT:
@@ -2100,6 +2129,8 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    BITSET_ZERO(fp->info.imm_mask);
    BITSET_ZERO(fp->info.user_mask);
    fp->info.sampler_mask = 0;
+   fp->info.lod_bias_mask = 0;
+   memset(fp->info.lod_bias, 0, sizeof(fp->info.lod_bias));
    fp->info.num_pre = 0;
    fp->info.num_flow = 0;
    fp->num_immediates = 0;

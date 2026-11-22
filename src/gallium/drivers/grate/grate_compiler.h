@@ -173,6 +173,10 @@ struct grate_fp_info {
    BITSET_DECLARE(imm_mask, GRATE_FP_MAX_SLOTS);   /* holding immediates */
    BITSET_DECLARE(user_mask, GRATE_FP_MAX_SLOTS);  /* holding user uniforms */
    uint32_t sampler_mask;   /* samplers read */
+   /* LOD bias of TXB with a constant bias, per sampler, in 1/16 (the
+    * TEXDESC LOD_BIAS field is s4.4); lod_bias_mask: samplers with one */
+   int16_t lod_bias[16];
+   uint16_t lod_bias_mask;
    struct grate_fp_pre pre[GRATE_FP_MAX_PRE];
    int num_pre;
    struct grate_fp_spec spec[GRATE_FP_MAX_SPEC];
