@@ -758,17 +758,24 @@ emit_zsa_state(struct grate_context *context, uint32_t **ptrp)
          mesa_logw("grate: stencil written before discard\n");
       }
 
+      /*
+       * Which faces the hardware gives the FRONT stencil state follows the
+       * winding in the framebuffer, not FRONT_FACE (measured: dEQP
+       * fragment_ops.depth_stencil on a window surface, stest.sh twoside on
+       * an FBO): with the y inversion, the back state goes in front.
+       */
+      int sw = context->y_invert;
       GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_QR_S_TEST_FRONT, 3));
-      GRATE_PUSHBUF_WORD(*ptrp, zsa->s_test[0]);
-      GRATE_PUSHBUF_WORD(*ptrp, zsa->s_test[1]);
+      GRATE_PUSHBUF_WORD(*ptrp, zsa->s_test[sw]);
+      GRATE_PUSHBUF_WORD(*ptrp, zsa->s_test[!sw]);
       GRATE_PUSHBUF_WORD(*ptrp, TGR3D_QR_S_CTRL_S_ENABLE(TGR3D_STATE_ENABLED) |
                                 TGR3D_QR_S_CTRL_S_SURF_PTR(GRATE_RT_STENCIL) |
                                 TGR3D_QR_S_CTRL_QRAST_FB_WRITE(TGR3D_STATE_ENABLED));
       GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_GLOBAL_S_OPERATION_FRONT, 2));
-      GRATE_PUSHBUF_WORD(*ptrp, zsa->s_operation[0] |
-                                TGR3D_GLOBAL_S_OPERATION_FRONT_S_REF(context->stencil_ref.ref_value[0]));
-      GRATE_PUSHBUF_WORD(*ptrp, zsa->s_operation[1] |
-                                TGR3D_GLOBAL_S_OPERATION_BACK_S_REF(context->stencil_ref.ref_value[1]));
+      GRATE_PUSHBUF_WORD(*ptrp, zsa->s_operation[sw] |
+                                TGR3D_GLOBAL_S_OPERATION_FRONT_S_REF(context->stencil_ref.ref_value[sw]));
+      GRATE_PUSHBUF_WORD(*ptrp, zsa->s_operation[!sw] |
+                                TGR3D_GLOBAL_S_OPERATION_BACK_S_REF(context->stencil_ref.ref_value[!sw]));
    }
 }
 
