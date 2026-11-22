@@ -87,11 +87,6 @@ grate_set_framebuffer_state(struct pipe_context *pcontext,
    }
 
    /* prepare the scissor-registers for the non-scissor case */
-   context->no_scissor[0]  = host1x_opcode_incr(REG_TGR3D_SU_SCISSOR_X, 2);
-   context->no_scissor[1]  = TGR3D_SU_SCISSOR_X_MIN(0);
-   context->no_scissor[1] |= TGR3D_SU_SCISSOR_X_MAX(framebuffer->width);
-   context->no_scissor[2]  = TGR3D_SU_SCISSOR_Y_MIN(0);
-   context->no_scissor[2] |= TGR3D_SU_SCISSOR_Y_MAX(framebuffer->height);
 }
 
 static void
@@ -154,6 +149,14 @@ grate_set_viewport_states(struct pipe_context *pcontext,
    context->guardband[3] = u_bitcast_f2u(6.99);
 
    context->y_invert = viewports[0].scale[1] < 0.0f;
+
+   /* GL viewports are whole pixels: round the edges */
+   float x0 = viewports[0].translate[0] - scale_x, x1 = viewports[0].translate[0] + scale_x;
+   float y0 = viewports[0].translate[1] - scale_y, y1 = viewports[0].translate[1] + scale_y;
+   context->viewport_rect.minx = MAX2(lroundf(x0), 0);
+   context->viewport_rect.maxx = MAX2(lroundf(x1), 0);
+   context->viewport_rect.miny = MAX2(lroundf(y0), 0);
+   context->viewport_rect.maxy = MAX2(lroundf(y1), 0);
 }
 
 static void
@@ -689,22 +692,27 @@ emit_render_targets(struct grate_context *context, uint32_t **ptrp)
 /*
  * The scissor rectangle is in the same coordinates as the viewport output
  * (framebuffer rows from the first in memory), as the hardware rasterizes;
- * max is exclusive. Without the scissor test, the whole framebuffer.
+ * max is exclusive. It is always the viewport, within the scissor while the
+ * scissor test is on: the hardware clips primitives to the guard band only,
+ * so parts outside a viewport smaller than the framebuffer would be drawn
+ * (dEQP clipping).
  */
 static void
 emit_scissor(struct grate_context *context, uint32_t **ptrp)
 {
-   struct grate_stream *stream = &context->gr3d->stream;
    const struct pipe_framebuffer_state *fb = &context->framebuffer.base;
-   const struct pipe_scissor_state *s = &context->scissor;
+   struct pipe_scissor_state r = context->viewport_rect;
 
-   if (!context->rast || !context->rast->base.scissor) {
-      grate_stream_push_words(stream, ptrp, context->no_scissor, 3, 0);
-      return;
+   if (context->rast && context->rast->base.scissor) {
+      const struct pipe_scissor_state *s = &context->scissor;
+      r.minx = MAX2(r.minx, s->minx);
+      r.miny = MAX2(r.miny, s->miny);
+      r.maxx = MIN2(r.maxx, s->maxx);
+      r.maxy = MIN2(r.maxy, s->maxy);
    }
 
-   unsigned maxx = MIN2(s->maxx, fb->width), maxy = MIN2(s->maxy, fb->height);
-   unsigned minx = MIN2(s->minx, maxx), miny = MIN2(s->miny, maxy);
+   unsigned maxx = MIN2(r.maxx, fb->width), maxy = MIN2(r.maxy, fb->height);
+   unsigned minx = MIN2(r.minx, maxx), miny = MIN2(r.miny, maxy);
 
    GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_SU_SCISSOR_X, 2));
    GRATE_PUSHBUF_WORD(*ptrp, TGR3D_SU_SCISSOR_X_MIN(minx) |

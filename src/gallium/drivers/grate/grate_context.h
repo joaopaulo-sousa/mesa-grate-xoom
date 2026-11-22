@@ -55,8 +55,10 @@ struct grate_context {
 
    struct grate_twopass *twopass;     /* see grate_twopass.c */
 
-   uint32_t no_scissor[3];
    struct pipe_scissor_state scissor;
+   /* the viewport rectangle in framebuffer pixels: the hardware clips to
+    * its guard band only, so draws are scissored to this (emit_scissor) */
+   struct pipe_scissor_state viewport_rect;
    uint32_t viewport[10];
    uint32_t guardband[4];
    bool y_invert;
