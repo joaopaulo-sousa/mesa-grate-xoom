@@ -2532,12 +2532,12 @@ _glcpp_parser_handle_version_declaration(glcpp_parser_t *parser, intmax_t versio
    else if (version >= 150)
       add_builtin_define(parser, "GL_core_profile", 1);
 
-   /* Currently, all ES2/ES3 implementations support highp in the
-    * fragment shader, so we always define this macro in ES2/ES3.
-    * If we ever get a driver that doesn't support highp, we'll
-    * need to add a flag to the gl_context and check that here.
-    */
-   if (version >= 130 || parser->is_gles)
+   /* ES: only when the fragment shader has highp floats (a driver
+    * reports none as precision 0) */
+   if (version >= 130 ||
+       (parser->is_gles &&
+        (!parser->gl_ctx ||
+         parser->gl_ctx->Const.Program[MESA_SHADER_FRAGMENT].HighFloat.Precision)))
       add_builtin_define (parser, "GL_FRAGMENT_PRECISION_HIGH", 1);
 
    /* Add all the extension macros available in this context */

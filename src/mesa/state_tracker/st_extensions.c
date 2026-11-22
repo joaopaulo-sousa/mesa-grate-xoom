@@ -322,6 +322,17 @@ void st_init_limits(struct pipe_screen *screen,
          pc->MediumFloat = pc->LowFloat;
       }
 
+      if (screen->shader_caps[sh].precision_formats) {
+         struct gl_precision *f[3] = { &pc->LowFloat, &pc->MediumFloat, &pc->HighFloat };
+         struct gl_precision *i[3] = { &pc->LowInt, &pc->MediumInt, &pc->HighInt };
+         for (unsigned p = 0; p < 3; p++) {
+            const uint8_t *fp = screen->shader_caps[sh].float_precision[p];
+            const uint8_t *ip = screen->shader_caps[sh].int_precision[p];
+            *f[p] = (struct gl_precision) { fp[0], fp[1], fp[2] };
+            *i[p] = (struct gl_precision) { ip[0], ip[1], ip[2] };
+         }
+      }
+
       if (pc->MaxInstructions &&
           (!screen->shader_caps[sh].indirect_const_addr ||
            pc->MaxUniformBlocks < 12)) {

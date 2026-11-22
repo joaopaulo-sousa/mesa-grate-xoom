@@ -369,6 +369,17 @@ grate_screen_init_shader_caps(struct grate_screen *screen)
    // Bool values
    caps->integers = false;
    caps->int64_atomics = false;
+   /*
+    * fp20 (s.6.13) for mediump, fx10 (s.1.8, (-2, 2)) for lowp, as the
+    * NVIDIA driver maps them; highp needs 16 bits of precision, more than
+    * fp20 has, so the fragment shader reports none. Integers are emulated
+    * in fp20, exact within +-2^13.
+    */
+   caps->precision_formats = true;
+   static const uint8_t fp[3][3] = { { 1, 1, 8 }, { 31, 31, 13 }, { 0, 0, 0 } };
+   static const uint8_t ip[3][3] = { { 13, 13, 0 }, { 13, 13, 0 }, { 0, 0, 0 } };
+   memcpy(caps->float_precision, fp, sizeof(fp));
+   memcpy(caps->int_precision, ip, sizeof(ip));
    caps->fp16 = false;
    caps->fp16_derivatives = false;
    caps->fp16_const_buffers = false;

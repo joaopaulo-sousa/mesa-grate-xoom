@@ -805,6 +805,13 @@ struct pipe_shader_caps {
    bool int16;
    bool glsl_16bit_consts;
    bool glsl_16bit_load_dst; /* fp16 or int16 is AND'ed with this */
+   /* GLSL ES precision formats (glGetShaderPrecisionFormat) as
+    * { range_min, range_max, precision } for lowp, mediump and highp, used
+    * when precision_formats is set instead of the defaults (IEEE float32,
+    * or the fp16/int16 ones); all zero = that precision is not supported */
+   bool precision_formats;
+   uint8_t float_precision[3][3];
+   uint8_t int_precision[3][3];
    bool tgsi_sqrt_supported;
    bool tgsi_any_inout_decl_range;
 };
