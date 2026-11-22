@@ -744,6 +744,16 @@ emit_scissor(struct grate_context *context, uint32_t **ptrp)
                              TGR3D_SU_SCISSOR_Y_MAX(maxy));
 }
 
+/* Wide lines: the setup unit takes half the width (in pixels) */
+static void
+emit_line_width(struct grate_context *context, uint32_t **ptrp)
+{
+   float width = context->rast ? context->rast->base.line_width : 1.0f;
+
+   GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_SU_LINE_WIDTH_2, 1));
+   GRATE_PUSHBUF_WORD(*ptrp, u_bitcast_f2u(MAX2(width, 1.0f) * 0.5f));
+}
+
 static void
 emit_viewport(struct grate_context *context, uint32_t **ptrp)
 {
@@ -1019,6 +1029,7 @@ grate_emit_state(struct grate_context *context, uint32_t **ptrp)
    emit_viewport(context, ptrp);
    emit_guardband(context, ptrp);
    emit_scissor(context, ptrp);
+   emit_line_width(context, ptrp);
    emit_zsa_state(context, ptrp);
    emit_attribs(context, ptrp);
    emit_vs_uniforms(context, ptrp);
