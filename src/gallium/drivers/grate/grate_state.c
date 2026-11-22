@@ -158,7 +158,6 @@ grate_set_viewport_states(struct pipe_context *pcontext,
    context->guardband[2] = u_bitcast_f2u((3967 - max_y) / scale_y);
    context->guardband[3] = u_bitcast_f2u(6.99);
 
-   context->y_invert = viewports[0].scale[1] < 0.0f;
 
    /* GL viewports are whole pixels: round the edges */
    float x0 = viewports[0].translate[0] - scale_x, x1 = viewports[0].translate[0] + scale_x;
@@ -392,17 +391,16 @@ grate_create_rasterizer_state(struct pipe_context *pcontext,
 
    so->draw_params = TGR3D_IDX_SET_PRIM_FLAT_VTX(!template->flatshade_first);
 
-   /* normal; FRONT_FACE also says which faces the fragment program's face
-    * register calls front (measured), the culling goes by the sign of the
-    * area */
-   so->cull_face[0] = TGR3D_SU_PARAM_FRONT_FACE(template->front_ccw);
-   so->cull_face[0] |= TGR3D_SU_PARAM_CULL(grate_cull_face(template->cull_face,
-                                           template->front_ccw));
-
-   /* y-inverted */
-   so->cull_face[1] = TGR3D_SU_PARAM_FRONT_FACE(!template->front_ccw);
-   so->cull_face[1] |= TGR3D_SU_PARAM_CULL(grate_cull_face(template->cull_face,
-                                           !template->front_ccw));
+   /*
+    * FRONT_FACE says which faces the fragment program's face register, the
+    * culling and the FRONT stencil state take as front; it is the same for
+    * a y-inverted viewport (measured: dEQP rasterization.culling,
+    * builtin_variable.frontfacing and fragment_ops.depth_stencil on a
+    * window surface, facetest.sh and stest.sh twoside on an FBO).
+    */
+   so->cull_face = TGR3D_SU_PARAM_FRONT_FACE(template->front_ccw);
+   so->cull_face |= TGR3D_SU_PARAM_CULL(grate_cull_face(template->cull_face,
+                                        template->front_ccw));
 
    return so;
 }
@@ -806,24 +804,17 @@ emit_zsa_state(struct grate_context *context, uint32_t **ptrp)
          mesa_logw("grate: stencil written before discard\n");
       }
 
-      /*
-       * Which faces the hardware gives the FRONT stencil state follows the
-       * winding in the framebuffer, not FRONT_FACE (measured: dEQP
-       * fragment_ops.depth_stencil on a window surface, stest.sh twoside on
-       * an FBO): with the y inversion, the back state goes in front.
-       */
-      int sw = context->y_invert;
       GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_QR_S_TEST_FRONT, 3));
-      GRATE_PUSHBUF_WORD(*ptrp, zsa->s_test[sw]);
-      GRATE_PUSHBUF_WORD(*ptrp, zsa->s_test[!sw]);
+      GRATE_PUSHBUF_WORD(*ptrp, zsa->s_test[0]);
+      GRATE_PUSHBUF_WORD(*ptrp, zsa->s_test[1]);
       GRATE_PUSHBUF_WORD(*ptrp, TGR3D_QR_S_CTRL_S_ENABLE(TGR3D_STATE_ENABLED) |
                                 TGR3D_QR_S_CTRL_S_SURF_PTR(GRATE_RT_STENCIL) |
                                 TGR3D_QR_S_CTRL_QRAST_FB_WRITE(TGR3D_STATE_ENABLED));
       GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_GLOBAL_S_OPERATION_FRONT, 2));
-      GRATE_PUSHBUF_WORD(*ptrp, zsa->s_operation[sw] |
-                                TGR3D_GLOBAL_S_OPERATION_FRONT_S_REF(context->stencil_ref.ref_value[sw]));
-      GRATE_PUSHBUF_WORD(*ptrp, zsa->s_operation[!sw] |
-                                TGR3D_GLOBAL_S_OPERATION_BACK_S_REF(context->stencil_ref.ref_value[!sw]));
+      GRATE_PUSHBUF_WORD(*ptrp, zsa->s_operation[0] |
+                                TGR3D_GLOBAL_S_OPERATION_FRONT_S_REF(context->stencil_ref.ref_value[0]));
+      GRATE_PUSHBUF_WORD(*ptrp, zsa->s_operation[1] |
+                                TGR3D_GLOBAL_S_OPERATION_BACK_S_REF(context->stencil_ref.ref_value[1]));
    }
 }
 
@@ -903,7 +894,7 @@ emit_program(struct grate_context *context, uint32_t **ptrp)
                             TGR3D_SU_PARAM_CLIP_ENABLE(TGR3D_STATE_ENABLED);
 
    /* depends on cull-face */
-   cull_face_linker_setup |= context->rast->cull_face[context->y_invert];
+   cull_face_linker_setup |= context->rast->cull_face;
 
    /* depends on linking */
    struct grate_fp_info *info = &context->fshader->info;

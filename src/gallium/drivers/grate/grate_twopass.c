@@ -259,7 +259,6 @@ grate_twopass_draw(struct grate_context *context, const struct pipe_draw_info *i
    struct pipe_sampler_state *sampler0 = context->samplers[0];
    unsigned num_views = context->num_sampler_views;
    uint32_t viewport[ARRAY_SIZE(context->viewport)], guardband[ARRAY_SIZE(context->guardband)];
-   bool y_invert = context->y_invert;
    memcpy(viewport, context->viewport, sizeof(viewport));
    memcpy(guardband, context->guardband, sizeof(guardband));
 
@@ -300,6 +299,5 @@ grate_twopass_draw(struct grate_context *context, const struct pipe_draw_info *i
    context->num_sampler_views = num_views;
    memcpy(context->viewport, viewport, sizeof(viewport));
    memcpy(context->guardband, guardband, sizeof(guardband));
-   context->y_invert = y_invert;
    return true;
 }
