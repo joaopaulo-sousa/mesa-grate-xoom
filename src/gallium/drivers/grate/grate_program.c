@@ -230,7 +230,25 @@ grate_fs_compile(enum drm_tegra_soc_id soc_id, const struct tgsi_token *tokens,
    assert(ok == TGSI_PARSE_OK);
 
    struct grate_fp_shader fp;
-   grate_tgsi_to_fp(&fp, &parser, key);
+   grate_tgsi_to_fp(&fp, &parser, key, false);
+
+   /*
+    * TRUNC of a varying is compiled as fract(x) so that a multi-row program
+    * can run the SFU on the interpolated register; a sequential program has
+    * fewer registers for its extra values and may only fit with |x|.
+    */
+   if (fp.info.failed && fp.info.varying_trunc) {
+      list_for_each_entry_safe(struct fp_instr, i, &fp.fp_instructions, link)
+         FREE(i);
+      list_for_each_entry_safe(struct fp_alu_instr_packet, i, &fp.alu_instructions, link)
+         FREE(i);
+      list_for_each_entry_safe(struct fp_mfu_instr, i, &fp.mfu_instructions, link)
+         FREE(i);
+      tgsi_parse_free(&parser);
+      ok = tgsi_parse_init(&parser, tokens);
+      assert(ok == TGSI_PARSE_OK);
+      grate_tgsi_to_fp(&fp, &parser, key, true);
+   }
 
    /* say which shader draws magenta, to have something to work from (not
     * the generic version of one that gets specialized at draw time) */

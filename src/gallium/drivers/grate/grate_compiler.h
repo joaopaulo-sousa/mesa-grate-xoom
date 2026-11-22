@@ -186,6 +186,7 @@ struct grate_fp_info {
    bool can_move;           /* texture coordinates the VS could compute */
    struct grate_moved moved;   /* ... that it does (grate_fp_key.move) */
    bool failed;             /* did not fit: the program draws magenta */
+   bool varying_trunc;      /* TRUNC of a varying as fract(x) (see trunc_abs) */
    bool reads_uniforms;     /* the ALU reads uniform registers: upload them */
 };
 
@@ -254,6 +255,6 @@ struct grate_fp_key {
 
 void
 grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
-                 const struct grate_fp_key *key);
+                 const struct grate_fp_key *key, bool trunc_abs);
 
 #endif

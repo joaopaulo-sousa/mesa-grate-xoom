@@ -910,6 +910,32 @@ emit_sfu(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
                        fp_opnd_modify(fp_sfu(c, FP_SFU_OP_FRC, s[i][0]), true, false));
             break;
          case TGSI_OPCODE_TRUNC: {
+            if (s[i][0].kind == FP_OPND_INPUT && !s[i][0].negate && !s[i][0].absolute &&
+                !c->trunc_abs) {
+               /* (cheaper in a sequential program: the |x| form below,
+                * which grate_fs_compile retries with when this fails) */
+               c->fp->info.varying_trunc = true;
+               /*
+                * A varying: fract of x itself, so the SFU can run on the
+                * interpolated register in a multi-row program (no operand
+                * modifiers there). f = fract(x), l = x - f = floor(x);
+                * x < 0 with f > 0 rounds up: l + 1.
+                */
+               struct fp_opnd x = s[i][0];
+               struct fp_opnd f = fp_sfu(c, FP_SFU_OP_FRC, x);
+               struct fp_opnd l = fp_val(c, FP_ALU_OP_MAD, f,
+                                         fp_opnd_modify(fp_opnd_one(c, false), true, false), x);
+               /* 1 when f > 0: saturate(f * 2^30) (f = 0 gives 0 exactly; a
+                * select on -f would take -0.0 as negative) */
+               struct fp_unit *uu = fp_new_unit(c);
+               uu->saturate = true;
+               fp_unit_op(&uu->slots[0], FP_ALU_OP_MAD, f, fp_opnd_const(c, 1073741824.0f),
+                          fp_opnd_zero(c, false));
+               struct fp_opnd up = fp_opnd_value(c, uu);
+               struct fp_opnd lu = fp_val(c, FP_ALU_OP_MAD, up, fp_opnd_one(c, false), l);
+               r = fp_val(c, FP_ALU_OP_CSEL, x, lu, l);
+               break;
+            }
             /* t = |x| - fract(|x|), x < 0 ? -t : t */
             struct fp_opnd a = fp_opnd_modify(s[i][0], false, true);
             struct fp_opnd t = fp_val(c, FP_ALU_OP_MAD, a, fp_opnd_one(c, false),
@@ -1542,9 +1568,11 @@ fp_relayout(struct fp_compiler *c)
       c->tex[n].live = false;
    fp_dead_code(c);
 
+   /* SFUs need a sequential program, but for those on a varying (pseudo
+    * inputs of a multi-row one) */
    c->seq = false;
    for (int i = 0; i < c->num_units; i++)
-      c->seq |= c->units[i].live && c->units[i].sfu;
+      c->seq |= c->units[i].live && c->units[i].sfu && !fp_rows_sfu(c, &c->units[i]);
    for (int n = 0; n < c->num_tex; n++)
       c->seq |= c->tex[n].live && c->tex[n].input < 0;
 }
@@ -2105,7 +2133,7 @@ fp_match_flow(struct fp_program *p)
 
 void
 grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
-                 const struct grate_fp_key *key)
+                 const struct grate_fp_key *key, bool trunc_abs)
 {
    static const struct grate_fp_key key_none = { .colormask = 0xf };
    struct fp_compiler *c = CALLOC_STRUCT(fp_compiler);
@@ -2115,6 +2143,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    if (!key)
       key = &key_none;
    c->key = key;
+   c->trunc_abs = trunc_abs;
    c->out_pair = 1;
    c->redirect_output = key && (key->blend || (key->colormask & 0xf) != 0xf);
 
@@ -2129,6 +2158,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    BITSET_ZERO(fp->info.imm_mask);
    BITSET_ZERO(fp->info.user_mask);
    fp->info.sampler_mask = 0;
+   fp->info.varying_trunc = false;
    fp->info.lod_bias_mask = 0;
    memset(fp->info.lod_bias, 0, sizeof(fp->info.lod_bias));
    fp->info.num_pre = 0;

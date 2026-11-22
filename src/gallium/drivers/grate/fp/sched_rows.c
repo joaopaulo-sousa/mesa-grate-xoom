@@ -30,6 +30,10 @@
  *   coordinates that are a varying are supported (the NVIDIA compiler uses
  *   one-row programs for dependent reads).
  *
+ * - The MFU of an EXEC may run up to three instructions: after the one that
+ *   interpolates, an SFU (rcp, rsq, lg2, sqrt, frc) works in place on a
+ *   varying it interpolated, row-relative (fp_rows_pseudo).
+ *
  * The units are list-scheduled into packets and EXECs honouring the latencies
  * above, and the values that have to outlive the next packet get a register.
  * The colour is written as fixed10 to r2/r3.
@@ -108,8 +112,15 @@ fp_assign_inputs(struct fp_compiler *c, bool packed)
           * packed, the earliest with any: one beside a taken one first,
           * keeping free pairs for the destination colour */
          int col = -1;
+         bool pseudo = o->index >= c->first_pseudo;
          for (e = 0; e < FP_MAX_EXECS && col < 0; e++) {
             int *x = c->exec_input[e];
+            /* two SFU instructions per EXEC after the interpolation */
+            int sfus = 0;
+            for (int k = 0; k < 4; k++)
+               sfus += x[k] >= c->first_pseudo;
+            if (pseudo && sfus >= 2)
+               continue;
             if (x[o->comp] == -1)
                col = o->comp;
             for (int k = 0; k < 4 && col < 0 && packed; k++)
@@ -576,17 +587,34 @@ fp_emit_rows(struct fp_compiler *c)
          struct fp_mfu_instr *mfu = CALLOC_STRUCT(fp_mfu_instr);
          list_inithead(&mfu->link);
          for (int k = 0; k < 4; k++) {
-            if (c->exec_input[e][k] < 0)
+            int in = c->exec_input[e][k], comp = c->exec_comp[e][k];
+            if (in < 0)
                continue;
+            if (in >= c->first_pseudo) {
+               comp = c->pseudo[in - c->first_pseudo].comp;
+               in = c->pseudo[in - c->first_pseudo].input;
+            }
             mfu->var[k].op = FP_VAR_OP_FP20;
-            mfu->var[k].tram_row = fp_tram_row(c, c->exec_input[e][k],
-                                               c->exec_comp[e][k], k);
+            mfu->var[k].tram_row = fp_tram_row(c, in, comp, k);
          }
          if (e == 0)
             fp_mfu_bary_setup(mfu);
          inst->mfu_sched.num_instructions = 1;
          inst->mfu_sched.address = list_length(&fp->mfu_instructions);
          list_addtail(&mfu->link, &fp->mfu_instructions);
+
+         /* the SFUs of pseudo inputs, in place on their columns */
+         for (int k = 0; k < 4; k++) {
+            int in = c->exec_input[e][k];
+            if (in < c->first_pseudo)
+               continue;
+            struct fp_mfu_instr *s = CALLOC_STRUCT(fp_mfu_instr);
+            list_inithead(&s->link);
+            s->sfu.op = c->pseudo[in - c->first_pseudo].op;
+            s->sfu.reg = k;
+            list_addtail(&s->link, &fp->mfu_instructions);
+            inst->mfu_sched.num_instructions++;
+         }
       }
 
       if (c->dst_used && c->dst_exec == e)
@@ -643,10 +671,109 @@ fp_dump_rows(struct fp_compiler *c)
  * until the registers suffice. More rows give more registers;
  * GRATE_FP_ROWS forces a minimum.
  */
+/* SFU ops a multi-row program runs on a varying (one step; ex2, sin and
+ * cos need a pre-op first) */
+/* The varying an SFU unit works on, through the copy that gives a read
+ * elsewhere operand a register of its own (a pseudo input interpolates the
+ * varying again instead) */
+static const struct fp_opnd *
+fp_rows_sfu_source(const struct fp_compiler *c, const struct fp_unit *u)
+{
+   const struct fp_opnd *x = &u->slots[0].src[0];
+   if (x->kind == FP_OPND_VALUE && c->units[x->index].sfu_copy &&
+       !x->negate && !x->absolute && !x->twice && !x->minus_one)
+      x = &c->units[x->index].slots[0].src[0];
+   return x;
+}
+
+bool
+fp_rows_sfu(const struct fp_compiler *c, const struct fp_unit *u)
+{
+   const struct fp_opnd *x = fp_rows_sfu_source(c, u);
+   return (u->sfu == FP_SFU_OP_RCP || u->sfu == FP_SFU_OP_RSQ ||
+           u->sfu == FP_SFU_OP_LG2 || u->sfu == FP_SFU_OP_SQRT ||
+           u->sfu == FP_SFU_OP_FRC) &&
+          x->kind == FP_OPND_INPUT && !x->negate && !x->absolute &&
+          !x->twice && !x->minus_one;
+}
+
+static bool fp_sched_rows_units(struct fp_compiler *c, int min_rows);
+
+/* Turn the SFUs on varyings into pseudo inputs read in their place */
+static bool
+fp_rows_pseudo(struct fp_compiler *c)
+{
+   c->first_pseudo = c->num_inputs;
+   c->num_pseudo = 0;
+   for (int i = 0; i < c->num_units; i++) {
+      struct fp_unit *u = &c->units[i];
+      if (!u->live || !u->sfu)
+         continue;
+      if (!fp_rows_sfu(c, u) || u->output_chan >= 0 ||
+          c->first_pseudo + c->num_pseudo >= FP_MAX_INPUTS) {
+         if (grate_debug & GRATE_DEBUG_TGSI)
+            fprintf(stderr, "GRATE FRAG: SFU u%d (op %d, src kind %d) keeps the program sequential\n",
+                    i, u->sfu, u->slots[0].src[0].kind);
+         return false;
+      }
+      for (int n = 0; n < c->num_tex; n++)
+         for (int k = 0; k < 2; k++)
+            if (c->tex[n].live && c->tex[n].coord[k].kind == FP_OPND_VALUE &&
+                c->tex[n].coord[k].index == i)
+               return false;
+      int p = c->num_pseudo++;
+      const struct fp_opnd *x = fp_rows_sfu_source(c, u);
+      c->pseudo[p].input = x->index;
+      c->pseudo[p].comp = x->comp;
+      c->pseudo[p].op = u->sfu;
+      u->live = false;
+      /* its copy has no other reader */
+      if (u->slots[0].src[0].kind == FP_OPND_VALUE)
+         c->units[u->slots[0].src[0].index].live = false;
+      for (int n = 0; n < c->num_units; n++) {
+         struct fp_unit *v = &c->units[n];
+         if (!v->live)
+            continue;
+         fp_unit_foreach_src(v, k, j) {
+            struct fp_opnd *o = &v->slots[k].src[j];
+            if (o->kind != FP_OPND_VALUE || o->index != i)
+               continue;
+            o->kind = FP_OPND_INPUT;
+            o->index = c->first_pseudo + p;
+            o->comp = 0;
+         }
+      }
+   }
+   return true;
+}
+
 bool
 fp_sched_rows(struct fp_compiler *c)
 {
    int min_rows = 1;
+
+   /* the pseudo inputs rewrite the units: kept for the sequential
+    * schedule if the program does not fit in rows */
+   struct fp_unit *saved = malloc(sizeof(c->units[0]) * c->num_units);
+   if (!saved)
+      return false;
+   memcpy(saved, c->units, sizeof(c->units[0]) * c->num_units);
+   bool pseudo = fp_rows_pseudo(c);
+   bool ok = pseudo && fp_sched_rows_units(c, min_rows);
+   if ((grate_debug & GRATE_DEBUG_TGSI) && c->num_pseudo)
+      fprintf(stderr, "GRATE FRAG: %d SFU pseudo inputs, rows %s\n", c->num_pseudo,
+              ok ? "fit" : pseudo ? "do not fit" : "refused");
+   if (!ok) {
+      memcpy(c->units, saved, sizeof(c->units[0]) * c->num_units);
+      c->num_pseudo = 0;
+   }
+   free(saved);
+   return ok;
+}
+
+static bool
+fp_sched_rows_units(struct fp_compiler *c, int min_rows)
+{
 
    if (getenv("GRATE_FP_ROWS"))
       min_rows = CLAMP(atoi(getenv("GRATE_FP_ROWS")), 1, FP_MAX_EXECS);

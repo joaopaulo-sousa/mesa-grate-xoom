@@ -168,6 +168,19 @@ struct fp_compiler {
    int exec_comp[FP_MAX_EXECS][4];
    int fetch_reg[FP_MAX_INPUTS][4];   /* sequential: register it goes to */
 
+   /*
+    * Multi-row programs: an SFU on a varying component is a pseudo input
+    * (index first_pseudo + n) whose column the MFU interpolates the varying
+    * into and then runs the SFU on in place, with a second (or third) MFU
+    * instruction of the same EXEC (measured, gpu/tools/asmtri exp-mfu2).
+    */
+   int first_pseudo, num_pseudo;
+   bool trunc_abs;        /* TRUNC as |x| - fract(|x|) even of a varying */
+   struct {
+      int input, comp;       /* the varying component */
+      enum fp_sfu_op op;
+   } pseudo[FP_MAX_INPUTS];
+
    /* blending: colour writes become outv[] values, combined with the
     * destination (PSEQ load into a register pair of EXEC dst_exec) */
    const struct grate_fp_key *key;
@@ -246,6 +259,7 @@ void fp_fold_conditions(struct fp_compiler *c);
 void fp_move_coords(struct fp_compiler *c);
 bool fp_opnd_is_const(struct fp_compiler *c, const struct fp_opnd *o, float v);
 bool fp_opnd_known(struct fp_compiler *c, const struct fp_opnd *o, float *v);
+bool fp_rows_sfu(const struct fp_compiler *c, const struct fp_unit *u);
 
 /* preshader.c */
 float fp20_to_float(uint32_t v);
