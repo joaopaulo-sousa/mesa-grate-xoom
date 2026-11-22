@@ -85,6 +85,10 @@ grate_screen_init_caps(struct grate_screen *screen)
    caps->fs_coord_origin_upper_left = true;
    caps->fs_coord_pixel_center_half_integer = true;
 
+   /* grate_clear fills the scissor rectangle with the 2D engine; without
+    * this the state tracker clears scissored buffers by drawing quads */
+   caps->clear_scissored = true;
+
    /*
    // NV30 reference values, check and uncomment them
    caps->endianness = PIPE_ENDIAN_LITTLE;
