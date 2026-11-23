@@ -205,10 +205,10 @@ grate_resource_transfer_map(struct pipe_context *pcontext,
                                                 : resource->pitch;
 
    ptrans->stride = lpitch;
-   ptrans->layer_stride = ptrans->stride;
+   ptrans->layer_stride = resource->layer_size;
    *transfer = ptrans;
 
-   uint8_t *map = (uint8_t *)ret + resource->level_offset[lvl] +
+   uint8_t *map = (uint8_t *)ret + grate_resource_offset(resource, lvl, box->z) +
                   util_format_get_nblocksy(presource->format, box->y) * lpitch +
                   util_format_get_nblocksx(presource->format, box->x) *
                   util_format_get_blocksize(presource->format);
@@ -239,7 +239,7 @@ grate_resource_transfer_unmap(struct pipe_context *pcontext,
       if (!grate_bo_map(resource->bo, &ret)) {
          unsigned lvl = MIN2(transfer->level, (unsigned)(GRATE_MAX_MIP_LEVELS - 1));
          const struct pipe_box *box = &transfer->box;
-         uint8_t *map = (uint8_t *)ret + resource->level_offset[lvl] +
+         uint8_t *map = (uint8_t *)ret + grate_resource_offset(resource, lvl, box->z) +
                         util_format_get_nblocksy(PIPE_FORMAT_ETC1_RGB8, box->y) * transfer->stride +
                         util_format_get_nblocksx(PIPE_FORMAT_ETC1_RGB8, box->x) * 8;
          grate_etc1_swap(map, transfer->stride, box);
@@ -398,6 +398,24 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
 
       lw = MAX2(lw >> 1, 1u);
       lh = MAX2(lh >> 1, 1u);
+   }
+
+   /*
+    * Cube maps: the six faces, each with its mip levels, 1024-byte aligned
+    * (measured with gratetest GRATETEST_CUBE: 4x4 RGBA and L8 faces are
+    * 1024 bytes apart, 32x32 RGBA ones 4096). The TEX unit steps from face
+    * to face by the real height, not the power of two the rows above are
+    * backed to (a 57x57 face read 4 rows off): the last face keeps that.
+    */
+   resource->layer_size = size;
+   if (template->target == PIPE_TEXTURE_CUBE) {
+      unsigned face = 0, fh = template->height0;
+      for (unsigned l = 0; l < levels; ++l) {
+         face += resource->level_pitch[l] * util_format_get_nblocksy(template->format, fh);
+         fh = MAX2(fh >> 1, 1u);
+      }
+      resource->layer_size = align(face, 1024);
+      size += resource->layer_size * 5;
    }
 
    resource->bo = grate_bo_alloc(screen->drm, size, flags);
@@ -702,7 +720,7 @@ pack_color(enum pipe_format format, const float *rgba)
 
 static void
 fill(struct grate_stream *stream, uint32_t **ptrp,
-           struct grate_resource *dst, unsigned level,
+           struct grate_resource *dst, unsigned level, unsigned layer,
            uint32_t fill_value, int blocksize,
            unsigned dstx, unsigned dsty,
            unsigned width, unsigned height)
@@ -747,7 +765,7 @@ fill(struct grate_stream *stream, uint32_t **ptrp,
    GRATE_PUSHBUF_WORD(ptr, host1x_opcode_mask(0x2b, 0x09));
    /* a mip level: where grate_screen_resource_create put it */
    level = MIN2(level, GRATE_MAX_MIP_LEVELS - 1);
-   grate_stream_push_reloc(stream, &ptr, dst->bo, dst->level_offset[level], true); /* 0x02b - dstba */
+   grate_stream_push_reloc(stream, &ptr, dst->bo, grate_resource_offset(dst, level, layer), true); /* 0x02b - dstba */
    GRATE_PUSHBUF_WORD(ptr, level ? dst->level_pitch[level] : dst->pitch); /* 0x02e - dstst */
 
    GRATE_PUSHBUF_WORD(ptr, host1x_opcode_nonincr(0x35, 1));
@@ -777,12 +795,12 @@ fill_zs(struct grate_stream *stream, uint32_t **ptrp, struct pipe_surface *dst,
 
    if (res->stencil) {
       if (clear_depth)
-         fill(stream, ptrp, res, dst->level, util_pack_z(PIPE_FORMAT_Z16_UNORM, depth), 2,
+         fill(stream, ptrp, res, dst->level, dst->first_layer, util_pack_z(PIPE_FORMAT_Z16_UNORM, depth), 2,
               x, y, width, height);
       if (clear_stencil)
-         fill(stream, ptrp, res->stencil, dst->level, stencil, 1, x, y, width, height);
+         fill(stream, ptrp, res->stencil, dst->level, dst->first_layer, stencil, 1, x, y, width, height);
    } else if (clear_depth || clear_stencil) {
-      fill(stream, ptrp, res, dst->level, util_pack_z_stencil(dst->format, depth, stencil),
+      fill(stream, ptrp, res, dst->level, dst->first_layer, util_pack_z_stencil(dst->format, depth, stencil),
            util_format_get_blocksize(dst->format), x, y, width, height);
    }
 }
@@ -828,7 +846,7 @@ grate_clear(struct pipe_context *pcontext, unsigned int buffers,
       for (i = 0; i < fb->nr_cbufs; ++i) {
          struct pipe_surface *dst = &fb->cbufs[i];
          fill(stream, &ptr,
-                  grate_resource(dst->texture), dst->level,
+                  grate_resource(dst->texture), dst->level, dst->first_layer,
                   pack_color(dst->format, color->f),
                   util_format_get_blocksize(dst->format),
                   x, y, w, h);
@@ -865,7 +883,7 @@ grate_clear_render_target(struct pipe_context *pipe,
    }
    
    fill(&context->gr2d->stream, &ptr,
-        grate_resource(dst->texture), dst->level,
+        grate_resource(dst->texture), dst->level, dst->first_layer,
         pack_color(dst->format, color->f),
         util_format_get_blocksize(dst->format),
         dstx, dsty, width, height);

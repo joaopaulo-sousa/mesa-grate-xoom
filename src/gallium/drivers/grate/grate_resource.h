@@ -20,7 +20,17 @@ struct grate_resource {
    /* byte offset and row pitch of each mip level inside the object */
    unsigned int level_offset[GRATE_MAX_MIP_LEVELS];
    unsigned int level_pitch[GRATE_MAX_MIP_LEVELS];
+   /* cube maps: the six faces one after the other, each with its mip
+    * levels; bytes from one face to the next */
+   unsigned int layer_size;
 };
+
+/* Byte offset of a mip level of a layer (cube face) inside the object */
+static inline unsigned
+grate_resource_offset(const struct grate_resource *res, unsigned level, unsigned layer)
+{
+   return res->level_offset[level] + layer * res->layer_size;
+}
 
 static inline struct grate_resource *
 grate_resource(struct pipe_resource *resource)

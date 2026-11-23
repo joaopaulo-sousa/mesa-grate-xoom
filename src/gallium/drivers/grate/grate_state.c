@@ -39,7 +39,8 @@ grate_set_constant_buffer(struct pipe_context *pcontext, enum mesa_shader_stage 
 
 static void
 grate_set_render_target(struct grate_context *context, unsigned slot,
-                        const struct grate_resource *res, unsigned level)
+                        const struct grate_resource *res, unsigned level,
+                        unsigned layer)
 {
    uint32_t rt_params;
 
@@ -53,7 +54,7 @@ grate_set_render_target(struct grate_context *context, unsigned slot,
 
    context->framebuffer.rt_params[slot] = rt_params;
    context->framebuffer.rt_bos[slot] = res->bo;
-   context->framebuffer.rt_offsets[slot] = res->level_offset[level];
+   context->framebuffer.rt_offsets[slot] = grate_resource_offset(res, level, layer);
    context->framebuffer.rt_present |= 1 << slot;
 }
 
@@ -71,19 +72,19 @@ grate_set_framebuffer_state(struct pipe_context *pcontext,
    if (framebuffer->nr_cbufs && framebuffer->cbufs[0].texture)
       grate_set_render_target(context, GRATE_RT_COLOR,
                               grate_resource(framebuffer->cbufs[0].texture),
-                              framebuffer->cbufs[0].level);
+                              framebuffer->cbufs[0].level, framebuffer->cbufs[0].first_layer);
 
    if (framebuffer->zsbuf.texture) {
       struct grate_resource *zs = grate_resource(framebuffer->zsbuf.texture);
       const struct util_format_description *desc =
          util_format_description(framebuffer->zsbuf.format);
 
-      unsigned level = framebuffer->zsbuf.level;
+      unsigned level = framebuffer->zsbuf.level, layer = framebuffer->zsbuf.first_layer;
       if (util_format_has_depth(desc))
-         grate_set_render_target(context, GRATE_RT_DEPTH, zs, level);
+         grate_set_render_target(context, GRATE_RT_DEPTH, zs, level, layer);
       if (util_format_has_stencil(desc))
          grate_set_render_target(context, GRATE_RT_STENCIL, zs->stencil ? zs->stencil : zs,
-                                 level);
+                                 level, layer);
    }
 
    /* prepare the scissor-registers for the non-scissor case */
