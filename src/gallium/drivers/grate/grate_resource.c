@@ -406,12 +406,19 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
     * 1024 bytes apart, 32x32 RGBA ones 4096). The TEX unit steps from face
     * to face by the real height, not the power of two the rows above are
     * backed to (a 57x57 face read 4 rows off): the last face keeps that.
+    * Power-of-two faces always span the whole mip chain, levels or not:
+    * grate_state.c samples them in mipmap mode (see emit_textures).
     */
    resource->layer_size = size;
    if (template->target == PIPE_TEXTURE_CUBE) {
-      unsigned face = 0, fh = template->height0;
-      for (unsigned l = 0; l < levels; ++l) {
-         face += resource->level_pitch[l] * util_format_get_nblocksy(template->format, fh);
+      unsigned face = 0, fw = template->width0, fh = template->height0;
+      bool pot = util_is_power_of_two_nonzero(fw) && util_is_power_of_two_nonzero(fh);
+      unsigned face_levels = pot ? util_logbase2(MAX2(fw, fh)) + 1 : levels;
+      for (unsigned l = 0; l < face_levels; ++l) {
+         unsigned lpitch = l < levels ? resource->level_pitch[l] :
+            align(util_format_get_nblocksx(template->format, fw) * blocksize, 16);
+         face += lpitch * util_format_get_nblocksy(template->format, fh);
+         fw = MAX2(fw >> 1, 1u);
          fh = MAX2(fh >> 1, 1u);
       }
       resource->layer_size = align(face, 1024);

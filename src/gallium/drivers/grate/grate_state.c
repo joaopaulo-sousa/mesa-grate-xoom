@@ -980,6 +980,15 @@ emit_textures(struct grate_context *context, uint32_t **ptrp)
          hi = TGR3D_TEX_TEXDESC_HI_LOD_MAX(levels << 4);
          if (sampler->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR)
             lo |= TGR3D_TEX_TEXDESC_LO_LERP_MIP;
+      } else if (pot && view->target == PIPE_TEXTURE_CUBE) {
+         /*
+          * Measured on cube maps: with BASE_LEVEL_ONLY the TEX unit steps
+          * from face to face by the base level alone (the faces are laid out
+          * with their whole mip chain) and always filters as magnified. With
+          * LOD_MAX = 1/16 it reads level 0 and picks the min or mag filter.
+          * LOD_MAX = 0 steps right but always magnifies too.
+          */
+         hi = TGR3D_TEX_TEXDESC_HI_LOD_MAX(1);
       } else {
          hi = TGR3D_TEX_TEXDESC_HI_BASE_LEVEL_ONLY(TGR3D_STATE_ENABLED);
       }
