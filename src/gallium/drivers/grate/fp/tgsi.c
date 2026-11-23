@@ -2155,6 +2155,29 @@ fp_match_flow(struct fp_program *p)
    return !depth && flow;
 }
 
+/*
+ * A cube map of a varying .xyz in a program that ends up sequential: the
+ * MFU divides in the TEX EXEC there too, on copies of the components the
+ * ALU writes (emit_tex)
+ */
+static void
+fp_cube_computed(struct fp_compiler *c, int n)
+{
+   struct fp_opnd in = { .kind = FP_OPND_INPUT, .index = c->tex[n].input };
+
+   for (int k = 0; k < 3; k++) {
+      struct fp_unit *u = fp_new_unit(c);
+      in.comp = k;
+      fp_unit_op(&u->slots[0], FP_ALU_OP_MAD, in, fp_opnd_one(c, false),
+                 fp_opnd_zero(c, false));
+      u->live = true;
+      c->tex[n].coord[k] = fp_opnd_value(c, u);
+   }
+   c->tex[n].num_coords = 3;
+   c->tex[n].input = -1;
+   c->tex[n].pair = 0;
+}
+
 void
 grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
                  const struct grate_fp_key *key, bool trunc_abs)
@@ -2263,7 +2286,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
       c->seq = true;
    for (int n = 0; n < c->num_tex && !c->failed && c->seq; n++)
       if (c->tex[n].live && c->tex[n].cube && c->tex[n].num_coords == 2)
-         fp_fail(c, "cube maps of a varying in a sequential program");
+         fp_cube_computed(c, n);
    if (!c->failed && c->seq) {
       /* and the sum it adds may take in a multiply, as when written so */
       fp_expand_blend_inv(c);
