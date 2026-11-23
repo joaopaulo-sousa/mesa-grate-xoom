@@ -8,7 +8,9 @@
  * instructions follow from the resulting layout.
  */
 #include "fp_compiler.h"
+#include "tgr_3d.xml.h"
 
+#include "pipe/p_shader_tokens.h"
 #include "util/macros.h"
 
 #define LINK_DST(index, comp, type) (((comp) | (type) << 2) << ((index) * 4))
@@ -69,8 +71,15 @@ fp_build_links(struct fp_compiler *c)
             fp_fail(c, "too many linker instructions");
             return;
          }
+         /* gl_PointCoord: the setup unit puts the point sprite's S and T in
+          * place of components x and y of whatever export the link reads */
+         uint32_t point = 0;
+         if (c->input_semantic[input] >> 8 == TGSI_SEMANTIC_PCOORD)
+            point = (used & 1 ? TGR3D_SU_INST_EVEN_P0_POINT(TGR3D_POINT_S) : 0) |
+                    (used & 2 ? TGR3D_SU_INST_EVEN_P1_POINT(TGR3D_POINT_T) : 0);
          info->links[info->num_links++] = (struct grate_fp_link) {
             .dst = dst,
+            .point = point,
             .semantic = c->input_semantic[input],
             .tram_row = r,
             .input = input,

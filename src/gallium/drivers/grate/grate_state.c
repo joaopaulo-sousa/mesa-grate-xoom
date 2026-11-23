@@ -3,6 +3,7 @@
 #include <string.h>
 #include <math.h>
 
+#include "pipe/p_shader_tokens.h"
 #include "util/format/u_format.h"
 #include "util/u_bitcast.h"
 #include "util/u_helpers.h"
@@ -743,6 +744,50 @@ emit_line_width(struct grate_context *context, uint32_t **ptrp)
    GRATE_PUSHBUF_WORD(*ptrp, u_bitcast_f2u(MAX2(width, 1.0f) * 0.5f));
 }
 
+/* The VS export with that semantic, numbered among the enabled outputs (the
+ * hardware squeezes the export mask: exports 2, 7, 9 are seen as 0, 1, 2),
+ * -1 if none */
+static int
+grate_vs_export(const struct grate_context *context, uint16_t semantic)
+{
+   for (int o = 0; context->vshader && o < 16; o++)
+      if (context->vshader->output_semantic[o] == semantic)
+         return util_bitcount(context->vshader->output_mask & BITFIELD_MASK(o));
+   return -1;
+}
+
+/*
+ * Point size: gl_PointSize from its VS export (POINT_SIZE_MODE_PSIZE, the
+ * export and component as the linker numbers them; the full width), else
+ * the fixed half width. The sprite coordinates go from MIN to MAX across
+ * the point, T down the framebuffer rows (measured): the upper left origin,
+ * swapped for the lower left one.
+ */
+static void
+emit_point_params(struct grate_context *context, uint32_t **ptrp)
+{
+   const struct pipe_rasterizer_state *rast = context->rast ? &context->rast->base : NULL;
+   int psize = grate_vs_export(context, GRATE_SEMANTIC(TGSI_SEMANTIC_PSIZE, 0));
+   float size = rast ? rast->point_size : 1.0f;
+   bool lower_left = rast && rast->sprite_coord_mode == PIPE_SPRITE_COORD_LOWER_LEFT;
+   uint32_t param = TGR3D_SU_POINT_PARAM_CLIP_MODE(TGR3D_CLIP_MODE_GUARDBAND);
+
+   if (psize >= 0 && (!rast || rast->point_size_per_vertex))
+      param |= TGR3D_SU_POINT_PARAM_VTX_OFFS(psize) |
+               TGR3D_SU_POINT_PARAM_ATTR_COMP(TGR3D_ATTR_COMP_X) |
+               TGR3D_SU_POINT_PARAM_POINT_SIZE_MODE(TGR3D_POINT_SIZE_MODE_PSIZE);
+   else
+      param |= TGR3D_SU_POINT_PARAM_POINT_SIZE_MODE(TGR3D_POINT_SIZE_MODE_FIXED);
+
+   GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_SU_POINT_PARAM, 6));
+   GRATE_PUSHBUF_WORD(*ptrp, param);
+   GRATE_PUSHBUF_WORD(*ptrp, u_bitcast_f2u(MAX2(size, 1.0f) * 0.5f));
+   GRATE_PUSHBUF_WORD(*ptrp, u_bitcast_f2u(1.0f)); /* MAX_S */
+   GRATE_PUSHBUF_WORD(*ptrp, u_bitcast_f2u(lower_left ? 0.0f : 1.0f)); /* MAX_T */
+   GRATE_PUSHBUF_WORD(*ptrp, u_bitcast_f2u(0.0f)); /* MIN_S */
+   GRATE_PUSHBUF_WORD(*ptrp, u_bitcast_f2u(lower_left ? 1.0f : 0.0f)); /* MIN_T */
+}
+
 static void
 emit_viewport(struct grate_context *context, uint32_t **ptrp)
 {
@@ -892,19 +937,15 @@ emit_program(struct grate_context *context, uint32_t **ptrp)
 
    for (int i = 0; i < info->num_links; ++i) {
       /*
-       * Source: the VS output with the same semantic, numbered among the
-       * enabled outputs (the hardware squeezes the export mask: exports
-       * 2, 7, 9 are seen as 0, 1, 2), export 1 if there is none. Bits
-       * 9..14: the TRAM row written, which the fragment MFU reads.
+       * Source: the VS export with the same semantic, export 1 if there is
+       * none (the point coordinate reads any: the position, export 0).
+       * Bits 9..14: the TRAM row written, which the fragment MFU reads.
        */
-      uint32_t src = 1 << 3;
-      for (int o = 0; context->vshader && o < 16; o++)
-         if (context->vshader->output_semantic[o] == info->links[i].semantic) {
-            unsigned squeezed = util_bitcount(context->vshader->output_mask &
-                                              BITFIELD_MASK(o));
-            src = squeezed << 3;
-         }
-      src |= (uint32_t)info->links[i].tram_row << 9;
+      uint32_t src = info->links[i].point ? 0 : 1 << 3;
+      int o = grate_vs_export(context, info->links[i].semantic);
+      if (o >= 0)
+         src = o << 3;
+      src |= (uint32_t)info->links[i].tram_row << 9 | info->links[i].point;
       linker_insts[3 + i * 2] = src;
       linker_insts[3 + i * 2 + 1] = info->links[i].dst;
       /* flat shading: no interpolation of the colour */
@@ -1032,6 +1073,7 @@ grate_emit_state(struct grate_context *context, uint32_t **ptrp)
    emit_guardband(context, ptrp);
    emit_scissor(context, ptrp);
    emit_line_width(context, ptrp);
+   emit_point_params(context, ptrp);
    emit_zsa_state(context, ptrp);
    emit_attribs(context, ptrp);
    emit_vs_uniforms(context, ptrp);

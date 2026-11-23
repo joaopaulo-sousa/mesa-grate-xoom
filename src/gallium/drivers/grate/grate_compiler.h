@@ -153,6 +153,7 @@ struct grate_moved {
  */
 struct grate_fp_link {
    uint32_t dst;           /* per export component: TRAM column and type */
+   uint32_t point;         /* point sprite S/T in place of export components */
    uint16_t semantic;
    uint8_t tram_row;
    uint8_t input;          /* TGSI input */

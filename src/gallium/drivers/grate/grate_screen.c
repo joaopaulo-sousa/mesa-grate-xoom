@@ -285,10 +285,10 @@ grate_screen_init_caps(struct grate_screen *screen)
    caps->max_line_width = 8192.0; // no clue
    caps->max_line_width_aa = 8192.0; // no clue
 
-   caps->min_point_size = 1.0; // no clue
-   caps->min_point_size_aa = 1.0; // no clue
-   caps->max_point_size = 8192.0; // no clue
-   caps->max_point_size_aa = 8192.0; // no clue
+   caps->min_point_size = 1.0;
+   caps->min_point_size_aa = 1.0;
+   caps->max_point_size = GRATE_MAX_POINT_SIZE;
+   caps->max_point_size_aa = GRATE_MAX_POINT_SIZE;
    caps->point_size_granularity = 
    caps->line_width_granularity = 1.0 / 16; // TODO: not a real limit, HW uses floats... but helps caching CSOs
    caps->max_texture_anisotropy = 0; // TODOD: 16.0; // Vendor GL has EXT_texture_filter_anisotropic

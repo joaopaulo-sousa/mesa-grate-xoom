@@ -4,6 +4,7 @@
 #include "util/u_dynarray.h"
 #include "util/u_memory.h"
 
+#include "compiler/nir/nir.h"
 #include "nir/nir_to_tgsi.h"
 
 #include "tgsi/tgsi_dump.h"
@@ -176,6 +177,7 @@ grate_create_vs_state(struct pipe_context *pcontext,
    so->base = *template;
 
    if (template->type == PIPE_SHADER_IR_NIR) {
+      NIR_PASS(_, template->ir.nir, nir_lower_point_size, 1.0f, GRATE_MAX_POINT_SIZE);
       so->base.tokens = nir_to_tgsi(template->ir.nir,
                                     pcontext->screen);
       so->base.type = PIPE_SHADER_IR_TGSI;
