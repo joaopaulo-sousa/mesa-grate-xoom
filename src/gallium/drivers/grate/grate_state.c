@@ -1001,8 +1001,19 @@ emit_textures(struct grate_context *context, uint32_t **ptrp)
                TGR3D_TEX_TEXDESC_HI_HEIGHT(height);
       /* LOD bias, s4.4 (measured: 0x10 = one level): the sampler's plus
        * the shader's constant TXB bias */
-      int bias = context->fshader->info.lod_bias[i] +
+      const struct grate_fp_info *fpinfo = &context->fshader->info;
+      int bias = fpinfo->lod_bias[i] +
                  (sampler ? (int)lroundf(sampler->lod_bias * 16.0f) : 0);
+      if (fpinfo->lod_bias_user_mask & (1u << i)) {
+         const struct pipe_constant_buffer *cb =
+            &context->constant_buffer[MESA_SHADER_FRAGMENT];
+         unsigned u = fpinfo->lod_bias_user[i];
+         float v = cb->user_buffer && u < cb->buffer_size / sizeof(float) ?
+                   ((const float *)cb->user_buffer)[u] : 0.0f;
+         v = CLAMP(v, -16.0f, 16.0f) * 16.0f;
+         bias += (fpinfo->lod_bias_user_neg & (1u << i)) ? -(int)lroundf(v) :
+                                                           (int)lroundf(v);
+      }
       lo |= TGR3D_TEX_TEXDESC_LO_LOD_BIAS(CLAMP(bias, -256, 255) & 0x1ff);
 
       GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_TEX_TEXADDR(i), 1));

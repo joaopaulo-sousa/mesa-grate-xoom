@@ -177,6 +177,10 @@ struct grate_fp_info {
     * TEXDESC LOD_BIAS field is s4.4); lod_bias_mask: samplers with one */
    int16_t lod_bias[16];
    uint16_t lod_bias_mask;
+   /* TXB with a uniform bias: the user float (index * 4 + comp) added to
+    * the descriptor at draw time, negated for the samplers in _neg */
+   uint8_t lod_bias_user[16];
+   uint16_t lod_bias_user_mask, lod_bias_user_neg;
    struct grate_fp_pre pre[GRATE_FP_MAX_PRE];
    int num_pre;
    struct grate_fp_spec spec[GRATE_FP_MAX_SPEC];

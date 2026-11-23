@@ -1141,9 +1141,10 @@ emit_tgsi_instr(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
 
    case TGSI_OPCODE_TXB: {
       /*
-       * The bias goes into the sampler's texture descriptor (constant
-       * biases, as the NVIDIA guide recommends); the TEX instruction can
-       * also read one per pixel from the row registers, not done yet.
+       * The bias goes into the sampler's texture descriptor: a constant
+       * one at compile time (as the NVIDIA guide recommends), a uniform
+       * one at draw time. The TEX instruction can also read one per pixel
+       * from the row registers, not done yet.
        */
       struct fp_opnd b = fp_src(c, &inst->Src[0].Register, 3);
       unsigned smp = inst->Src[1].Register.Index;
@@ -1157,6 +1158,22 @@ emit_tgsi_instr(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
          }
          info->lod_bias[smp] = bias;
          info->lod_bias_mask |= 1u << smp;
+      } else if (smp < 16 && b.kind == FP_OPND_UNIFORM && !b.absolute &&
+                 BITSET_TEST(c->fp->info.user_mask, b.index)) {
+         /* a uniform: known at draw time (grate_state.c emit_textures) */
+         struct grate_fp_info *info = &c->fp->info;
+         unsigned user = info->user_index[b.index];
+         bool neg = b.negate;
+         if ((info->lod_bias_user_mask & (1u << smp)) &&
+             (info->lod_bias_user[smp] != user ||
+              !!(info->lod_bias_user_neg & (1u << smp)) != neg)) {
+            fp_fail(c, "different LOD biases on one sampler");
+            break;
+         }
+         info->lod_bias_user[smp] = user;
+         info->lod_bias_user_mask |= 1u << smp;
+         if (neg)
+            info->lod_bias_user_neg |= 1u << smp;
       } else {
          static bool warned;
          if (!warned) {
@@ -2207,6 +2224,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    fp->info.sampler_mask = 0;
    fp->info.varying_trunc = false;
    fp->info.lod_bias_mask = 0;
+   fp->info.lod_bias_user_mask = fp->info.lod_bias_user_neg = 0;
    memset(fp->info.lod_bias, 0, sizeof(fp->info.lod_bias));
    fp->info.num_pre = 0;
    fp->info.num_flow = 0;
