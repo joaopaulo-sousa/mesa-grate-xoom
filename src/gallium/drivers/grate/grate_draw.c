@@ -431,7 +431,7 @@ grate_draw_range(struct grate_context *context, const struct pipe_draw_info *inf
     * uploading.
     */
    grate_init_state(context, &ptr);
-   grate_emit_state(context, &ptr);
+   grate_emit_state(context, &ptr, info->mode);
 
    uint16_t out_mask = context->vshader->output_mask;
    GRATE_PUSHBUF_WORD(ptr, host1x_opcode_incr(REG_TGR3D_IDX_ATTR_MASK, 1));

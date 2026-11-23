@@ -43,7 +43,7 @@ struct grate_vertex_state {
 };
 
 void
-grate_emit_state(struct grate_context *context, uint32_t **ptrp);
+grate_emit_state(struct grate_context *context, uint32_t **ptrp, enum mesa_prim mode);
 
 void
 grate_context_state_init(struct pipe_context *pcontext);

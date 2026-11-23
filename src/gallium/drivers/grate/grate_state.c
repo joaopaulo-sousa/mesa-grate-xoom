@@ -788,6 +788,35 @@ emit_point_params(struct grate_context *context, uint32_t **ptrp)
    GRATE_PUSHBUF_WORD(*ptrp, u_bitcast_f2u(lower_left ? 1.0f : 0.0f)); /* MIN_T */
 }
 
+/*
+ * Polygon offset (measured, gpu/dev/zbiastest.sh): the setup unit adds
+ * ZFACTOR (a float) times max(|dz/dx|, |dz/dy|) in window depth per pixel,
+ * plus ZBIAS, a signed 22-bit count of 2^-20, the rasterizer's depth step.
+ * The minimum resolvable difference r of the units is the depth plane's
+ * step, the coarsest one (2^-14, depth below 0.5) for Z16NL. Polygons only,
+ * not lines and points.
+ */
+static void
+emit_depth_offset(struct grate_context *context, uint32_t **ptrp, enum mesa_prim mode)
+{
+   const struct pipe_rasterizer_state *rast = context->rast ? &context->rast->base : NULL;
+   const struct pipe_surface *zs = &context->framebuffer.base.zsbuf;
+   uint32_t bias = 0;
+   float factor = 0.0f;
+
+   if (rast && rast->offset_tri && zs->texture &&
+       u_reduced_prim(mode) == MESA_PRIM_TRIANGLES) {
+      int r = grate_pixel_format(zs->format) == TGR3D_SURF_FORMAT_Z16NL ? 64 : 16;
+      long units = lroundf(rast->offset_units * r);
+      bias = CLAMP(units, -(1 << 21), (1 << 21) - 1) & TGR3D_SU_ZBIAS_VAL__MASK;
+      factor = rast->offset_scale;
+   }
+
+   GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_SU_ZBIAS, 2));
+   GRATE_PUSHBUF_WORD(*ptrp, bias);
+   GRATE_PUSHBUF_WORD(*ptrp, u_bitcast_f2u(factor));
+}
+
 static void
 emit_viewport(struct grate_context *context, uint32_t **ptrp)
 {
@@ -1066,7 +1095,7 @@ emit_textures(struct grate_context *context, uint32_t **ptrp)
 }
 
 void
-grate_emit_state(struct grate_context *context, uint32_t **ptrp)
+grate_emit_state(struct grate_context *context, uint32_t **ptrp, enum mesa_prim mode)
 {
    emit_render_targets(context, ptrp);
    emit_viewport(context, ptrp);
@@ -1074,6 +1103,7 @@ grate_emit_state(struct grate_context *context, uint32_t **ptrp)
    emit_scissor(context, ptrp);
    emit_line_width(context, ptrp);
    emit_point_params(context, ptrp);
+   emit_depth_offset(context, ptrp, mode);
    emit_zsa_state(context, ptrp);
    emit_attribs(context, ptrp);
    emit_vs_uniforms(context, ptrp);
