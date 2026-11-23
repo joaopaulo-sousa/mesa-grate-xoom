@@ -89,6 +89,9 @@ struct vp_src_operand {
    int index;
    enum vp_swz swizzle[4];
    bool negate, absolute;
+   /* constant fetched relative to address register A0 component rel - 1
+    * (ARL), 0: absolute */
+   int rel;
 };
 
 /* condition register 0 states a written component may be tested for */

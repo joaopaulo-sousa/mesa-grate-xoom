@@ -209,8 +209,9 @@ tgsi_dst_to_vp(struct grate_vp_shader *vp, const struct tgsi_dst_register *dst, 
 }
 
 static struct vp_src_operand
-tgsi_src_to_vp(struct grate_vp_shader *vp, const struct tgsi_src_register *src)
+tgsi_src_to_vp(struct grate_vp_shader *vp, const struct tgsi_full_src_register *full)
 {
+   const struct tgsi_src_register *src = &full->Register;
    enum vp_swz swizzle[4] = {
       src->SwizzleX,
       src->SwizzleY,
@@ -224,8 +225,15 @@ tgsi_src_to_vp(struct grate_vp_shader *vp, const struct tgsi_src_register *src)
    case TGSI_FILE_INPUT:
       return attrib(src->Index, swizzle, negate, absolute);
 
-   case TGSI_FILE_CONSTANT:
-      return uniform(src->Index, swizzle, negate, absolute);
+   case TGSI_FILE_CONSTANT: {
+      struct vp_src_operand u = uniform(src->Index, swizzle, negate, absolute);
+      /* CONST[ADDR[0].c + index]: the fetch adds A0.c (ARL) */
+      if (src->Indirect) {
+         assert(full->Indirect.File == TGSI_FILE_ADDRESS && full->Indirect.Index == 0);
+         u.rel = full->Indirect.Swizzle + 1;
+      }
+      return u;
+   }
 
    case TGSI_FILE_TEMPORARY:
       return src_temp(src->Index, swizzle, negate, absolute);
@@ -374,7 +382,7 @@ tgsi_flow_to_vp(struct grate_vp_shader *vp, struct vp_flow *flow,
    switch (opcode) {
    case TGSI_OPCODE_IF:
    case TGSI_OPCODE_UIF: {
-      struct vp_src_operand c = tgsi_src_to_vp(vp, &inst->Src[0].Register);
+      struct vp_src_operand c = tgsi_src_to_vp(vp, &inst->Src[0]);
       struct vp_vec_instr set = emit_vec(VP_VEC_OP_MOV, dst_temp(VP_SCRATCH0, 0x1, false),
                                          c, src_undef(), src_undef());
       set.cond_set = true;
@@ -446,8 +454,10 @@ vp_fetch_once(struct grate_vp_shader *vp, struct vp_src_operand *src, int num)
                    src[i].file == VP_SRC_FILE_UNIFORM ? &constant : NULL;
       if (!fetch)
          continue;
-      if (*fetch < 0 || *fetch == src[i].index) {
-         *fetch = src[i].index;
+      /* a relative constant fetch differs from the absolute one */
+      int key = src[i].index + 4096 * src[i].rel;
+      if (*fetch < 0 || *fetch == key) {
+         *fetch = key;
          continue;
       }
       emit_packed(vp, emit_vec(VP_VEC_OP_MOV, dst_temp(temp, 0xf, false), src[i],
@@ -465,12 +475,27 @@ tgsi_to_vp(struct grate_vp_shader *vp, struct vp_flow *flow,
    if (tgsi_flow_to_vp(vp, flow, inst))
       return true;
 
+   if (opcode == TGSI_OPCODE_ARL) {
+      /*
+       * A0 = floor(src) for the written ADDR[0] components; the vector
+       * destination register is left alone but must be even
+       */
+      const struct tgsi_dst_register *a = &inst->Dst[0].Register;
+      if (a->File != TGSI_FILE_ADDRESS || a->Index != 0)
+         return false;
+      struct vp_src_operand s = tgsi_src_to_vp(vp, &inst->Src[0]);
+      emit_packed(vp, emit_vec(VP_VEC_OP_ARL, dst_temp(VP_SCRATCH1, a->WriteMask, false),
+                               s, src_undef(), src_undef()),
+                  emit_sNOP());
+      return true;
+   }
+
    bool saturate = inst->Instruction.Saturate != 0;
    struct vp_dst_operand dst = tgsi_dst_to_vp(vp, &inst->Dst[0].Register, saturate);
    struct vp_src_operand src[3];
 
    for (unsigned i = 0; i < inst->Instruction.NumSrcRegs && i < 3; i++)
-      src[i] = tgsi_src_to_vp(vp, &inst->Src[i].Register);
+      src[i] = tgsi_src_to_vp(vp, &inst->Src[i]);
    vp_fetch_once(vp, src, MIN2(inst->Instruction.NumSrcRegs, 3));
 
    if (vp_direct_ops[opcode].num_src) {

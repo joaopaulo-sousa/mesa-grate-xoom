@@ -100,8 +100,10 @@ grate_vp_pack(uint32_t *dst, struct vp_instr *instr, bool end_of_program)
    /* find the attribute/uniform fetch-values, and zero out the index
     * for these registers.
     */
-   int attr_fetch = -1, uniform_fetch = -1;
+   int attr_fetch = -1, uniform_fetch = -1, uniform_rel = 0;
    for (int i = 0; i < 3; ++i) {
+      if (instr->vec.src[i].file == VP_SRC_FILE_UNIFORM && instr->vec.src[i].rel)
+         uniform_rel = instr->vec.src[i].rel;
       switch (instr->vec.src[i].file) {
       case VP_SRC_FILE_ATTRIB:
          assert(attr_fetch < 0 ||
@@ -142,6 +144,13 @@ grate_vp_pack(uint32_t *dst, struct vp_instr *instr, bool end_of_program)
 
    }
 
+   if (instr->scalar.src.file == VP_SRC_FILE_UNIFORM && instr->scalar.src.rel)
+      uniform_rel = instr->scalar.src.rel;
+   /* fetched constant index = A0.c + uniform fetch index */
+   if (uniform_rel) {
+      tmp.constant_relative_addressing_enable = 1;
+      tmp.address_register_select = uniform_rel - 1;
+   }
    tmp.attribute_fetch_index = attr_fetch >= 0 ? attr_fetch : 0;
    tmp.uniform_fetch_index = uniform_fetch >= 0 ? uniform_fetch : 0;
 
