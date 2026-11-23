@@ -216,7 +216,11 @@ struct fp_compiler {
 
    /* SFU units or dependent texture reads: a sequential program */
    bool seq;
-   int out_pair;           /* colour register pair: 1 = r2/r3, 0 = r0/r1 */
+   int out_pair;           /* colour register pair: 1 = r2/r3, 0 = r0/r1 (of
+                              the last row) */
+   int seq_rows;           /* pixel packet rows of a sequential program (1..4):
+                              EXEC e works on row e % seq_rows (sched_seq.c) */
+   struct seq_readers *seq_readers;   /* sched_seq.c, while it runs */
    struct fp_seq_exec seq_exec[FP_SEQ_MAX_EXECS];
 
    int packet_exec[FP_MAX_PACKETS];

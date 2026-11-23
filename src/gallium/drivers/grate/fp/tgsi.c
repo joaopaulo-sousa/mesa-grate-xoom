@@ -1457,11 +1457,33 @@ fp_opnd_equal(const struct fp_opnd *a, const struct fp_opnd *b)
           a->minus_one == b->minus_one;
 }
 
+/* What an SFU unit works on: through the copy that gives it a register */
+static const struct fp_opnd *
+fp_cse_sfu_source(const struct fp_compiler *c, const struct fp_unit *u)
+{
+   const struct fp_opnd *x = &u->slots[0].src[0];
+   if (x->kind == FP_OPND_VALUE && c->units[x->index].sfu_copy)
+      return &c->units[x->index].slots[0].src[0];
+   return x;
+}
+
+/* Whether a texture fetch reads unit i as a coordinate */
+static bool
+fp_cse_tex_reads(const struct fp_compiler *c, int i)
+{
+   for (int n = 0; n < c->num_tex; n++)
+      for (int k = 0; k < c->tex[n].num_coords; k++)
+         if (c->tex[n].coord[k].kind == FP_OPND_VALUE && c->tex[n].coord[k].index == i)
+            return true;
+   return false;
+}
+
 /*
  * Common subexpressions: a plain value unit identical to an earlier one
- * (TGSI repeats the same operation per channel for replicated scalars)
- * hands its readers to the earlier one. In unit order, so whole chains
- * collapse; fp_dead_code then drops the copies.
+ * (TGSI repeats the same operation per channel for replicated scalars), or
+ * an SFU unit with the same function of the same value, hands its readers
+ * to the earlier one. In unit order, so whole chains collapse;
+ * fp_dead_code then drops the copies.
  */
 static void
 fp_cse(struct fp_compiler *c)
@@ -1476,6 +1498,26 @@ fp_cse(struct fp_compiler *c)
          struct fp_opnd *o = &u->slots[k].src[j];
          if (o->kind == FP_OPND_VALUE)
             o->index = remap[o->index];
+      }
+      if (u->sfu && u->output_chan < 0) {
+         /* the same function of the same value (scalar TGSI ops replicated,
+          * rcp of an int divisor per channel): once. Not for texture
+          * coordinates: s and t take a register each, even when equal */
+         if (fp_cse_tex_reads(c, i))
+            continue;
+         const struct fp_opnd *x = fp_cse_sfu_source(c, u);
+         for (int p = 0; p < i; p++) {
+            struct fp_unit *q = &c->units[p];
+            if (remap[p] == p && q->sfu == u->sfu && q->output_chan < 0 &&
+                !fp_cse_tex_reads(c, p) &&
+                (fp_cse_sfu_source(c, q) == &q->slots[0].src[0]) ==
+                   (x == &u->slots[0].src[0]) &&
+                fp_opnd_equal(fp_cse_sfu_source(c, q), x)) {
+               remap[i] = p;
+               break;
+            }
+         }
+         continue;
       }
       if (!fp_unit_has_value(u) || u->num_slots != 1 || u->sfu || u->sfu_copy)
          continue;
@@ -2366,7 +2408,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
       fp_emit_rows(c);
    fp_embed_constants(fp);
    fp_build_links(c);
-   fp->info.num_rows = c->seq ? 1 : c->num_execs;
+   fp->info.num_rows = c->seq ? MAX2(c->seq_rows, 1) : c->num_execs;
    fp->info.failed = c->failed;
    FREE(c);
 }
