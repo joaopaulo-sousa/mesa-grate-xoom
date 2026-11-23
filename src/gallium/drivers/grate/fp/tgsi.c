@@ -2361,6 +2361,9 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
     * instructions (16 EXECs instead of 4): fall back to the latter when the
     * former run out of packets.
     */
+   /* GRATE_FP_SEQ=1: sequential programs only (to try them out) */
+   if (getenv("GRATE_FP_SEQ") && atoi(getenv("GRATE_FP_SEQ")))
+      c->seq = true;
    if (!c->failed && !c->seq && !fp_sched_rows(c))
       c->seq = true;
    for (int n = 0; n < c->num_tex && !c->failed && c->seq; n++)

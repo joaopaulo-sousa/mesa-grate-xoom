@@ -172,18 +172,20 @@ seq_reg_ready(struct fp_compiler *c, struct seq_state *s,
 
    if (o->kind == FP_OPND_INPUT) {
       int f = s->fetch_exec[o->index][o->comp];
-      /* more rows: the SFU of a later round, on the row it went to */
-      return f >= 0 && (rows == 1 ? f <= e : f + rows <= e && (e - f) % rows == 0);
+      /* more rows: the SFU of a later round, on the row it went to; a TEX
+       * of the EXEC that interpolated (as in multi-row programs) too */
+      return f >= 0 && (rows == 1 ? f <= e :
+                        (same_exec_sfu && f == e) || (f + rows <= e && (e - f) % rows == 0));
    }
    if (o->kind != FP_OPND_VALUE)
       return false;
    struct fp_unit *d = &c->units[o->index];
    if (d->exec < 0)
       return false;
-   if (!seq_is_alu(d) && same_exec_sfu)
-      return d->exec <= e;
    if (rows == 1)
-      return d->exec < e;
+      return d->exec < e || (!seq_is_alu(d) && same_exec_sfu && d->exec == e);
+   if (!seq_is_alu(d) && same_exec_sfu && d->exec == e)
+      return true;
    /* more rows (measured, asmtri exp-wrap5): the MFU of EXEC e sees an
     * ALU write of EXEC k from k + rows on; an SFU result stays on its row */
    return d->exec + rows <= e && (seq_is_alu(d) || (e - d->exec) % rows == 0);
@@ -342,7 +344,8 @@ seq_half_needed(struct fp_compiler *c, enum seq_item_kind kind, int a,
             continue;
          int h = fp_output_half(o->comp);
          int pair = kind == SEQ_TEXEL ? 1 - c->tex[a].pair : c->dst_pair;
-         if (2 * pair + h / 2 == reg && h % 2 == high)
+         int base = 4 * SEQ_ROW(c, kind == SEQ_TEXEL ? c->tex[a].exec : c->dst_exec);
+         if (base + 2 * pair + h / 2 == reg && h % 2 == high)
             return true;
       }
    }
@@ -541,6 +544,15 @@ seq_fetch_inputs(struct fp_compiler *c, struct seq_state *s,
                   total++;
                }
             }
+      for (int n = 0; n < c->num_tex; n++)
+         if (c->tex[n].live)
+            for (int k = 0; k < c->tex[n].num_coords; k++) {
+               struct fp_opnd *o = &c->tex[n].coord[k];
+               if (o->kind == FP_OPND_INPUT && !used[o->index][o->comp]) {
+                  used[o->index][o->comp] = true;
+                  total++;
+               }
+            }
       cap = DIV_ROUND_UP(total, c->seq_rows);
    }
    int fetched = 0;
@@ -583,8 +595,10 @@ seq_fetch_inputs(struct fp_compiler *c, struct seq_state *s,
       for (int k = 0; k < n; k++) {
          struct fp_opnd *o = ops[k];
          int comp = o->comp;
+         /* (texture coordinates go together, to one pair: not capped) */
          if (o->kind != FP_OPND_INPUT || s->fetch_exec[o->index][comp] >= 0 ||
-             live + 2 > limit || fetched == cap)
+             live + 2 > limit ||
+             (fetched >= cap && !seq_is_coord(c, o->index, comp)))
             continue;
          int r = seq_fetch_reg(c, owner, x, o->index, comp, e);
          if (r < 0)
@@ -665,7 +679,7 @@ seq_unit_ready(struct fp_compiler *c, struct seq_state *s,
          continue;
       fp_unit_foreach_src(r, k, j) {
          struct fp_opnd *o = &r->slots[k].src[j];
-         if (o->kind == FP_OPND_INPUT && o->comp == reg &&
+         if (o->kind == FP_OPND_INPUT && o->comp == reg % 4 &&
              s->fetch_exec[o->index][o->comp] < 0 &&
              seq_is_coord(c, o->index, o->comp))
             return false;
@@ -811,13 +825,15 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
             if (!u->live || u->exec >= 0 || !seq_reads_dst(u) ||
                 !seq_others_ready(c, s, u, e, FP_OPND_DST))
                continue;
+            int base = 4 * SEQ_ROW(c, e);   /* row-relative */
             for (int p = 0; p < 2; p++) {
-               if (!seq_fixed_free(c, &owner[2 * p], e) ||
-                   !seq_fixed_free(c, &owner[2 * p + 1], e))
+               if (!seq_fixed_free(c, &owner[base + 2 * p], e) ||
+                   !seq_fixed_free(c, &owner[base + 2 * p + 1], e))
                   continue;
-               s->dst_exec = e;
+               s->dst_exec = c->dst_exec = e;
                c->dst_pair = p;
-               owner[2 * p] = owner[2 * p + 1] = (struct seq_owner) { SEQ_DST, 0, 0 };
+               owner[base + 2 * p] = owner[base + 2 * p + 1] =
+                  (struct seq_owner) { SEQ_DST, 0, 0 };
                x->pseq = true;
                progress = true;
                break;
@@ -838,24 +854,29 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
              seq_live_items(c, owner, e - 1) + 4 -
                 2 * (c->tex[n].num_coords - 2) > limit)
             continue;
+         /* the TEX works on the pairs of its EXEC's row */
+         int base = 4 * SEQ_ROW(c, e);
          for (int p = 0; p < 2; p++) {
             struct fp_opnd *s0 = &c->tex[n].coord[0], *s1 = &c->tex[n].coord[1];
-            if ((s0->kind == FP_OPND_INPUT && s0->comp != 2 * p) ||
-                (s1->kind == FP_OPND_INPUT && s1->comp != 2 * p + 1))
+            if ((s0->kind == FP_OPND_INPUT &&
+                 s->fetch_reg[s0->index][s0->comp] != base + 2 * p) ||
+                (s1->kind == FP_OPND_INPUT &&
+                 s->fetch_reg[s1->index][s1->comp] != base + 2 * p + 1))
                continue;
             int q = 1 - p;
-            if (!seq_fixed_free(c, &owner[2 * q], e) ||
-                !seq_fixed_free(c, &owner[2 * q + 1], e))
+            if (!seq_fixed_free(c, &owner[base + 2 * q], e) ||
+                !seq_fixed_free(c, &owner[base + 2 * q + 1], e))
                continue;
             /* computed coordinates go to pair p: no fixed item may be there */
-            if ((s0->kind == FP_OPND_VALUE && owner[2 * p].kind != SEQ_NONE &&
-                 !seq_fixed_free(c, &owner[2 * p], e)) ||
-                (s1->kind == FP_OPND_VALUE && owner[2 * p + 1].kind != SEQ_NONE &&
-                 !seq_fixed_free(c, &owner[2 * p + 1], e)))
+            if ((s0->kind == FP_OPND_VALUE && owner[base + 2 * p].kind != SEQ_NONE &&
+                 !seq_fixed_free(c, &owner[base + 2 * p], e)) ||
+                (s1->kind == FP_OPND_VALUE && owner[base + 2 * p + 1].kind != SEQ_NONE &&
+                 !seq_fixed_free(c, &owner[base + 2 * p + 1], e)))
                continue;
             c->tex[n].exec = e;
             c->tex[n].pair = p;
-            owner[2 * q] = owner[2 * q + 1] = (struct seq_owner) { SEQ_TEXEL, n, 0 };
+            owner[base + 2 * q] = owner[base + 2 * q + 1] =
+               (struct seq_owner) { SEQ_TEXEL, n, 0 };
             x->tex = n;
             x->cube_mfu = fp_tex_coord(c, n, FP_TEX_R) >= 0;
             remaining--;
@@ -915,8 +936,9 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
          progress = true;
       }
 
-      /* nothing at all happened: the limit or a missing rule blocks it */
-      if (!progress && ++idle > 1) {
+      /* nothing at all happened: the limit or a missing rule blocks it
+       * (more rows: an SFU may wait that many EXECs for its operand) */
+      if (!progress && ++idle > c->seq_rows) {
          if (grate_debug & GRATE_DEBUG_TGSI) {
             fprintf(stderr, "GRATE FRAG: stuck at EXEC %d, live %d:", e,
                     seq_live_items(c, owner, e));
@@ -1068,15 +1090,17 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
       if (!c->tex[n].live)
          continue;
       int q = 1 - c->tex[n].pair, t = SEQ_T(c->tex[n].exec, T_TEX);
+      int base = 4 * SEQ_ROW(c, c->tex[n].exec);
       for (int h = 0; h < 4; h++) {
-         items[num] = (struct seq_item) { .def = t, .last = t, .reg = 2 * q + h / 2, .half = h % 2, .row = -1 };
+         items[num] = (struct seq_item) { .def = t, .last = t, .reg = base + 2 * q + h / 2, .half = h % 2, .row = -1 };
          texel_item[n][h] = num++;
       }
    }
    if (c->dst_used) {
       int q = c->dst_pair, t = SEQ_T(s->dst_exec, T_PSEQ);
+      int base = 4 * SEQ_ROW(c, s->dst_exec);
       for (int h = 0; h < 4; h++) {
-         items[num] = (struct seq_item) { .def = t, .last = t, .reg = 2 * q + h / 2, .half = h % 2, .row = -1 };
+         items[num] = (struct seq_item) { .def = t, .last = t, .reg = base + 2 * q + h / 2, .half = h % 2, .row = -1 };
          dst_item[h] = num++;
       }
    }
@@ -1118,7 +1142,8 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
           * fp20 values; a cube map's r (by the MFU) and a bias from the
           * texel pair, 2q and 2q+1, before the texel lands there */
          int role = c->tex[n].role[k];
-         int want = role < FP_TEX_R ? 2 * p + role : 2 * (1 - p) + (role - FP_TEX_R);
+         int want = 4 * SEQ_ROW(c, c->tex[n].exec) +
+                    (role < FP_TEX_R ? 2 * p + role : 2 * (1 - p) + (role - FP_TEX_R));
          SEQ_READ(it, SEQ_T(c->tex[n].exec, T_TEX) - (role >= FP_TEX_R));
          if (items[it].reg >= 0 && items[it].reg != want)
             return false;
@@ -1262,16 +1287,17 @@ seq_try(struct fp_compiler *c, int step)
 /*
  * Rows of a sequential program (measured, gpu/tools/asmtri/README.md "Long
  * multi-row programs"): more than one gives 4 registers more each, at the
- * cost of pixels in flight. Texture fetches and destination loads with more
- * rows are not measured yet: those programs keep one.
+ * cost of pixels in flight. The TEX and the PSEQ load of EXEC e work on the
+ * pairs of row e % rows, as in multi-row programs (fstest and dEQP texture,
+ * blend and depth_stencil with every program on 1 and on 3 rows,
+ * GRATE_FP_SEQ / GRATE_FP_SEQ_ROWS: the same pixels). Cube maps keep one
+ * row: their MFU coordinate setup uses absolute registers.
  */
 static bool
 seq_rows_ok(struct fp_compiler *c)
 {
-   if (c->dst_used)
-      return false;
    for (int n = 0; n < c->num_tex; n++)
-      if (c->tex[n].live)
+      if (c->tex[n].live && fp_tex_coord(c, n, FP_TEX_R) >= 0)
          return false;
    return true;
 }
@@ -1283,8 +1309,10 @@ static bool
 seq_sched_rows(struct fp_compiler *c)
 {
    bool fx10_ok = !getenv("GRATE_FP_FX10") || atoi(getenv("GRATE_FP_FX10"));
+   /* GRATE_FP_SEQ_ROWS: at least that many rows (to try them out) */
+   int min_rows = getenv("GRATE_FP_SEQ_ROWS") ? CLAMP(atoi(getenv("GRATE_FP_SEQ_ROWS")), 1, 4) : 1;
 
-   for (c->seq_rows = 1; c->seq_rows <= 4; c->seq_rows++) {
+   for (c->seq_rows = min_rows; c->seq_rows <= 4; c->seq_rows++) {
       if (c->seq_rows > 1 && !seq_rows_ok(c))
          break;
       for (int i = 0; i < c->num_units; i++)
@@ -1346,7 +1374,8 @@ seq_resolve(struct fp_compiler *c, const struct fp_opnd *o, int e, int p)
    case FP_OPND_TEXEL:
    case FP_OPND_DST: {
       int pair = o->kind == FP_OPND_TEXEL ? 1 - c->tex[o->index].pair : c->dst_pair;
-      ret = fp_alu_src_row(2 * pair + fp_output_half(o->comp) / 2);
+      int exec = o->kind == FP_OPND_TEXEL ? c->tex[o->index].exec : c->dst_exec;
+      ret = fp_alu_src_row(4 * SEQ_ROW(c, exec) + 2 * pair + fp_output_half(o->comp) / 2);
       ret.datatype = FP_DATATYPE_FIXED10;
       ret.sub_reg_select_high = fp_output_half(o->comp) % 2;
       break;
