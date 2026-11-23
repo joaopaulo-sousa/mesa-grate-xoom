@@ -279,8 +279,15 @@ grate_pixel_format(enum pipe_format format)
    case PIPE_FORMAT_R4G4B4A4_UNORM:
       return TGR3D_SURF_FORMAT_B4G4R4A4;
    case PIPE_FORMAT_Z16_UNORM:
-   case PIPE_FORMAT_Z24_UNORM_S8_UINT:   /* the depth plane, see stencil */
       return TGR3D_SURF_FORMAT_Z16;
+   /*
+    * The depth plane (see stencil): the depth unit writes 16 bits, so a
+    * 24-bit request gets the nonlinear 16-bit encoding (grate_pack_z16nl),
+    * which keeps its precision near the far plane, where perspective puts
+    * most of a scene.
+    */
+   case PIPE_FORMAT_Z24_UNORM_S8_UINT:
+      return TGR3D_SURF_FORMAT_Z16NL;
    case PIPE_FORMAT_B8G8R8A8_UNORM:
    case PIPE_FORMAT_B8G8R8X8_UNORM:
       return TGR3D_SURF_FORMAT_R8G8B8A8;
@@ -802,6 +809,28 @@ fill(struct grate_stream *stream, uint32_t **ptrp,
    *ptrp = ptr;
 }
 
+/*
+ * Depth z in the Z16NL encoding (measured, gpu/dev/znltest.sh): the top
+ * three bits e, the low 13 m. For e = 0..6 the values step evenly through
+ * [1 - 2^-e, 1 - 2^-(e+1)], for e = 7 through [1 - 2^-7, 1].
+ */
+static uint16_t
+grate_pack_z16nl(double z)
+{
+   if (!(z > 0.0))
+      return 0;
+   if (z >= 1.0)
+      return 0xffff;
+
+   unsigned e = 0;
+   while (e < 7 && z >= 1.0 - ldexp(1.0, -(int)(e + 1)))
+      e++;
+   double start = 1.0 - ldexp(1.0, -(int)e);
+   double width = e < 7 ? ldexp(1.0, -(int)(e + 1)) : ldexp(1.0, -7);
+   unsigned v = (e << 13) + (unsigned)lround((z - start) / width * 8192.0);
+   return MIN2(v, 0xffff);
+}
+
 /* Clear the depth and/or stencil of a depth/stencil surface, plane by plane */
 static void
 fill_zs(struct grate_stream *stream, uint32_t **ptrp, struct pipe_surface *dst,
@@ -815,7 +844,7 @@ fill_zs(struct grate_stream *stream, uint32_t **ptrp, struct pipe_surface *dst,
 
    if (res->stencil) {
       if (clear_depth)
-         fill(stream, ptrp, res, dst->level, dst->first_layer, util_pack_z(PIPE_FORMAT_Z16_UNORM, depth), 2,
+         fill(stream, ptrp, res, dst->level, dst->first_layer, grate_pack_z16nl(depth), 2,
               x, y, width, height);
       if (clear_stencil)
          fill(stream, ptrp, res->stencil, dst->level, dst->first_layer, stencil, 1, x, y, width, height);
