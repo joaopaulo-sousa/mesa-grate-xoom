@@ -194,6 +194,10 @@ struct fp_compiler {
     * components 2*pair, +1 */
    struct {
       struct fp_opnd coord[2];
+   /* cube map: R is coordinate 2 of the same varying, interpolated into the
+    * first register of the other pair, which the TEX reads as R before it
+    * writes the texel there */
+   bool cube;
       int input;
       int pair;            /* register pair of the coordinates */
       int sampler;

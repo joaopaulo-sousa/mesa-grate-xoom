@@ -737,10 +737,19 @@ emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
    struct fp_opnd s = fp_src(c, &inst->Src[0].Register, 0);
    struct fp_opnd t = fp_src(c, &inst->Src[0].Register, 1);
 
+   bool cube = inst->Texture.Texture == TGSI_TEXTURE_CUBE;
    if (inst->Texture.Texture != TGSI_TEXTURE_2D &&
-       inst->Texture.Texture != TGSI_TEXTURE_RECT) {
-      fp_fail(c, "only 2D textures are supported");
+       inst->Texture.Texture != TGSI_TEXTURE_RECT && !cube) {
+      fp_fail(c, "only 2D and cube textures are supported");
       return;
+   }
+   if (cube) {
+      struct fp_opnd r = fp_src(c, &inst->Src[0].Register, 2);
+      if (!fp_tex_varying(&s, &t) || r.kind != FP_OPND_INPUT || r.index != s.index ||
+          r.negate || r.absolute || s.comp != 0 || t.comp != 1 || r.comp != 2) {
+         fp_fail(c, "cube map coordinates other than a varying .xyz");
+         return;
+      }
    }
    if (c->num_tex == FP_MAX_TEXTURES) {
       fp_fail(c, "too many texture fetches");
@@ -750,9 +759,9 @@ emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
    /* repeat of a non-power-of-two texture: wrapped here, the TEX unit
     * does not (grate_npot_repeat) */
    unsigned smp = inst->Src[1].Register.Index;
-   if (c->key && smp < 8 && (c->key->npot_s & (1u << smp)))
+   if (!cube && c->key && smp < 8 && (c->key->npot_s & (1u << smp)))
       s = fp_sfu(c, FP_SFU_OP_FRC, s);
-   if (c->key && smp < 8 && (c->key->npot_t & (1u << smp)))
+   if (!cube && c->key && smp < 8 && (c->key->npot_t & (1u << smp)))
       t = fp_sfu(c, FP_SFU_OP_FRC, t);
 
    /* coordinates other than two varying components (a dependent read)
@@ -781,6 +790,7 @@ emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
    /* the pair of the components, when they are .xy or .zw */
    c->tex[n].pair = varying && !(s.comp & 1) && t.comp == s.comp + 1 ? s.comp / 2 : 0;
    c->tex[n].sampler = inst->Src[1].Register.Index;
+   c->tex[n].cube = cube;
    c->tex[n].exec = -1;
    c->tex[n].live = false;
 
@@ -2237,6 +2247,9 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
     */
    if (!c->failed && !c->seq && !fp_sched_rows(c))
       c->seq = true;
+   for (int n = 0; n < c->num_tex && !c->failed && c->seq; n++)
+      if (c->tex[n].live && c->tex[n].cube)
+         fp_fail(c, "cube maps in a sequential program");
    if (!c->failed && c->seq) {
       /* and the sum it adds may take in a multiply, as when written so */
       fp_expand_blend_inv(c);

@@ -944,6 +944,8 @@ emit_textures(struct grate_context *context, uint32_t **ptrp)
 
       lo = TGR3D_TEX_TEXDESC_LO_SURF_FORMAT(res->format) |
            TGR3D_TEX_TEXDESC_LO_LAYOUT(TGR3D_LAYOUT_LINEAR);
+      if (view->target == PIPE_TEXTURE_CUBE)
+         lo |= TGR3D_TEX_TEXDESC_LO_CUBEMAP;
       /* compressed (DXT, ETC1): libgrate's COMPRESSED bit */
       if (util_format_is_compressed(view->format))
          lo |= TGR3D_TEX_TEXDESC_LO_LAYOUT(TGR3D_LAYOUT_SWIZZLED);
