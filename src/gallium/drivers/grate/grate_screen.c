@@ -564,6 +564,9 @@ static const nir_shader_compiler_options grate_base_compiler_options = {
    .force_indirect_unrolling_sampler = true,
    .max_unroll_iterations = 32,
     */
+   /* no integers: nir_lower_int_to_float has no float form of the bit
+    * operations nir_opt_algebraic makes (imul by 2^n -> ishl), as i915 */
+   .lower_bitops = true,
    .lower_fdiv = true,
    .no_integers = true,
 };
