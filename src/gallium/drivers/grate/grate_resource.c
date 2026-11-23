@@ -265,12 +265,19 @@ grate_pixel_format(enum pipe_format format)
       return TGR3D_SURF_FORMAT_S8;
     case PIPE_FORMAT_L8A8_UNORM:
       return TGR3D_SURF_FORMAT_L8A8;
+   /*
+    * The 16-bit surface names have red and blue the other way round from
+    * the gallium ones, as the 8888 ones below (measured: a draw into each,
+    * gratetest GRATETEST_RTFMT). B5G6R5 is sampled through a swizzle
+    * (grate_sampler_channel); not rendered into.
+    */
+   case PIPE_FORMAT_R5G6B5_UNORM:
    case PIPE_FORMAT_B5G6R5_UNORM:
       return TGR3D_SURF_FORMAT_B5G6R5;
-   case PIPE_FORMAT_B5G5R5A1_UNORM:
-      return TGR3D_SURF_FORMAT_A1B5G5R5;
-   case PIPE_FORMAT_B4G4R4A4_UNORM:
-      return TGR3D_SURF_FORMAT_A4B4G4R4;
+   case PIPE_FORMAT_R5G5B5A1_UNORM:
+      return TGR3D_SURF_FORMAT_B5G5R5A1;
+   case PIPE_FORMAT_R4G4B4A4_UNORM:
+      return TGR3D_SURF_FORMAT_B4G4R4A4;
    case PIPE_FORMAT_Z16_UNORM:
    case PIPE_FORMAT_Z24_UNORM_S8_UINT:   /* the depth plane, see stencil */
       return TGR3D_SURF_FORMAT_Z16;

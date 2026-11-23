@@ -402,9 +402,10 @@ grate_screen_init_shader_caps(struct grate_screen *screen)
 
 /*
  * Formats the TEX unit samples, measured (gpu/dev/texfmt.sh): the 8888 ones,
- * 565 (red and blue come swapped, see grate_sampler_channel), the 8-bit
- * luminance/alpha ones and the compressed DXT1/3/5 and ETC1. Others (4444, 5551: wrong bits) the frontend
- * converts on upload.
+ * the 16-bit R5G6B5, R5G5B5A1 and R4G4B4A4 (B5G6R5 too, red and blue
+ * swapped back, see grate_sampler_channel), the 8-bit luminance/alpha ones
+ * and the compressed DXT1/3/5 and ETC1. The frontend converts the others on
+ * upload.
  */
 unsigned
 grate_sampler_channel(enum pipe_format format, unsigned c)
@@ -424,6 +425,9 @@ grate_sampler_format(enum pipe_format format)
    case PIPE_FORMAT_R8G8B8A8_UNORM:
    case PIPE_FORMAT_R8G8B8X8_UNORM:
    case PIPE_FORMAT_B5G6R5_UNORM:
+   case PIPE_FORMAT_R5G6B5_UNORM:
+   case PIPE_FORMAT_R5G5B5A1_UNORM:
+   case PIPE_FORMAT_R4G4B4A4_UNORM:
    case PIPE_FORMAT_L8_UNORM:
    case PIPE_FORMAT_A8_UNORM:
    case PIPE_FORMAT_L8A8_UNORM:
@@ -455,12 +459,6 @@ grate_screen_is_format_supported(struct pipe_screen *pscreen,
          return false;
    }
 
-   /*
-    * The fragment compiler reads texels with the half layout measured for
-    * 8888 textures (B G | R A); other formats unpack differently (RGB565
-    * came out with red and blue swapped in RetroArch). Sample only those,
-    * the frontend converts the rest on upload.
-    */
    /* depth/stencil is two planes (grate_resource.stencil): a depth/stencil
     * buffer only */
    if (format == PIPE_FORMAT_Z24_UNORM_S8_UINT &&
@@ -468,6 +466,10 @@ grate_screen_is_format_supported(struct pipe_screen *pscreen,
                                             PIPE_BIND_SAMPLER_VIEW |
                                             PIPE_BIND_DISPLAY_TARGET |
                                             PIPE_BIND_SCANOUT | PIPE_BIND_SHARED)))
+      return false;
+
+   /* B5G6R5 is R5G6B5 with red and blue swapped: textures only */
+   if (format == PIPE_FORMAT_B5G6R5_UNORM && (usage & ~PIPE_BIND_SAMPLER_VIEW))
       return false;
 
    /* compressed: textures only */
