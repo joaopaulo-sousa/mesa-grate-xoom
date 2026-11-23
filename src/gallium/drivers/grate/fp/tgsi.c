@@ -921,7 +921,7 @@ emit_sfu(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
    unsigned opcode = inst->Instruction.Opcode;
    struct fp_opnd s[4][2], r = { 0 };
    bool scalar = opcode != TGSI_OPCODE_FRC && opcode != TGSI_OPCODE_FLR &&
-                 opcode != TGSI_OPCODE_TRUNC;
+                 opcode != TGSI_OPCODE_CEIL && opcode != TGSI_OPCODE_TRUNC;
 
    for (int i = 0; i < 4; i++) {
       if (!(dst->WriteMask & (1 << i)))
@@ -948,6 +948,11 @@ emit_sfu(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
             /* floor(x) = x - fract(x) */
             r = fp_val(c, FP_ALU_OP_MAD, s[i][0], fp_opnd_one(c, false),
                        fp_opnd_modify(fp_sfu(c, FP_SFU_OP_FRC, s[i][0]), true, false));
+            break;
+         case TGSI_OPCODE_CEIL:
+            /* ceil(x) = -floor(-x) = x + fract(-x) */
+            r = fp_val(c, FP_ALU_OP_MAD, s[i][0], fp_opnd_one(c, false),
+                       fp_sfu(c, FP_SFU_OP_FRC, fp_opnd_modify(s[i][0], true, false)));
             break;
          case TGSI_OPCODE_TRUNC: {
             if (s[i][0].kind == FP_OPND_INPUT && !s[i][0].negate && !s[i][0].absolute &&
@@ -1208,6 +1213,7 @@ emit_tgsi_instr(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
    case TGSI_OPCODE_COS:
    case TGSI_OPCODE_FRC:
    case TGSI_OPCODE_FLR:
+   case TGSI_OPCODE_CEIL:
    case TGSI_OPCODE_TRUNC:
    case TGSI_OPCODE_POW:
       emit_sfu(c, inst);
