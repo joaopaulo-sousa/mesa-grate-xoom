@@ -417,7 +417,13 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
       for (unsigned l = 0; l < face_levels; ++l) {
          unsigned lpitch = l < levels ? resource->level_pitch[l] :
             align(util_format_get_nblocksx(template->format, fw) * blocksize, 16);
-         face += lpitch * util_format_get_nblocksy(template->format, fh);
+         unsigned rows = util_format_get_nblocksy(template->format, fh);
+         /* measured with the 61x61 ETC1 faces of dEQP (no other size to
+          * try): non-power-of-two compressed faces are stepped by twice
+          * their block rows (4096 bytes, not 2048) */
+         if (!pot && util_format_is_compressed(template->format))
+            rows *= 2;
+         face += lpitch * rows;
          fw = MAX2(fw >> 1, 1u);
          fh = MAX2(fh >> 1, 1u);
       }
