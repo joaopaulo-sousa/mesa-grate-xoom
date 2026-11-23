@@ -424,8 +424,8 @@ fp_specialize(struct fp_compiler *c)
    for (int n = 0; n < c->num_tex; n++)
       for (int k = 0; k < c->tex[n].num_coords; k++) {
          struct fp_opnd *o = &c->tex[n].coord[k];
-         /* r of a cube map stays a value of its own (fp_sched_seq) */
-         if (o->kind != FP_OPND_VALUE || !has_repl[o->index] || k == 2)
+         /* r and a bias stay values of their own (fp_sched_seq) */
+         if (o->kind != FP_OPND_VALUE || !has_repl[o->index] || k >= 2)
             continue;
          struct fp_opnd x = fp_spec_through(*o, repl[o->index]);
          if (!x.negate && !x.absolute &&

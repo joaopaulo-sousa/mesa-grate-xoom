@@ -731,7 +731,8 @@ fp_tex_varying(const struct fp_opnd *s, const struct fp_opnd *t)
 }
 
 static void
-emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
+emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst,
+         const struct fp_opnd *bias)
 {
    const struct tgsi_dst_register *dst = &inst->Dst[0].Register;
    struct fp_opnd s = fp_src(c, &inst->Src[0].Register, 0);
@@ -748,7 +749,8 @@ emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
    if (cube) {
       struct fp_opnd r = fp_src(c, &inst->Src[0].Register, 2);
       if (!fp_tex_varying(&s, &t) || r.kind != FP_OPND_INPUT || r.index != s.index ||
-          r.negate || r.absolute || s.comp != 0 || t.comp != 1 || r.comp != 2) {
+          r.negate || r.absolute || s.comp != 0 || t.comp != 1 || r.comp != 2 ||
+          bias) {
          /*
           * Other coordinates, as the NVIDIA compiler handles them (cgdump
           * shaders/cube-computed.glsl): the ALU writes s, t, r to the
@@ -778,6 +780,8 @@ emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
    /* coordinates other than two varying components (a dependent read)
     * need a sequential program: the ALU computes them in an earlier pass */
    bool varying = fp_tex_varying(&s, &t);
+   if (bias)
+      c->seq = true;
    if (!varying) {
       /* the TEX reads fp20 coordinates from a register pair: anything but
        * a plain varying component or a value of its own gets copied */
@@ -796,9 +800,22 @@ emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
 
    int n = c->num_tex++;
    c->tex[n].coord[0] = s;
+   c->tex[n].role[0] = FP_TEX_S;
    c->tex[n].coord[1] = t;
-   c->tex[n].coord[2] = cube_r;
-   c->tex[n].num_coords = cube_computed ? 3 : 2;
+   c->tex[n].role[1] = FP_TEX_T;
+   c->tex[n].num_coords = 2;
+   if (cube_computed) {
+      c->tex[n].coord[2] = cube_r;
+      c->tex[n].role[2] = FP_TEX_R;
+      c->tex[n].num_coords = 3;
+   }
+   if (bias) {
+      /* per pixel: read by the TEX from a register of its own */
+      int k = c->tex[n].num_coords++;
+      c->tex[n].coord[k] = fp_val(c, FP_ALU_OP_MAD, *bias, fp_opnd_one(c, false),
+                                  fp_opnd_zero(c, false));
+      c->tex[n].role[k] = FP_TEX_BIAS;
+   }
    c->tex[n].input = varying ? s.index : -1;
    /* the pair of the components, when they are .xy or .zw */
    c->tex[n].pair = varying && !(s.comp & 1) && t.comp == s.comp + 1 ? s.comp / 2 : 0;
@@ -1136,15 +1153,15 @@ emit_tgsi_instr(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
       break;
 
    case TGSI_OPCODE_TEX:
-      emit_tex(c, inst);
+      emit_tex(c, inst, NULL);
       break;
 
    case TGSI_OPCODE_TXB: {
       /*
        * The bias goes into the sampler's texture descriptor: a constant
        * one at compile time (as the NVIDIA guide recommends), a uniform
-       * one at draw time. The TEX instruction can also read one per pixel
-       * from the row registers, not done yet.
+       * one at draw time. Any other is read per pixel by the TEX (txb, as
+       * the NVIDIA compiler does: cgdump shaders/tex2d-varbias.glsl).
        */
       struct fp_opnd b = fp_src(c, &inst->Src[0].Register, 3);
       unsigned smp = inst->Src[1].Register.Index;
@@ -1175,13 +1192,10 @@ emit_tgsi_instr(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
          if (neg)
             info->lod_bias_user_neg |= 1u << smp;
       } else {
-         static bool warned;
-         if (!warned) {
-            warned = true;
-            fprintf(stderr, "GRATE FRAG: non-constant LOD bias ignored\n");
-         }
+         emit_tex(c, inst, &b);
+         break;
       }
-      emit_tex(c, inst);
+      emit_tex(c, inst, NULL);
       break;
    }
 
@@ -1244,8 +1258,10 @@ fp_pseq_word(const struct fp_compiler *c, int pair)
 uint32_t
 fp_tex_word(const struct fp_compiler *c, int n, int coord_pair)
 {
+   /* bit 12: txb, the LOD bias from the second register of the texel pair */
    return (c->tex[n].sampler & 0xf) | coord_pair << 4 |
-          (1 - coord_pair) << 5 | 1 << 10;
+          (1 - coord_pair) << 5 | 1 << 10 |
+          (fp_tex_coord(c, n, FP_TEX_BIAS) >= 0) << 12;
 }
 
 
@@ -1614,8 +1630,9 @@ fp_relayout(struct fp_compiler *c)
    c->seq = false;
    for (int i = 0; i < c->num_units; i++)
       c->seq |= c->units[i].live && c->units[i].sfu && !fp_rows_sfu(c, &c->units[i]);
+   /* and texture fetches of computed coordinates, cube r or a bias */
    for (int n = 0; n < c->num_tex; n++)
-      c->seq |= c->tex[n].live && c->tex[n].input < 0;
+      c->seq |= c->tex[n].live && (c->tex[n].input < 0 || c->tex[n].num_coords > 2);
 }
 
 /*
@@ -2182,6 +2199,7 @@ fp_cube_computed(struct fp_compiler *c, int n)
 {
    struct fp_opnd in = { .kind = FP_OPND_INPUT, .index = c->tex[n].input };
 
+   /* only s and t so far: a bias is not on varyings (emit_tex) */
    for (int k = 0; k < 3; k++) {
       struct fp_unit *u = fp_new_unit(c);
       in.comp = k;
@@ -2189,6 +2207,7 @@ fp_cube_computed(struct fp_compiler *c, int n)
                  fp_opnd_zero(c, false));
       u->live = true;
       c->tex[n].coord[k] = fp_opnd_value(c, u);
+      c->tex[n].role[k] = k;
    }
    c->tex[n].num_coords = 3;
    c->tex[n].input = -1;
@@ -2303,7 +2322,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    if (!c->failed && !c->seq && !fp_sched_rows(c))
       c->seq = true;
    for (int n = 0; n < c->num_tex && !c->failed && c->seq; n++)
-      if (c->tex[n].live && c->tex[n].cube && c->tex[n].num_coords == 2)
+      if (c->tex[n].live && c->tex[n].cube && fp_tex_coord(c, n, FP_TEX_R) < 0)
          fp_cube_computed(c, n);
    if (!c->failed && c->seq) {
       /* and the sum it adds may take in a multiply, as when written so */

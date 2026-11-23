@@ -186,6 +186,16 @@ seq_half_needed(struct fp_compiler *c, enum seq_item_kind kind, int a,
    return false;
 }
 
+/* Whether a cube map's r and a bias of fetch n are there for EXEC e */
+static bool
+seq_extra_coords_ready(struct fp_compiler *c, struct seq_state *s, int n, int e)
+{
+   for (int k = 2; k < c->tex[n].num_coords; k++)
+      if (!seq_reg_ready(c, s, &c->tex[n].coord[k], e, true))
+         return false;
+   return true;
+}
+
 /* Whether the MFU of an EXEC has nothing to do yet */
 static bool
 seq_mfu_free(const struct fp_seq_exec *x)
@@ -569,12 +579,11 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
          if (!c->tex[n].live || c->tex[n].exec >= 0 ||
              !seq_reg_ready(c, s, &c->tex[n].coord[0], e, true) ||
              !seq_reg_ready(c, s, &c->tex[n].coord[1], e, true) ||
-             (c->tex[n].num_coords > 2 &&
-              (!seq_reg_ready(c, s, &c->tex[n].coord[2], e, true) ||
-               !seq_mfu_free(x))) ||
-             /* the texel takes a pair; a cube map's 1/r is already in it */
+             !seq_extra_coords_ready(c, s, n, e) ||
+             (fp_tex_coord(c, n, FP_TEX_R) >= 0 && !seq_mfu_free(x)) ||
+             /* the texel takes a pair; r and a bias are already in it */
              seq_live_items(c, owner, e - 1) + 4 -
-                2 * (c->tex[n].num_coords > 2) > limit)
+                2 * (c->tex[n].num_coords - 2) > limit)
             continue;
          for (int p = 0; p < 2; p++) {
             struct fp_opnd *s0 = &c->tex[n].coord[0], *s1 = &c->tex[n].coord[1];
@@ -595,7 +604,7 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
             c->tex[n].pair = p;
             owner[2 * q] = owner[2 * q + 1] = (struct seq_owner) { SEQ_TEXEL, n, 0 };
             x->tex = n;
-            x->cube_mfu = c->tex[n].num_coords > 2;
+            x->cube_mfu = fp_tex_coord(c, n, FP_TEX_R) >= 0;
             remaining--;
             progress = true;
             break;
@@ -808,10 +817,11 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
          if (it < 0)
             return false;
          /* the coordinates are read from pair p: s in 2p, t in 2p+1, as
-          * fp20 values; a cube map's r from the first register of the
-          * texel pair, by the MFU before the texel lands there */
-         int want = k < 2 ? 2 * p + k : 2 * (1 - p);
-         SEQ_READ(it, SEQ_T(c->tex[n].exec, T_TEX) - (k == 2));
+          * fp20 values; a cube map's r (by the MFU) and a bias from the
+          * texel pair, 2q and 2q+1, before the texel lands there */
+         int role = c->tex[n].role[k];
+         int want = role < FP_TEX_R ? 2 * p + role : 2 * (1 - p) + (role - FP_TEX_R);
+         SEQ_READ(it, SEQ_T(c->tex[n].exec, T_TEX) - (role >= FP_TEX_R));
          if (items[it].reg >= 0 && items[it].reg != want)
             return false;
          items[it].reg = want;

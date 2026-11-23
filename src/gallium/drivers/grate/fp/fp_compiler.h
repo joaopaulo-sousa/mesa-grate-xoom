@@ -95,6 +95,8 @@ struct fp_unit {
 };
 
 /* What one EXEC of a sequential program does (sched_seq.c) */
+enum fp_tex_role { FP_TEX_S, FP_TEX_T, FP_TEX_R, FP_TEX_BIAS };
+
 struct fp_seq_exec {
    int sfu_unit;           /* SFU unit run by the MFU, -1 if none */
    int ipl_input[4];       /* TGSI input interpolated into r(k), -1 if none */
@@ -194,10 +196,12 @@ struct fp_compiler {
    /* texture fetches; multi-row programs need coord = TGSI input
     * components 2*pair, +1 */
    struct {
-      /* s, t and, for a cube map in a sequential program, r: the MFU
-       * divides them by the major axis in the TEX EXEC, with r in the
-       * first register of the texel pair (the texel overwrites it) */
-      struct fp_opnd coord[3];
+      /* s and t, then in sequential programs: a cube map's r (the MFU
+       * divides them by the major axis in the TEX EXEC) and a per-pixel
+       * LOD bias (txb), in the first and second register of the texel
+       * pair (the texel overwrites them) */
+      struct fp_opnd coord[4];
+      uint8_t role[4];     /* enum fp_tex_role */
       int num_coords;
       /* cube map: in a multi-row program R is coordinate 2 of the same
        * varying, interpolated into that register, and the MFU divides */
@@ -223,6 +227,16 @@ struct fp_compiler {
 #define fp_unit_foreach_src(u, k, j) \
    for (int k = 0; k < MAX2((u)->num_slots, 1); k++) \
       for (int j = 0; j < ((u)->num_slots ? 3 : 1); j++)
+
+/* The coordinate of texture fetch n with role "role", -1 if none */
+static inline int
+fp_tex_coord(const struct fp_compiler *c, int n, enum fp_tex_role role)
+{
+   for (int k = 0; k < c->tex[n].num_coords; k++)
+      if (c->tex[n].role[k] == role)
+         return k;
+   return -1;
+}
 
 /* Whether a unit defines a value (not a colour write or a discard) */
 static inline bool
