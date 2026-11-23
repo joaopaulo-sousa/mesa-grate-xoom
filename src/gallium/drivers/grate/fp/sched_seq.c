@@ -750,11 +750,8 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
       struct fp_unit *u = &c->units[i];
       if (!u->live || u->output_chan >= 0)
          continue;
-      if (!seq_is_alu(u)) {
-         /* in place: the item of the operand */
-         value_item[i] = value_item[u->slots[0].src[0].index];
-         continue;
-      }
+      if (!seq_is_alu(u))
+         continue;   /* in place: below, once the inputs have items */
       items[num] = (struct seq_item) { .def = seq_alu_time(c, u, true), .last = -1, .reg = -1, .half = -1, .fx10 = u->fx10 };
       value_item[i] = num++;
    }
@@ -764,6 +761,17 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
             items[num] = (struct seq_item) { .def = SEQ_T(s->fetch_exec[i][k], T_MFU), .last = -1, .reg = s->fetch_reg[i][k], .half = -1 };
             input_item[i][k] = num++;
          }
+   /* an SFU works in place: the item of its operand, a value or a varying
+    * component it was folded onto (fp_fold_sfu_copies) */
+   for (int i = 0; i < c->num_units; i++) {
+      struct fp_unit *u = &c->units[i];
+      if (!u->live || u->output_chan >= 0 || seq_is_alu(u))
+         continue;
+      const struct fp_opnd *x = &u->slots[0].src[0];
+      value_item[i] = x->kind == FP_OPND_VALUE ? value_item[x->index] :
+                      x->kind == FP_OPND_INPUT ? input_item[x->index][x->comp] : -1;
+   }
+
    /* the TEX and the PSEQ load write all four halves of their pair, read
     * or not */
    for (int n = 0; n < c->num_tex; n++) {
