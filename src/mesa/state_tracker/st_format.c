@@ -284,12 +284,12 @@ static const struct format_mapping format_map[] = {
    {
       { GL_RGBA4, GL_RGBA2, 0 },
       { PIPE_FORMAT_B4G4R4A4_UNORM, PIPE_FORMAT_A4B4G4R4_UNORM,
-        DEFAULT_RGBA_FORMATS }
+        PIPE_FORMAT_R4G4B4A4_UNORM, DEFAULT_RGBA_FORMATS }
    },
    {
       { GL_RGB5_A1, 0 },
       { PIPE_FORMAT_B5G5R5A1_UNORM, PIPE_FORMAT_A1B5G5R5_UNORM,
-        DEFAULT_RGBA_FORMATS }
+        PIPE_FORMAT_R5G5B5A1_UNORM, DEFAULT_RGBA_FORMATS }
    },
    {
       { GL_R3_G3_B2, 0 },
@@ -311,7 +311,7 @@ static const struct format_mapping format_map[] = {
    },
    {
       { GL_RGB565, 0 },
-      { PIPE_FORMAT_B5G6R5_UNORM, DEFAULT_RGB_FORMATS }
+      { PIPE_FORMAT_B5G6R5_UNORM, PIPE_FORMAT_R5G6B5_UNORM, DEFAULT_RGB_FORMATS }
    },
 
    /* basic Alpha formats */
