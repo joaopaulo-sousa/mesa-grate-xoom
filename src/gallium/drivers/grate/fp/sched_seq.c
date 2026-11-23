@@ -151,7 +151,7 @@ seq_item_needed(struct fp_compiler *c, enum seq_item_kind kind, int a, int b,
    for (int n = 0; n < c->num_tex; n++) {
       if (!c->tex[n].live || (c->tex[n].exec >= 0 && c->tex[n].exec < e))
          continue;
-      for (int k = 0; k < 2; k++)
+      for (int k = 0; k < c->tex[n].num_coords; k++)
          if (seq_opnd_is(&c->tex[n].coord[k], kind, a, b))
             return true;
    }
@@ -184,6 +184,16 @@ seq_half_needed(struct fp_compiler *c, enum seq_item_kind kind, int a,
       }
    }
    return false;
+}
+
+/* Whether the MFU of an EXEC has nothing to do yet */
+static bool
+seq_mfu_free(const struct fp_seq_exec *x)
+{
+   for (int k = 0; k < 4; k++)
+      if (x->ipl_input[k] >= 0)
+         return false;
+   return x->sfu_unit < 0 && !x->cube_mfu;
 }
 
 /* Whether a fixed register can be loaded in EXEC e (by its PSEQ, MFU or
@@ -282,7 +292,7 @@ static bool
 seq_is_coord(struct fp_compiler *c, int i, int comp)
 {
    for (int n = 0; n < c->num_tex; n++)
-      for (int k = 0; k < 2; k++)
+      for (int k = 0; k < c->tex[n].num_coords; k++)
          if (c->tex[n].live && seq_opnd_is(&c->tex[n].coord[k], SEQ_INPUT, i, comp))
             return true;
    return false;
@@ -341,8 +351,8 @@ seq_fetch_inputs(struct fp_compiler *c, struct seq_state *s,
          int t = i - c->num_units;
          if (!c->tex[t].live || c->tex[t].exec >= 0)
             continue;
-         ops[n++] = &c->tex[t].coord[0];
-         ops[n++] = &c->tex[t].coord[1];
+         for (int k = 0; k < c->tex[t].num_coords; k++)
+            ops[n++] = &c->tex[t].coord[k];
       }
 
       for (int k = 0; k < n; k++) {
@@ -462,7 +472,7 @@ seq_forwardable(struct fp_compiler *c, struct seq_state *s, int i, int e,
          }
    }
    for (int n = 0; n < c->num_tex; n++)
-      for (int k = 0; k < 2; k++)
+      for (int k = 0; k < c->tex[n].num_coords; k++)
          if (c->tex[n].live && seq_opnd_is(&c->tex[n].coord[k], SEQ_VALUE, i, 0))
             return false;
    if (reader < 0 || !seq_is_alu(&c->units[reader]) || c->units[reader].exec >= 0)
@@ -559,7 +569,12 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
          if (!c->tex[n].live || c->tex[n].exec >= 0 ||
              !seq_reg_ready(c, s, &c->tex[n].coord[0], e, true) ||
              !seq_reg_ready(c, s, &c->tex[n].coord[1], e, true) ||
-             seq_live_items(c, owner, e - 1) + 4 > limit)
+             (c->tex[n].num_coords > 2 &&
+              (!seq_reg_ready(c, s, &c->tex[n].coord[2], e, true) ||
+               !seq_mfu_free(x))) ||
+             /* the texel takes a pair; a cube map's 1/r is already in it */
+             seq_live_items(c, owner, e - 1) + 4 -
+                2 * (c->tex[n].num_coords > 2) > limit)
             continue;
          for (int p = 0; p < 2; p++) {
             struct fp_opnd *s0 = &c->tex[n].coord[0], *s1 = &c->tex[n].coord[1];
@@ -580,6 +595,7 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
             c->tex[n].pair = p;
             owner[2 * q] = owner[2 * q + 1] = (struct seq_owner) { SEQ_TEXEL, n, 0 };
             x->tex = n;
+            x->cube_mfu = c->tex[n].num_coords > 2;
             remaining--;
             progress = true;
             break;
@@ -785,16 +801,17 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
       if (!c->tex[n].live)
          continue;
       int p = c->tex[n].pair;
-      for (int k = 0; k < 2; k++) {
+      for (int k = 0; k < c->tex[n].num_coords; k++) {
          struct fp_opnd *o = &c->tex[n].coord[k];
          int it = o->kind == FP_OPND_VALUE ? value_item[o->index] :
                   input_item[o->index][o->comp];
          if (it < 0)
             return false;
-         SEQ_READ(it, SEQ_T(c->tex[n].exec, T_TEX));
          /* the coordinates are read from pair p: s in 2p, t in 2p+1, as
-          * fp20 values */
-         int want = 2 * p + k;
+          * fp20 values; a cube map's r from the first register of the
+          * texel pair, by the MFU before the texel lands there */
+         int want = k < 2 ? 2 * p + k : 2 * (1 - p);
+         SEQ_READ(it, SEQ_T(c->tex[n].exec, T_TEX) - (k == 2));
          if (items[it].reg >= 0 && items[it].reg != want)
             return false;
          items[it].reg = want;
@@ -1076,6 +1093,27 @@ fp_emit_seq(struct fp_compiler *c)
             struct fp_unit *u = &c->units[x->sfu_unit];
             mfu->sfu.op = u->sfu;
             mfu->sfu.reg = u->reg;
+         }
+         inst->mfu_sched.num_instructions = 1;
+         inst->mfu_sched.address = list_length(&fp->mfu_instructions);
+         list_addtail(&mfu->link, &fp->mfu_instructions);
+      }
+
+      if (x->cube_mfu) {
+         /*
+          * Cube coordinates computed by the ALU, as the NVIDIA compiler
+          * does: rcp of register 8 + R's column (the major axis) into R,
+          * then S and T scaled by it.
+          */
+         int p = c->tex[x->tex].pair, r = 2 * (1 - p);
+         struct fp_mfu_instr *mfu = CALLOC_STRUCT(fp_mfu_instr);
+         list_inithead(&mfu->link);
+         mfu->sfu.op = FP_SFU_OP_RCP;
+         mfu->sfu.reg = 8 + r;
+         for (int k = 0; k < 2; k++) {
+            mfu->mul[k].dst = FP_MFU_MUL_DST_ROW_REG_0 + 2 * p + k;
+            mfu->mul[k].src[0] = FP_MFU_MUL_SRC_ROW_REG_0 + r;
+            mfu->mul[k].src[1] = FP_MFU_MUL_SRC_ROW_REG_0 + 2 * p + k;
          }
          inst->mfu_sched.num_instructions = 1;
          inst->mfu_sched.address = list_length(&fp->mfu_instructions);

@@ -100,6 +100,7 @@ struct fp_seq_exec {
    int ipl_input[4];       /* TGSI input interpolated into r(k), -1 if none */
    int ipl_comp[4];        /* ... its component */
    int tex;                /* texture fetch, -1 if none */
+   bool cube_mfu;          /* the MFU divides its cube coordinates */
    bool pseq;              /* destination colour load */
    int first_packet;
    int num_packets;
@@ -193,11 +194,14 @@ struct fp_compiler {
    /* texture fetches; multi-row programs need coord = TGSI input
     * components 2*pair, +1 */
    struct {
-      struct fp_opnd coord[2];
-   /* cube map: R is coordinate 2 of the same varying, interpolated into the
-    * first register of the other pair, which the TEX reads as R before it
-    * writes the texel there */
-   bool cube;
+      /* s, t and, for a cube map in a sequential program, r: the MFU
+       * divides them by the major axis in the TEX EXEC, with r in the
+       * first register of the texel pair (the texel overwrites it) */
+      struct fp_opnd coord[3];
+      int num_coords;
+      /* cube map: in a multi-row program R is coordinate 2 of the same
+       * varying, interpolated into that register, and the MFU divides */
+      bool cube;
       int input;
       int pair;            /* register pair of the coordinates */
       int sampler;

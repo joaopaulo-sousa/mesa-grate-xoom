@@ -743,12 +743,23 @@ emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
       fp_fail(c, "only 2D and cube textures are supported");
       return;
    }
+   struct fp_opnd cube_r = { 0 };
+   bool cube_computed = false;
    if (cube) {
       struct fp_opnd r = fp_src(c, &inst->Src[0].Register, 2);
       if (!fp_tex_varying(&s, &t) || r.kind != FP_OPND_INPUT || r.index != s.index ||
           r.negate || r.absolute || s.comp != 0 || t.comp != 1 || r.comp != 2) {
-         fp_fail(c, "cube map coordinates other than a varying .xyz");
-         return;
+         /*
+          * Other coordinates, as the NVIDIA compiler handles them (cgdump
+          * shaders/cube-computed.glsl): the ALU writes s, t, r to the
+          * coordinate pair and the first register of the other one, and
+          * the TEX EXEC's MFU divides them by the major axis in place
+          * (sched_seq.c). In place: each gets a copy of its own.
+          */
+         s = fp_val(c, FP_ALU_OP_MAD, s, fp_opnd_one(c, false), fp_opnd_zero(c, false));
+         t = fp_val(c, FP_ALU_OP_MAD, t, fp_opnd_one(c, false), fp_opnd_zero(c, false));
+         cube_r = fp_val(c, FP_ALU_OP_MAD, r, fp_opnd_one(c, false), fp_opnd_zero(c, false));
+         cube_computed = true;
       }
    }
    if (c->num_tex == FP_MAX_TEXTURES) {
@@ -786,6 +797,8 @@ emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
    int n = c->num_tex++;
    c->tex[n].coord[0] = s;
    c->tex[n].coord[1] = t;
+   c->tex[n].coord[2] = cube_r;
+   c->tex[n].num_coords = cube_computed ? 3 : 2;
    c->tex[n].input = varying ? s.index : -1;
    /* the pair of the components, when they are .xy or .zw */
    c->tex[n].pair = varying && !(s.comp & 1) && t.comp == s.comp + 1 ? s.comp / 2 : 0;
@@ -1453,7 +1466,7 @@ fp_cse(struct fp_compiler *c)
    }
 
    for (int n = 0; n < c->num_tex; n++)
-      for (int k = 0; k < 2; k++)
+      for (int k = 0; k < c->tex[n].num_coords; k++)
          if (c->tex[n].coord[k].kind == FP_OPND_VALUE)
             c->tex[n].coord[k].index = remap[c->tex[n].coord[k].index];
 }
@@ -1486,7 +1499,7 @@ fp_fuse_mad(struct fp_compiler *c)
             readers[u->slots[k].src[j].index]++;
    }
    for (int n = 0; n < c->num_tex; n++)
-      for (int k = 0; k < 2; k++)
+      for (int k = 0; k < c->tex[n].num_coords; k++)
          if (c->tex[n].coord[k].kind == FP_OPND_VALUE)
             readers[c->tex[n].coord[k].index] += 2;   /* keep */
 
@@ -1564,7 +1577,8 @@ fp_relayout(struct fp_compiler *c)
    for (int n = 0; n < c->num_tex; n++) {
       struct fp_opnd s = fp_copy_source(c, c->tex[n].coord[0]);
       struct fp_opnd t = fp_copy_source(c, c->tex[n].coord[1]);
-      if (c->tex[n].input >= 0 || !fp_tex_varying(&s, &t))
+      if (c->tex[n].input >= 0 || c->tex[n].num_coords > 2 ||
+          !fp_tex_varying(&s, &t))
          continue;
       c->tex[n].coord[0] = s;
       c->tex[n].coord[1] = t;
@@ -1692,7 +1706,7 @@ fp_dead_code(struct fp_compiler *c)
          else if (o->kind == FP_OPND_TEXEL) {
             c->tex[o->index].live = true;
             /* computed coordinates (sequential programs) */
-            for (int k = 0; k < 2; k++)
+            for (int k = 0; k < c->tex[o->index].num_coords; k++)
                if (c->tex[o->index].coord[k].kind == FP_OPND_VALUE)
                   c->units[c->tex[o->index].coord[k].index].live = true;
          }
@@ -2248,8 +2262,8 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    if (!c->failed && !c->seq && !fp_sched_rows(c))
       c->seq = true;
    for (int n = 0; n < c->num_tex && !c->failed && c->seq; n++)
-      if (c->tex[n].live && c->tex[n].cube)
-         fp_fail(c, "cube maps in a sequential program");
+      if (c->tex[n].live && c->tex[n].cube && c->tex[n].num_coords == 2)
+         fp_fail(c, "cube maps of a varying in a sequential program");
    if (!c->failed && c->seq) {
       /* and the sum it adds may take in a multiply, as when written so */
       fp_expand_blend_inv(c);

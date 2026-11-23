@@ -150,7 +150,7 @@ fp_count_inputs(struct fp_compiler *c, bool *live)
             BITSET_SET(read, o->index * 4 + o->comp);
          else if (o->kind == FP_OPND_TEXEL && !tex_live[o->index]) {
             tex_live[o->index] = true;
-            for (int t = 0; t < 2; t++) {
+            for (int t = 0; t < c->tex[o->index].num_coords; t++) {
                struct fp_opnd *x = &c->tex[o->index].coord[t];
                if (x->kind == FP_OPND_VALUE)
                   live[x->index] = true;
@@ -179,7 +179,7 @@ fp_move_reads(struct fp_compiler *c, struct fp_move *mv, int i, int input, int c
       }
    }
    for (int n = 0; n < c->num_tex; n++)
-      for (int t = 0; t < 2; t++) {
+      for (int t = 0; t < c->tex[n].num_coords; t++) {
          struct fp_opnd *o = &c->tex[n].coord[t];
          if (o->kind == FP_OPND_VALUE && o->index == i)
             fp_move_set(mv, o, (struct fp_opnd) { .kind = FP_OPND_INPUT, .index = input,
@@ -209,8 +209,9 @@ fp_move_coords(struct fp_compiler *c)
 
    /* the coordinates of dependent reads */
    for (int n = 0; n < c->num_tex; n++) {
-      if (c->tex[n].input >= 0 || m->num_outs == GRATE_MOVED_MAX ||
-          input == FP_MAX_INPUTS)
+      /* a cube map's s/r, t/r are not linear: they stay here */
+      if (c->tex[n].input >= 0 || c->tex[n].num_coords > 2 ||
+          m->num_outs == GRATE_MOVED_MAX || input == FP_MAX_INPUTS)
          continue;
 
       /* both coordinates, or none: drop what a failed one added */

@@ -746,7 +746,7 @@ fp_rows_pseudo(struct fp_compiler *c)
          return false;
       }
       for (int n = 0; n < c->num_tex; n++)
-         for (int k = 0; k < 2; k++)
+         for (int k = 0; k < c->tex[n].num_coords; k++)
             if (c->tex[n].live && c->tex[n].coord[k].kind == FP_OPND_VALUE &&
                 c->tex[n].coord[k].index == i)
                return false;

@@ -151,7 +151,7 @@ fp_preshade(struct fp_compiler *c)
 
    /* values that must be in a register: texture coordinates */
    for (int n = 0; n < c->num_tex; n++)
-      for (int k = 0; k < 2; k++)
+      for (int k = 0; k < c->tex[n].num_coords; k++)
          if (c->tex[n].coord[k].kind == FP_OPND_VALUE)
             keep[c->tex[n].coord[k].index] = true;
 
@@ -422,9 +422,10 @@ fp_specialize(struct fp_compiler *c)
    }
 
    for (int n = 0; n < c->num_tex; n++)
-      for (int k = 0; k < 2; k++) {
+      for (int k = 0; k < c->tex[n].num_coords; k++) {
          struct fp_opnd *o = &c->tex[n].coord[k];
-         if (o->kind != FP_OPND_VALUE || !has_repl[o->index])
+         /* r of a cube map stays a value of its own (fp_sched_seq) */
+         if (o->kind != FP_OPND_VALUE || !has_repl[o->index] || k == 2)
             continue;
          struct fp_opnd x = fp_spec_through(*o, repl[o->index]);
          if (!x.negate && !x.absolute &&

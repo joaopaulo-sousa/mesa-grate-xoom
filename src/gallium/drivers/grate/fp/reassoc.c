@@ -43,7 +43,7 @@ fp_move_last_unit(struct fp_compiler *c, int pos)
       }
    }
    for (int n = 0; n < c->num_tex; n++)
-      for (int k = 0; k < 2; k++) {
+      for (int k = 0; k < c->tex[n].num_coords; k++) {
          struct fp_opnd *o = &c->tex[n].coord[k];
          if (o->kind == FP_OPND_VALUE && o->index >= pos)
             o->index = o->index == last ? pos : o->index + 1;
@@ -99,7 +99,7 @@ fp_reassoc_scan(struct fp_compiler *c, struct fp_reassoc *r)
             r->alive[o->index] = true;
             r->readers[o->index]++;
          } else if (o->kind == FP_OPND_TEXEL) {
-            for (int t = 0; t < 2; t++)
+            for (int t = 0; t < c->tex[o->index].num_coords; t++)
                if (c->tex[o->index].coord[t].kind == FP_OPND_VALUE) {
                   r->alive[c->tex[o->index].coord[t].index] = true;
                   r->readers[c->tex[o->index].coord[t].index] += 2;   /* keep */
@@ -348,7 +348,7 @@ fp_scale_operand(struct fp_compiler *c, struct fp_reassoc *r, int i, const struc
        r->readers[i] == 0)
       return false;
    for (int n = 0; n < c->num_tex; n++)
-      for (int k = 0; k < 2; k++)
+      for (int k = 0; k < c->tex[n].num_coords; k++)
          if (c->tex[n].coord[k].kind == FP_OPND_VALUE && c->tex[n].coord[k].index == i)
             return false;
    for (int n = i + 1; n < c->num_units; n++) {
@@ -400,7 +400,7 @@ fp_fold_minus_one(struct fp_compiler *c, struct fp_reassoc *r, int i,
        x->absolute || x->twice || x->minus_one || u->saturate || r->readers[i] == 0)
       return false;
    for (int n = 0; n < c->num_tex; n++)
-      for (int k = 0; k < 2; k++)
+      for (int k = 0; k < c->tex[n].num_coords; k++)
          if (c->tex[n].coord[k].kind == FP_OPND_VALUE && c->tex[n].coord[k].index == i)
             return false;
    for (int n = i + 1; n < c->num_units; n++) {
