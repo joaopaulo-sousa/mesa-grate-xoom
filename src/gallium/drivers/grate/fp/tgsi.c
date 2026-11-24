@@ -838,6 +838,18 @@ emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst,
       s = fp_sfu(c, FP_SFU_OP_FRC, s);
    if (!cube && c->key && smp < 8 && (c->key->npot_t & (1u << smp)))
       t = fp_sfu(c, FP_SFU_OP_FRC, t);
+   /* read from a power-of-two copy (grate_npot_shadow): scaled to the part
+    * the texture takes of it. w/W is exact in fp20; on a varying the vertex
+    * shader computes it (move.c), the TEX then reads it as it would s */
+   if (!cube && c->key && smp < 8 && (c->key->npot_shadow & (1u << smp))) {
+      unsigned w = c->key->shadow_size[smp][0], h = c->key->shadow_size[smp][1];
+      s = fp_val(c, FP_ALU_OP_MAD, s,
+                 fp_opnd_const(c, (float)w / util_next_power_of_two(w)),
+                 fp_opnd_zero(c, false));
+      t = fp_val(c, FP_ALU_OP_MAD, t,
+                 fp_opnd_const(c, (float)h / util_next_power_of_two(h)),
+                 fp_opnd_zero(c, false));
+   }
 
    /* coordinates other than two varying components (a dependent read)
     * need a sequential program: the ALU computes them in an earlier pass */

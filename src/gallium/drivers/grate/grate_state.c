@@ -1009,7 +1009,11 @@ emit_textures(struct grate_context *context, uint32_t **ptrp)
          continue;
 
       struct grate_resource *res = grate_resource(view->texture);
-      unsigned width = view->texture->width0, height = view->texture->height0;
+      /* other filters for minified and magnified: a power-of-two copy,
+       * brought up to date before the draw (grate_draw_vbo) */
+      if (grate_npot_shadow(view, sampler) && res->shadow)
+         res = res->shadow;
+      unsigned width = res->b.width0, height = res->b.height0;
       uint32_t lo, hi;
 
       lo = TGR3D_TEX_TEXDESC_LO_SURF_FORMAT(res->format) |
@@ -1050,13 +1054,14 @@ emit_textures(struct grate_context *context, uint32_t **ptrp)
          hi = TGR3D_TEX_TEXDESC_HI_LOD_MAX(levels << 4);
          if (sampler->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR)
             lo |= TGR3D_TEX_TEXDESC_LO_LERP_MIP;
-      } else if (pot && view->target == PIPE_TEXTURE_CUBE) {
+      } else if (pot) {
          /*
           * Measured on cube maps: with BASE_LEVEL_ONLY the TEX unit steps
           * from face to face by the base level alone (the faces are laid out
           * with their whole mip chain) and always filters as magnified. With
           * LOD_MAX = 1/16 it reads level 0 and picks the min or mag filter.
-          * LOD_MAX = 0 steps right but always magnifies too.
+          * LOD_MAX = 0 steps right but always magnifies too. 2D textures
+          * the same (dEQP texture.filtering.2d nearest_linear/linear_nearest).
           */
          hi = TGR3D_TEX_TEXDESC_HI_LOD_MAX(1);
       } else {

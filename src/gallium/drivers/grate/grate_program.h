@@ -83,6 +83,10 @@ bool
 grate_npot_repeat(const struct pipe_sampler_view *view,
                   const struct pipe_sampler_state *sampler, int axis);
 
+bool
+grate_npot_shadow(const struct pipe_sampler_view *view,
+                  const struct pipe_sampler_state *sampler);
+
 void
 grate_context_program_init(struct pipe_context *pcontext);
 

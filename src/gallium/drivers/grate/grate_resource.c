@@ -131,6 +131,8 @@ grate_resource_destroy(struct pipe_screen *pscreen,
 
    if (resource->stencil)
       grate_resource_destroy(pscreen, &resource->stencil->b);
+   if (resource->shadow)
+      grate_resource_destroy(pscreen, &resource->shadow->b);
    grate_bo_unref(resource->bo);
    FREE(resource);
 }
@@ -248,6 +250,8 @@ grate_resource_transfer_unmap(struct pipe_context *pcontext,
    }
 
    grate_bo_unmap(resource->bo);
+   if (transfer->usage & PIPE_MAP_WRITE)
+      resource->writes++;
 
    pipe_resource_reference(&transfer->resource, NULL);
    slab_free(&context->transfer_pool, transfer);
@@ -735,6 +739,73 @@ grate_blit(struct pipe_context *pcontext, const struct pipe_blit_info *info)
    grate_stream_end(&gr2d->stream, &ptr);
 
    grate_stream_flush(&gr2d->stream, false);
+   dst->writes++;
+}
+
+/*
+ * A power-of-two copy of a non-power-of-two 2D texture: the TEX unit picks
+ * the minification or magnification filter only on power-of-two ones (with
+ * LOD_MAX, which a non-power-of-two descriptor uses for its size), so
+ * programs sampling with different filters read this, their coordinates
+ * scaled by w/W and h/H (grate_npot_shadow). The last column and row are
+ * repeated into the rest: clamping at the copy's edge then reads what
+ * clamping at the texture's would. All by the 2D engine, in same-size
+ * copies, the repeated part doubling each time.
+ */
+struct grate_resource *
+grate_resource_npot_shadow(struct pipe_context *pcontext, struct grate_resource *res)
+{
+   struct grate_context *context = grate_context(pcontext);
+   unsigned w = res->b.width0, h = res->b.height0;
+   unsigned W = util_next_power_of_two(w), H = util_next_power_of_two(h);
+
+   if (!res->shadow) {
+      struct pipe_resource templ = res->b;
+      templ.width0 = W;
+      templ.height0 = H;
+      templ.last_level = 0;
+      templ.bind = PIPE_BIND_SAMPLER_VIEW;
+      struct pipe_resource *s = pcontext->screen->resource_create(pcontext->screen, &templ);
+      if (!s)
+         return res;
+      res->shadow = grate_resource(s);
+      res->shadow_writes = res->writes - 1;
+   }
+   struct grate_resource *s = res->shadow;
+   if (res->shadow_writes == res->writes)
+      return s;
+
+   /* the source's writes landed, the draws reading the old copy done */
+   grate_context_submit_bo(context, res->bo);
+   grate_bo_wait(res->bo);
+   grate_context_submit_bo(context, s->bo);
+   grate_bo_wait(s->bo);
+
+   struct pipe_blit_info b = {
+      .src.resource = &res->b, .src.format = res->b.format,
+      .dst.resource = &s->b, .dst.format = res->b.format,
+      .mask = PIPE_MASK_RGBA, .filter = PIPE_TEX_FILTER_NEAREST,
+   };
+   u_box_2d(0, 0, w, h, &b.src.box);
+   b.dst.box = b.src.box;
+   pcontext->blit(pcontext, &b);
+
+   b.src.resource = &s->b;
+   for (unsigned x = w, n = 1; x < W; x += n, n *= 2) {
+      n = MIN2(n, W - x);
+      u_box_2d(x - n, 0, n, h, &b.src.box);
+      u_box_2d(x, 0, n, h, &b.dst.box);
+      pcontext->blit(pcontext, &b);
+   }
+   for (unsigned y = h, n = 1; y < H; y += n, n *= 2) {
+      n = MIN2(n, H - y);
+      u_box_2d(0, y - n, W, n, &b.src.box);
+      u_box_2d(0, y, W, n, &b.dst.box);
+      pcontext->blit(pcontext, &b);
+   }
+   grate_bo_wait(s->bo);
+   res->shadow_writes = res->writes;
+   return s;
 }
 
 static uint32_t
@@ -899,6 +970,7 @@ grate_clear(struct pipe_context *pcontext, unsigned int buffers,
                   pack_color(dst->format, color->f),
                   util_format_get_blocksize(dst->format),
                   x, y, w, h);
+         grate_resource(dst->texture)->writes++;
       }
    }
 
@@ -936,6 +1008,7 @@ grate_clear_render_target(struct pipe_context *pipe,
         pack_color(dst->format, color->f),
         util_format_get_blocksize(dst->format),
         dstx, dsty, width, height);
+   grate_resource(dst->texture)->writes++;
    
    grate_stream_end(stream, &ptr);
    grate_stream_flush(stream, false);

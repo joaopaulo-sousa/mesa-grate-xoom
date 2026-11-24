@@ -387,6 +387,21 @@ grate_draw_vbo(struct pipe_context *pcontext,
     * even count of whole triangles each, so that a strip's next part keeps
     * the winding (u_split_draw repeats the two vertices it continues from)
     */
+   /* power-of-two copies the textures are read from (grate_npot_shadow):
+    * up to date now, by the 2D engine, before the draw's job is built */
+   if (context->fshader) {
+      u_foreach_bit(i, context->fshader->info->sampler_mask) {
+         struct pipe_sampler_view *view = context->sampler_views[i];
+         if (grate_npot_shadow(view, context->samplers[i]))
+            grate_resource_npot_shadow(pcontext, grate_resource(view->texture));
+      }
+   }
+
+   /* what the draw renders to changes (copies of it are out of date) */
+   for (unsigned i = 0; i < context->framebuffer.base.nr_cbufs; i++)
+      if (context->framebuffer.base.cbufs[i].texture)
+         grate_resource(context->framebuffer.base.cbufs[i].texture)->writes++;
+
    static const uint32_t max_verts = 2046;
    struct pipe_draw_start_count_bias part = draws[0];
    uint32_t left = draws[0].count;

@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "util/format/u_format.h"
 #include "util/u_dynarray.h"
 #include "util/u_memory.h"
 
@@ -465,6 +466,30 @@ grate_npot_repeat(const struct pipe_sampler_view *view,
             util_is_power_of_two_nonzero(view->texture->height0));
 }
 
+/*
+ * Whether a sampler view + state is read from a power-of-two copy
+ * (grate_resource_npot_shadow): a 2D non-power-of-two texture minified and
+ * magnified with different filters, which the TEX unit picks only for
+ * power-of-two ones. Not mirrored (that would turn at the copy's edge) nor
+ * compressed (the 2D engine copies bytes).
+ */
+bool
+grate_npot_shadow(const struct pipe_sampler_view *view,
+                  const struct pipe_sampler_state *sampler)
+{
+   if (!view || !view->texture || !sampler || view->target != PIPE_TEXTURE_2D)
+      return false;
+   const struct pipe_resource *t = view->texture;
+   return !(util_is_power_of_two_nonzero(t->width0) &&
+            util_is_power_of_two_nonzero(t->height0)) &&
+          sampler->min_img_filter != sampler->mag_img_filter &&
+          view->u.tex.first_level == 0 &&
+          sampler->wrap_s != PIPE_TEX_WRAP_MIRROR_REPEAT &&
+          sampler->wrap_t != PIPE_TEX_WRAP_MIRROR_REPEAT &&
+          !util_format_is_compressed(view->format) &&
+          !util_format_is_depth_or_stencil(view->format);
+}
+
 static struct grate_fp_key
 grate_fs_key(struct grate_context *context)
 {
@@ -493,6 +518,11 @@ grate_fs_key(struct grate_context *context)
          key.npot_s |= 1u << i;
       if (grate_npot_repeat(view, context->samplers[i], 1))
          key.npot_t |= 1u << i;
+      if (grate_npot_shadow(view, context->samplers[i])) {
+         key.npot_shadow |= 1u << i;
+         key.shadow_size[i][0] = view->texture->width0;
+         key.shadow_size[i][1] = view->texture->height0;
+      }
    }
 
    if (!blend)

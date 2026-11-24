@@ -23,6 +23,13 @@ struct grate_resource {
    /* cube maps: the six faces one after the other, each with its mip
     * levels; bytes from one face to the next */
    unsigned int layer_size;
+
+   /* bumped by every write (upload, draw, clear, blit), for copies of it */
+   unsigned int writes;
+   /* a power-of-two copy, for filters the TEX unit has only for those
+    * (grate_resource_npot_shadow), and the writes it is up to date with */
+   struct grate_resource *shadow;
+   unsigned int shadow_writes;
 };
 
 /* Byte offset of a mip level of a layer (cube face) inside the object */
@@ -43,6 +50,9 @@ grate_pixel_format(enum pipe_format format);
 
 unsigned
 grate_resource_blocksize(enum pipe_format format);
+
+struct grate_resource *
+grate_resource_npot_shadow(struct pipe_context *pcontext, struct grate_resource *res);
 
 void
 grate_context_resource_init(struct pipe_context *pcontext);

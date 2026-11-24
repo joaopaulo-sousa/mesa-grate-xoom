@@ -254,10 +254,14 @@ struct grate_fp_key {
     * unit does not wrap those, the program takes fract() of the coordinate
     * (grate_npot_repeat) */
    uint8_t npot_s, npot_t;
-   uint8_t pad[3];
+   /* samplers reading a power-of-two copy (grate_npot_shadow): the program
+    * scales the coordinates by the texture's size to the copy's, here */
+   uint8_t npot_shadow;
+   uint8_t pad[2];
    /* sampler view swizzles (PIPE_SWIZZLE_* r | g << 3 | b << 6 | a << 9),
     * xor GRATE_SWIZZLE_IDENTITY: 0 is none */
    uint16_t tex_swizzle[GRATE_FP_MAX_SWIZZLED];
+   uint16_t shadow_size[GRATE_FP_MAX_SWIZZLED][2];   /* npot_shadow: w, h */
    /* glBlendColor, while a blend factor reads it (else 0): compiled in as
     * immediates, a change of colour selects another variant */
    float blend_color[4];
