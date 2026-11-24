@@ -208,6 +208,10 @@ grate_vp_pack(uint32_t *dst, struct vp_instr *instr, bool end_of_program)
    }
    tmp.scalar_op_write_mask = vp_write_mask(instr->scalar.dst.write_mask);
 
+   /* clamps both results to [0, 1] (vertex-shader-isa.md); the compiler
+    * pairs every operation with a NOP, so it is the one operation's */
+   tmp.saturate_result = instr->vec.dst.saturate || instr->scalar.dst.saturate;
+
    tmp.rA = vp_src_reg(instr->vec.src[0]);
    tmp.rA_absolute = instr->vec.src[0].absolute;
 
