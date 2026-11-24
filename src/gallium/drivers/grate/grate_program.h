@@ -60,6 +60,7 @@ struct grate_fragment_shader_state {
    const struct grate_fp_info *info;  /* that variant's */
 
    bool discards;                     /* KILL/KILL_IF: discards fragments */
+   bool reads_z;                      /* gl_FragCoord.z (grate_fp_key.depth) */
 
    struct grate_fs_variant variants[GRATE_FS_MAX_VARIANTS];
    unsigned num_variants;

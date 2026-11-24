@@ -265,6 +265,9 @@ struct grate_fp_key {
    /* glBlendColor, while a blend factor reads it (else 0): compiled in as
     * immediates, a change of colour selects another variant */
    float blend_color[4];
+   /* gl_FragCoord.z, while the program reads it (else 0): the viewport's
+    * depth scale and translate, compiled in as immediates */
+   float depth[2];
 };
 
 /* max_pre: preshader entries at most (GRATE_FP_MAX_PRE); fewer keep more

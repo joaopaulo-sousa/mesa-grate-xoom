@@ -61,6 +61,7 @@ struct grate_context {
     * its guard band only, so draws are scissored to this (emit_scissor) */
    struct pipe_scissor_state viewport_rect;
    uint32_t viewport[10];
+   float depth_scale, depth_translate;   /* of the viewport: gl_FragCoord.z */
    uint32_t guardband[4];
 };
 

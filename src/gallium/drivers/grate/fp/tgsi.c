@@ -305,6 +305,12 @@ fp_opnd_const(struct fp_compiler *c, float value)
    return fp_opnd_uniform(fp_const_slot(c, value));
 }
 
+static struct fp_opnd
+fp_val(struct fp_compiler *c, enum fp_alu_op op, struct fp_opnd a,
+       struct fp_opnd b, struct fp_opnd cc);
+static struct fp_opnd
+fp_sfu(struct fp_compiler *c, enum fp_sfu_op op, struct fp_opnd x);
+
 /*
  * The fragment position and the polygon face are registers, not varyings
  * (grate fragment-shader-isa.md). Measured: the position registers hold
@@ -331,8 +337,25 @@ fp_special_input(struct fp_compiler *c, int input, int comp, struct fp_opnd *o)
    if (name != TGSI_SEMANTIC_POSITION)
       return false;
    if (comp > 1) {
-      /* z and w need the linker's help (fragment-shader-isa.md), not done */
-      *o = comp == 3 ? fp_opnd_one(c, false) : fp_opnd_zero(c, false);
+      /*
+       * z and w: the clip space z and w of the position export, a varying
+       * like any other (the linker reads export 0 by its semantic), which
+       * the perspective correct interpolation gives exactly. w is 1 / w_clip
+       * and z the viewport's depth transform of z_clip / w_clip, its scale
+       * and translate in the key. The NVIDIA blob also spends TRAM columns
+       * on them (cgdump fragz: w from an interpolated component and rcp, z
+       * from a "magic" linker write into r3).
+       */
+      struct fp_opnd w = { .kind = FP_OPND_INPUT, .index = input, .comp = 3 };
+      struct fp_opnd rw = fp_sfu(c, FP_SFU_OP_RCP, w);
+      if (comp == 3) {
+         *o = rw;
+         return true;
+      }
+      struct fp_opnd z = { .kind = FP_OPND_INPUT, .index = input, .comp = 2 };
+      struct fp_opnd ndc = fp_val(c, FP_ALU_OP_MAD, z, rw, fp_opnd_zero(c, false));
+      *o = fp_val(c, FP_ALU_OP_MAD, ndc, fp_opnd_const(c, c->key->depth[0]),
+                  fp_opnd_const(c, c->key->depth[1]));
       return true;
    }
 
@@ -415,10 +438,6 @@ fp_src(struct fp_compiler *c, const struct tgsi_src_register *src, int chan)
 
    return fp_opnd_modify(o, src->Negate, src->Absolute);
 }
-
-static struct fp_opnd
-fp_val(struct fp_compiler *c, enum fp_alu_op op, struct fp_opnd a,
-       struct fp_opnd b, struct fp_opnd cc);
 
 /* A value written under a predicate: the old one for the other pixels (a
  * temporary not written yet is 0) */
@@ -746,9 +765,6 @@ fp_val(struct fp_compiler *c, enum fp_alu_op op, struct fp_opnd a,
  * TEX with varying coordinates: one texture fetch per EXEC, the texel
  * channels become fixed10 operands. A colour destination gets copies.
  */
-static struct fp_opnd
-fp_sfu(struct fp_compiler *c, enum fp_sfu_op op, struct fp_opnd x);
-
 /* Texture coordinates a multi-row program can fetch with: two components
  * of a varying, interpolated straight into a register pair (the TRAM layout
  * puts any component in any column) */

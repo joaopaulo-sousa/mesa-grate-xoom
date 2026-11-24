@@ -437,6 +437,7 @@ grate_create_fs_state(struct pipe_context *pcontext,
    struct tgsi_shader_info scan;
    tgsi_scan_shader(so->base.tokens, &scan);
    so->discards = scan.uses_kill;
+   so->reads_z = scan.reads_z;
 
    /* the opaque variant, used without blending */
    grate_fs_compile(context->drm->soc_id, so->base.tokens, &grate_fp_key_none,
@@ -498,6 +499,11 @@ grate_fs_key(struct grate_context *context)
 
    memset(&key, 0, sizeof(key));
    key.colormask = 0xf;
+
+   if (context->fshader && context->fshader->reads_z) {
+      key.depth[0] = context->depth_scale;
+      key.depth[1] = context->depth_translate;
+   }
 
    for (unsigned i = 0; i < GRATE_FP_MAX_SWIZZLED; i++) {
       const struct pipe_sampler_view *view = context->sampler_views[i];

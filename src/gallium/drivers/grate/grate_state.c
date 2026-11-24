@@ -126,6 +126,9 @@ grate_set_viewport_states(struct pipe_context *pcontext,
    assert(num_viewports == 1);
    assert(start_slot == 0);
 
+   context->depth_scale = viewports[0].scale[2];
+   context->depth_translate = viewports[0].translate[2];
+
    context->viewport[0] = host1x_opcode_incr(REG_TGR3D_SU_VIEWPORT_X, 6);
    context->viewport[1] = u_bitcast_f2u(viewports[0].translate[0] * 16.0f);
    context->viewport[2] = u_bitcast_f2u(viewports[0].translate[1] * 16.0f);
