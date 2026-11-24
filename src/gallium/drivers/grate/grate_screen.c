@@ -431,6 +431,8 @@ grate_sampler_format(enum pipe_format format)
    case PIPE_FORMAT_L8_UNORM:
    case PIPE_FORMAT_A8_UNORM:
    case PIPE_FORMAT_L8A8_UNORM:
+   case PIPE_FORMAT_Z16_UNORM:   /* read as L8A8 (grate_fp_key.depth_tex) */
+   case PIPE_FORMAT_Z24_UNORM_S8_UINT:   /* its depth plane, linear Z16 then */
    case PIPE_FORMAT_DXT1_RGB:
    case PIPE_FORMAT_DXT1_RGBA:
    case PIPE_FORMAT_DXT3_RGBA:
@@ -460,10 +462,10 @@ grate_screen_is_format_supported(struct pipe_screen *pscreen,
    }
 
    /* depth/stencil is two planes (grate_resource.stencil): a depth/stencil
-    * buffer only */
+    * buffer, or a texture of its depth (OES_packed_depth_stencil with
+    * OES_depth_texture) */
    if (format == PIPE_FORMAT_Z24_UNORM_S8_UINT &&
        (usage & ~PIPE_BIND_DEPTH_STENCIL & (PIPE_BIND_RENDER_TARGET |
-                                            PIPE_BIND_SAMPLER_VIEW |
                                             PIPE_BIND_DISPLAY_TARGET |
                                             PIPE_BIND_SCANOUT | PIPE_BIND_SHARED)))
       return false;

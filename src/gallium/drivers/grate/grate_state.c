@@ -809,7 +809,7 @@ emit_depth_offset(struct grate_context *context, uint32_t **ptrp, enum mesa_prim
 
    if (rast && rast->offset_tri && zs->texture &&
        u_reduced_prim(mode) == MESA_PRIM_TRIANGLES) {
-      int r = grate_pixel_format(zs->format) == TGR3D_SURF_FORMAT_Z16NL ? 64 : 16;
+      int r = grate_resource(zs->texture)->format == TGR3D_SURF_FORMAT_Z16NL ? 64 : 16;
       long units = lroundf(rast->offset_units * r);
       bias = CLAMP(units, -(1 << 21), (1 << 21) - 1) & TGR3D_SU_ZBIAS_VAL__MASK;
       factor = rast->offset_scale;
@@ -1019,7 +1019,11 @@ emit_textures(struct grate_context *context, uint32_t **ptrp)
       unsigned width = res->b.width0, height = res->b.height0;
       uint32_t lo, hi;
 
-      lo = TGR3D_TEX_TEXDESC_LO_SURF_FORMAT(res->format) |
+      /* Z16: no depth format in the TEX unit, the bytes as L8A8
+       * (grate_fp_key.depth_tex) */
+      unsigned fmt = res->format == TGR3D_SURF_FORMAT_Z16 ? TGR3D_SURF_FORMAT_L8A8
+                                                          : res->format;
+      lo = TGR3D_TEX_TEXDESC_LO_SURF_FORMAT(fmt) |
            TGR3D_TEX_TEXDESC_LO_LAYOUT(TGR3D_LAYOUT_LINEAR);
       if (view->target == PIPE_TEXTURE_CUBE)
          lo |= TGR3D_TEX_TEXDESC_LO_CUBEMAP;

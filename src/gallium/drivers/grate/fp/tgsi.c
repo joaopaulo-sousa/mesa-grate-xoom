@@ -922,12 +922,37 @@ emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst,
    if (sampler < GRATE_FP_MAX_SWIZZLED)
       swizzle ^= c->key->tex_swizzle[sampler];
 
+   /*
+    * A depth texture read as L8A8 (grate_fp_key.depth_tex): luminance the
+    * low byte, alpha the high one. Measured: the TEX unit gives a byte v as
+    * the fixed10 (v + (v >> 7)) / 256, so A' = A / 256 plus 1 / 256 from
+    * A = 128 on, which s = sat(256 A' - 127) takes back out:
+    * d = A' + L' / 256 - s / 256, within the fp20 rounding of
+    * (256 A + L) / 65535. Luminance (d, d, d, 1), as OES_depth_texture has
+    * it.
+    */
+   struct fp_opnd depth = { 0 };
+   bool is_depth = sampler < GRATE_FP_MAX_SWIZZLED && (c->key->depth_tex & (1u << sampler));
+   if (is_depth) {
+      struct fp_opnd l = { .kind = FP_OPND_TEXEL, .index = n, .comp = 0 };
+      struct fp_opnd a = { .kind = FP_OPND_TEXEL, .index = n, .comp = 3 };
+      struct fp_unit *step = fp_new_unit(c);
+      step->saturate = true;
+      fp_unit_op(&step->slots[0], FP_ALU_OP_MAD, a, fp_opnd_const(c, 256.0f),
+                 fp_opnd_const(c, -127.0f));
+      struct fp_opnd hl = fp_val(c, FP_ALU_OP_MAD, l, fp_opnd_const(c, 1.0f / 256.0f), a);
+      depth = fp_val(c, FP_ALU_OP_MAD, fp_opnd_value(c, step),
+                     fp_opnd_const(c, -1.0f / 256.0f), hl);
+   }
+
    for (int i = 0; i < 4; i++) {
       if (!(dst->WriteMask & (1 << i)))
          continue;
       bool output = fp_color_write(c, dst);
       unsigned sw = (swizzle >> (3 * i)) & 7;
       struct fp_opnd texel = { .kind = FP_OPND_TEXEL, .index = n, .comp = sw };
+      if (is_depth && sw <= PIPE_SWIZZLE_W)
+         texel = sw == PIPE_SWIZZLE_W ? fp_opnd_one(c, output) : depth;
       if (sw == PIPE_SWIZZLE_0)
          texel = fp_opnd_zero(c, output);
       else if (sw == PIPE_SWIZZLE_1)

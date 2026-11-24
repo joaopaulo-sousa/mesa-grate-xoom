@@ -524,6 +524,9 @@ grate_fs_key(struct grate_context *context)
          key.npot_s |= 1u << i;
       if (grate_npot_repeat(view, context->samplers[i], 1))
          key.npot_t |= 1u << i;
+      if (view->format == PIPE_FORMAT_Z16_UNORM ||
+          view->format == PIPE_FORMAT_Z24_UNORM_S8_UINT)
+         key.depth_tex |= 1u << i;
       if (grate_npot_shadow(view, context->samplers[i])) {
          key.npot_shadow |= 1u << i;
          key.shadow_size[i][0] = view->texture->width0;

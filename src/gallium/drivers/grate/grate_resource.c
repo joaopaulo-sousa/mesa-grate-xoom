@@ -346,7 +346,9 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
    resource->tiled = 0;
    if (template->bind & (PIPE_BIND_RENDER_TARGET | PIPE_BIND_SAMPLER_VIEW |
                          PIPE_BIND_SCANOUT | PIPE_BIND_DEPTH_STENCIL)) {
-      if (template->bind & PIPE_BIND_DEPTH_STENCIL)
+      /* a depth texture: the rows as the TEX unit reads them (below) */
+      if ((template->bind & PIPE_BIND_DEPTH_STENCIL) &&
+          !(template->bind & PIPE_BIND_SAMPLER_VIEW))
          resource->pitch = align(resource->pitch, 256);
       else if (!(template->bind & PIPE_BIND_SAMPLER_VIEW))
          resource->pitch = align(resource->pitch, 32);
@@ -387,6 +389,11 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
       /* pick pixel-format */
       int format = grate_pixel_format(template->format);
       assert(format >= 0);
+      /* a depth/stencil texture: the depth plane in the linear Z16 the
+       * TEX unit can be made to read (grate_fp_key.depth_tex) */
+      if (template->format == PIPE_FORMAT_Z24_UNORM_S8_UINT &&
+          (template->bind & PIPE_BIND_SAMPLER_VIEW))
+         format = TGR3D_SURF_FORMAT_Z16;
       resource->format = format;
    }
 
@@ -914,9 +921,10 @@ fill_zs(struct grate_stream *stream, uint32_t **ptrp, struct pipe_surface *dst,
    bool clear_stencil = (flags & PIPE_CLEAR_STENCIL) && util_format_has_stencil(desc);
 
    if (res->stencil) {
+      uint16_t z = res->format == TGR3D_SURF_FORMAT_Z16 ? util_pack_z(PIPE_FORMAT_Z16_UNORM, depth)
+                                                        : grate_pack_z16nl(depth);
       if (clear_depth)
-         fill(stream, ptrp, res, dst->level, dst->first_layer, grate_pack_z16nl(depth), 2,
-              x, y, width, height);
+         fill(stream, ptrp, res, dst->level, dst->first_layer, z, 2, x, y, width, height);
       if (clear_stencil)
          fill(stream, ptrp, res->stencil, dst->level, dst->first_layer, stencil, 1, x, y, width, height);
    } else if (clear_depth || clear_stencil) {

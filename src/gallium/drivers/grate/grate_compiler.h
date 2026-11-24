@@ -257,7 +257,11 @@ struct grate_fp_key {
    /* samplers reading a power-of-two copy (grate_npot_shadow): the program
     * scales the coordinates by the texture's size to the copy's, here */
    uint8_t npot_shadow;
-   uint8_t pad[2];
+   /* samplers reading a Z16 depth texture: the TEX unit has no depth
+    * format (measured, gratetest GRATETEST_TEXDEPTHV), the 16 bits are read
+    * as L8A8, the program puts low and high byte back together */
+   uint8_t depth_tex;
+   uint8_t pad;
    /* sampler view swizzles (PIPE_SWIZZLE_* r | g << 3 | b << 6 | a << 9),
     * xor GRATE_SWIZZLE_IDENTITY: 0 is none */
    uint16_t tex_swizzle[GRATE_FP_MAX_SWIZZLED];
