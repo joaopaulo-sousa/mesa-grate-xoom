@@ -569,7 +569,10 @@ seq_fetch_inputs(struct fp_compiler *c, struct seq_state *s,
 
       if (i < c->num_units) {
          struct fp_unit *u = &c->units[i];
-         if (!u->live || u->exec >= 0 || !seq_others_ready(c, s, u, e, FP_OPND_INPUT))
+         /* one row: when the rest is there, to keep registers free; more:
+          * now or never (only the first round interpolates) */
+         if (!u->live || u->exec >= 0 ||
+             (c->seq_rows == 1 && !seq_others_ready(c, s, u, e, FP_OPND_INPUT)))
             continue;
          /* colour writes wait for the rest (seq_unit_ready): their
           * varyings would only take registers meanwhile */

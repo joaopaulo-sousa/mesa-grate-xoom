@@ -138,10 +138,9 @@ fp_assign_inputs(struct fp_compiler *c, bool packed)
                   col = k;
          }
          if (col < 0) {
-            if (packed)
-               fp_fail(c, "too many varyings");
-            else
-               c->failed = true;
+            /* not in rows: the sequential schedule interpolates in more
+             * EXECs (fp_sched_rows_units) */
+            c->failed = true;
             return;
          }
          e--;
@@ -813,12 +812,12 @@ fp_sched_rows_units(struct fp_compiler *c, int min_rows)
     * does not fit (the destination colour and what reads them get room) */
    for (int packed = 0; packed < 2; packed++) {
       fp_assign_inputs(c, packed);
-      if (c->failed && !packed) {
+      if (c->failed) {
          c->failed = false;
+         if (packed)
+            return false;
          continue;
       }
-      if (c->failed)
-         return false;
 
       for (int limit = 16; limit > 0; limit--) {
          if (!fp_schedule(c, limit))
