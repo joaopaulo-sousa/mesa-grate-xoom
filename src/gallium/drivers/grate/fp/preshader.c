@@ -183,30 +183,38 @@ fp_preshade(struct fp_compiler *c)
           info->num_pre == c->max_pre || !fp_pre_unit(c, u, pre_of, &p))
          continue;
 
-      int slot = fp_pre_slot(info);
-      if (slot < 0)
-         break;
-      p.dst = slot;
+      /* a uniform slot only for what the program reads (below): the
+       * entries others read are results on the CPU only */
+      p.dst = GRATE_FP_PRE_NO_DST;
       p.value01 = fp_pre_value01(info, &p);
-      BITSET_SET(info->used_mask, slot);
       pre_of[i] = info->num_pre;
-      slot_of[i] = slot;
       info->pre[info->num_pre++] = p;
    }
 
-   /* the readers take the uniform; the units themselves end up dead. A
-    * special function works in place on a register: one left in the
-    * program (out of preshader room) keeps its operand unit */
+   /* the readers left in the program take the uniform; the units
+    * themselves end up dead. A special function works in place on a
+    * register: one left in the program (out of preshader room) keeps its
+    * operand unit */
    for (int i = 0; i < c->num_units; i++) {
       struct fp_unit *u = &c->units[i];
-      if (u->sfu)
+      if (u->sfu || pre_of[i] >= 0)
          continue;
       fp_unit_foreach_src(u, k, j) {
          struct fp_opnd *o = &u->slots[k].src[j];
-         if (o->kind == FP_OPND_VALUE && slot_of[o->index] >= 0) {
-            o->kind = FP_OPND_UNIFORM;
-            o->index = slot_of[o->index];
+         if (o->kind != FP_OPND_VALUE || pre_of[o->index] < 0)
+            continue;
+         if (slot_of[o->index] < 0) {
+            int slot = fp_pre_slot(info);
+            if (slot < 0) {
+               fp_fail(c, "too many uniforms");
+               return;
+            }
+            BITSET_SET(info->used_mask, slot);
+            slot_of[o->index] = slot;
+            info->pre[pre_of[o->index]].dst = slot;
          }
+         o->kind = FP_OPND_UNIFORM;
+         o->index = slot_of[o->index];
       }
    }
 
@@ -214,7 +222,8 @@ fp_preshade(struct fp_compiler *c)
    int pre_at_slot[GRATE_FP_MAX_SLOTS];
    memset(pre_at_slot, -1, sizeof(pre_at_slot));
    for (int i = 0; i < info->num_pre; i++)
-      pre_at_slot[info->pre[i].dst] = i;
+      if (info->pre[i].dst != GRATE_FP_PRE_NO_DST)
+         pre_at_slot[info->pre[i].dst] = i;
 
    info->num_spec = 0;
    for (int i = 0; i < c->num_units; i++) {
@@ -345,7 +354,8 @@ fp_fold(struct fp_compiler *c)
 
    memset(pre_at_slot, -1, sizeof(pre_at_slot));
    for (int i = 0; i < c->fp->info.num_pre; i++)
-      pre_at_slot[c->fp->info.pre[i].dst] = i;
+      if (c->fp->info.pre[i].dst != GRATE_FP_PRE_NO_DST)
+         pre_at_slot[c->fp->info.pre[i].dst] = i;
 
    for (int i = 0; i < c->num_units; i++) {
       struct fp_unit *u = &c->units[i];

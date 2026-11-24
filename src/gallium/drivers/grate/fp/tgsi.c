@@ -1895,8 +1895,9 @@ fp_compact_uniforms(struct fp_compiler *c)
       BITSET_SET(info->used_mask, i);
 
    for (int i = 0; i < info->num_pre; i++)
-      info->pre[i].dst = map[info->pre[i].dst] >= 0 ? map[info->pre[i].dst] :
-                                                      GRATE_FP_PRE_NO_DST;
+      if (info->pre[i].dst != GRATE_FP_PRE_NO_DST)
+         info->pre[i].dst = map[info->pre[i].dst] >= 0 ? map[info->pre[i].dst] :
+                                                         GRATE_FP_PRE_NO_DST;
 
    for (int i = 0; i < c->num_units; i++) {
       struct fp_unit *u = &c->units[i];

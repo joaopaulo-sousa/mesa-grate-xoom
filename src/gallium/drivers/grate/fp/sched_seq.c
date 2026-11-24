@@ -1135,15 +1135,27 @@ seq_read_in_exec(struct fp_compiler *c, const struct fp_opnd *o, int e)
    return false;
 }
 
+/* The register items of phase 2 and their registers: on the heap (with
+ * FP_MAX_UNITS of them, too much for a thread's stack) */
+#define SEQ_MAX_ITEMS (FP_MAX_UNITS + FP_MAX_INPUTS * 4 + 4 * FP_MAX_TEXTURES + 8)
+struct seq_alloc_mem {
+   struct seq_item items[SEQ_MAX_ITEMS];
+   int order[SEQ_MAX_ITEMS];
+   int assigned[SEQ_MAX_ITEMS], assigned_half[SEQ_MAX_ITEMS];
+   int value_item[FP_MAX_UNITS];
+};
+
 static bool
 seq_alloc(struct fp_compiler *c, struct seq_state *s)
 {
-   struct seq_item items[FP_MAX_UNITS + FP_MAX_INPUTS * 4 + 4 * FP_MAX_TEXTURES + 8];
-   int value_item[FP_MAX_UNITS], input_item[FP_MAX_INPUTS][4];
+   struct seq_alloc_mem *m = c->seq_mem;
+   struct seq_item *items = m->items;
+   int *value_item = m->value_item;
+   int input_item[FP_MAX_INPUTS][4];
    int texel_item[FP_MAX_TEXTURES][4], dst_item[4], out_item[4];
    int num = 0;
 
-   memset(value_item, -1, sizeof(value_item));
+   memset(value_item, -1, sizeof(m->value_item));
    memset(input_item, -1, sizeof(input_item));
    memset(texel_item, -1, sizeof(texel_item));
    memset(dst_item, -1, sizeof(dst_item));
@@ -1304,7 +1316,7 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
    /* greedy in order of definition, fixed registers first at equal times;
     * more rows: the items bound to a row (SFU operands) before the free
     * ones, which fit around them */
-   int order[ARRAY_SIZE(items)];
+   int *order = m->order;
    for (int i = 0; i < num; i++)
       order[i] = i;
 #define SEQ_FREE(it) (c->seq_rows > 1 && (it)->reg < 0 && (it)->row < 0)
@@ -1317,9 +1329,9 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
          int tmp = order[k]; order[k] = order[k - 1]; order[k - 1] = tmp;
       }
 
-   int assigned[ARRAY_SIZE(items)], assigned_half[ARRAY_SIZE(items)];
-   memset(assigned, -1, sizeof(assigned));
-   memset(assigned_half, -1, sizeof(assigned_half));
+   int *assigned = m->assigned, *assigned_half = m->assigned_half;
+   memset(assigned, -1, sizeof(m->assigned));
+   memset(assigned_half, -1, sizeof(m->assigned_half));
    for (int oi = 0; oi < num; oi++) {
       int i = order[oi];
       struct seq_item *it = &items[i];
@@ -1471,13 +1483,20 @@ bool
 fp_sched_seq(struct fp_compiler *c)
 {
    struct seq_readers *rd = MALLOC_STRUCT(seq_readers);
-   if (!rd)
+   struct seq_alloc_mem *mem = MALLOC_STRUCT(seq_alloc_mem);
+   if (!rd || !mem) {
+      FREE(rd);
+      FREE(mem);
       return false;
+   }
+   c->seq_mem = mem;
    seq_build_readers(c, rd);
    c->seq_readers = rd;
    bool ok = seq_sched_rows(c);
    c->seq_readers = NULL;
+   c->seq_mem = NULL;
    FREE(rd);
+   FREE(mem);
    return ok;
 }
 

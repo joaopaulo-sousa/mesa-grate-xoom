@@ -20,7 +20,7 @@
 #include "grate_compiler.h"
 #include "fpir.h"
 
-#define FP_MAX_UNITS 512
+#define FP_MAX_UNITS 1024
 #define FP_MAX_TEMPS 32
 #define FP_MAX_INPUTS 16
 #define FP_MAX_EXECS 4           /* multi-row programs */
@@ -232,6 +232,7 @@ struct fp_compiler {
    int seq_rows;           /* pixel packet rows of a sequential program (1..4):
                               EXEC e works on row e % seq_rows (sched_seq.c) */
    struct seq_readers *seq_readers;   /* sched_seq.c, while it runs */
+   struct seq_alloc_mem *seq_mem;     /* ... and its register items */
    struct fp_seq_exec seq_exec[FP_SEQ_MAX_EXECS];
 
    int packet_exec[FP_MAX_PACKETS];
