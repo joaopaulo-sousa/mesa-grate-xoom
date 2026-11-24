@@ -1,10 +1,12 @@
 #include <stdio.h>
 #include <math.h>
+#include <string.h>
 
 #include "pipe/p_state.h"
 #include "util/u_bitcast.h"
 #include "util/u_draw.h"
 #include "util/u_helpers.h"
+#include "util/u_inlines.h"
 #include "util/u_prim.h"
 #include "util/u_split_draw.h"
 
@@ -319,7 +321,30 @@ grate_init_state(struct grate_context *context, uint32_t **ptrp)
 
 static void
 grate_draw_range(struct grate_context *context, const struct pipe_draw_info *info,
-                 const struct pipe_draw_start_count_bias *draws);
+                 const struct pipe_draw_start_count_bias *draws, uint32_t pivot);
+
+/*
+ * The vertex a fan turns around and a loop closes on (PIVOT_VTX). It is a
+ * vertex number, not a position in the index buffer: an indexed fan or loop
+ * reads its first index (on the CPU, only for those two primitives)
+ */
+static uint32_t
+grate_draw_pivot(struct pipe_context *pcontext, const struct pipe_draw_info *info,
+                 const struct pipe_draw_start_count_bias *draw)
+{
+   if (!info->index_size)
+      return draw->start;
+   if (info->mode != MESA_PRIM_TRIANGLE_FAN && info->mode != MESA_PRIM_LINE_LOOP)
+      return 0;
+
+   uint32_t index = 0;
+   unsigned offset = draw->start * info->index_size;
+   if (info->has_user_indices)
+      memcpy(&index, (const uint8_t *)info->index.user + offset, info->index_size);
+   else
+      pipe_buffer_read(pcontext, info->index.resource, offset, info->index_size, &index);
+   return index;
+}
 
 /* Whether the draw reads a BO an earlier draw of the open job wrote: its
  * textures (a render target sampled) and vertex buffers */
@@ -404,12 +429,13 @@ grate_draw_vbo(struct pipe_context *pcontext,
 
    static const uint32_t max_verts = 2046;
    struct pipe_draw_start_count_bias part = draws[0];
+   uint32_t pivot = grate_draw_pivot(pcontext, info, &draws[0]);
    uint32_t left = draws[0].count;
    while (left) {
       uint32_t count = left, step;
       u_split_draw(info, max_verts, &count, &step);
       part.count = count;
-      grate_draw_range(context, info, &part);
+      grate_draw_range(context, info, &part, pivot);
       part.start += step;
       left -= step;
    }
@@ -418,7 +444,7 @@ grate_draw_vbo(struct pipe_context *pcontext,
 /* One draw of at most 2048 vertices */
 static void
 grate_draw_range(struct grate_context *context, const struct pipe_draw_info *info,
-                 const struct pipe_draw_start_count_bias *draws)
+                 const struct pipe_draw_start_count_bias *draws, uint32_t pivot)
 {
    struct pipe_context *pcontext = &context->base;
    struct grate_stream *stream = &context->gr3d->stream;
@@ -496,7 +522,7 @@ grate_draw_range(struct grate_context *context, const struct pipe_draw_info *inf
    value  = TGR3D_IDX_SET_PRIM_DRAW_MODE(index_size);
    value |= context->rast->draw_params;
    value |= TGR3D_IDX_SET_PRIM_PRIM_TYPE(grate_primitive_type(info->mode));
-   value |= TGR3D_IDX_SET_PRIM_PIVOT_VTX(draws[0].start);
+   value |= TGR3D_IDX_SET_PRIM_PIVOT_VTX(pivot);
    value |= TGR3D_IDX_SET_PRIM_INVALIDATE_DMACACHE;
    value |= TGR3D_IDX_SET_PRIM_INVALIDATE_VTXCACHE;
 
