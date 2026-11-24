@@ -115,7 +115,13 @@ grate_set_viewport_states(struct pipe_context *pcontext,
                           const struct pipe_viewport_state *viewports)
 {
    struct grate_context *context = grate_context(pcontext);
-   static const float zeps = 0x1p-21f; /* 2^-21 */
+   /*
+    * Window depth scaled by 1 - 2^-20, so that it stays below 1.0 (the
+    * depth plane's last step) whatever the depth range, glDepthRange(0, 0)
+    * and reversed ones too. (Upstream took 2^-21 off scale and translate,
+    * which only does that for (0, 1): (0, 0) went below 0, clipped away.)
+    */
+   static const float zscale = 1.0f - 0x1p-20f;
    unsigned int hw_scale;
 
    if (context->drm->soc_id == DRM_TEGRA_SOC_T114)
@@ -132,13 +138,14 @@ grate_set_viewport_states(struct pipe_context *pcontext,
    context->viewport[0] = host1x_opcode_incr(REG_TGR3D_SU_VIEWPORT_X, 6);
    context->viewport[1] = u_bitcast_f2u(viewports[0].translate[0] * 16.0f);
    context->viewport[2] = u_bitcast_f2u(viewports[0].translate[1] * 16.0f);
-   context->viewport[3] = u_bitcast_f2u(viewports[0].translate[2] - zeps);
+   context->viewport[3] = u_bitcast_f2u(viewports[0].translate[2] * zscale);
    context->viewport[4] = u_bitcast_f2u(viewports[0].scale[0] * 16.0f);
    context->viewport[5] = u_bitcast_f2u(viewports[0].scale[1] * 16.0f);
-   context->viewport[6] = u_bitcast_f2u(viewports[0].scale[2] - zeps);
+   context->viewport[6] = u_bitcast_f2u(viewports[0].scale[2] * zscale);
 
    /* the range the depth unit keeps (Z_CLAMP_KILL): from the nearer to the
-    * farther, whichever glDepthRange puts first */
+    * farther, whichever glDepthRange puts first (unscaled: the depth
+    * written, z * zscale, stays within it) */
    float z0 = viewports[0].translate[2] - viewports[0].scale[2];
    float z1 = viewports[0].translate[2] + viewports[0].scale[2];
    uint32_t depth_near = MIN2(z0, z1) * hw_scale;
