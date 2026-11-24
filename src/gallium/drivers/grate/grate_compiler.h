@@ -35,11 +35,11 @@ struct grate_vp_shader {
  * compiler allocates up to GRATE_FP_MAX_SLOTS while it works and keeps the
  * ones the final program reads (fp_compact_uniforms). */
 #define GRATE_FP_NUM_CONSTS 32
-#define GRATE_FP_MAX_SLOTS 512
+#define GRATE_FP_MAX_SLOTS 2048
 /* user uniform components a shader may declare (64 vec4: Qt Quick's
  * shaders declare more than the GLES2 minimum of 16); only those it reads
  * take a register, a program reading more than there are fails to compile */
-#define GRATE_FP_USER_CONSTS 256
+#define GRATE_FP_USER_CONSTS 1024
 #define GRATE_FP_MAX_IMMEDIATES 32
 
 /*
@@ -159,6 +159,17 @@ struct grate_fp_link {
    uint8_t input;          /* TGSI input */
 };
 
+/* The uniform slots of a program while it compiles: user uniform components,
+ * immediates and preshader results; the first GRATE_FP_NUM_CONSTS, the ALU
+ * uniform registers, go to grate_fp_info once compiled */
+struct grate_fp_slots {
+   uint32_t consts[GRATE_FP_MAX_SLOTS];
+   uint16_t user_index[GRATE_FP_MAX_SLOTS]; /* user slot: index * 4 + comp */
+   BITSET_DECLARE(used_mask, GRATE_FP_MAX_SLOTS);  /* slots taken */
+   BITSET_DECLARE(imm_mask, GRATE_FP_MAX_SLOTS);   /* holding immediates */
+   BITSET_DECLARE(user_mask, GRATE_FP_MAX_SLOTS);  /* holding user uniforms */
+};
+
 struct grate_fp_info {
    struct grate_fp_link links[GRATE_FP_MAX_LINKS];
    int num_links;
@@ -166,13 +177,13 @@ struct grate_fp_info {
    int max_tram_row;       /* TRAM rows used */
    int num_rows;            /* pixel packet rows (r0-r3, r4-r7, ...) */
    /* ALU uniform registers: user uniform components, immediates (fp20,
-    * already converted) and preshader results. Slots while compiling, the
-    * first GRATE_FP_NUM_CONSTS once compiled. */
-   uint32_t consts[GRATE_FP_MAX_SLOTS];
-   uint8_t user_index[GRATE_FP_MAX_SLOTS]; /* user slot: index * 4 + comp */
-   BITSET_DECLARE(used_mask, GRATE_FP_MAX_SLOTS);  /* slots taken */
-   BITSET_DECLARE(imm_mask, GRATE_FP_MAX_SLOTS);   /* holding immediates */
-   BITSET_DECLARE(user_mask, GRATE_FP_MAX_SLOTS);  /* holding user uniforms */
+    * already converted) and preshader results (the compiler works with
+    * more slots, struct grate_fp_slots) */
+   uint32_t consts[GRATE_FP_NUM_CONSTS];
+   uint16_t user_index[GRATE_FP_NUM_CONSTS]; /* user slot: index * 4 + comp */
+   BITSET_DECLARE(used_mask, GRATE_FP_NUM_CONSTS);  /* registers taken */
+   BITSET_DECLARE(imm_mask, GRATE_FP_NUM_CONSTS);   /* holding immediates */
+   BITSET_DECLARE(user_mask, GRATE_FP_NUM_CONSTS);  /* holding user uniforms */
    uint32_t sampler_mask;   /* samplers read */
    /* LOD bias of TXB with a constant bias, per sampler, in 1/16 (the
     * TEXDESC LOD_BIAS field is s4.4); lod_bias_mask: samplers with one */
@@ -180,13 +191,13 @@ struct grate_fp_info {
    uint16_t lod_bias_mask;
    /* TXB with a uniform bias: the user float (index * 4 + comp) added to
     * the descriptor at draw time, negated for the samplers in _neg */
-   uint8_t lod_bias_user[16];
+   uint16_t lod_bias_user[16];
    uint16_t lod_bias_user_mask, lod_bias_user_neg;
    struct grate_fp_pre *pre;   /* num_pre of them, freed by grate_fp_info_fini */
    int num_pre;
    struct grate_fp_spec spec[GRATE_FP_MAX_SPEC];
    int num_spec;
-   uint8_t flow_user[GRATE_FP_MAX_FLOW];   /* user uniforms loops exit by */
+   uint16_t flow_user[GRATE_FP_MAX_FLOW];   /* user uniforms loops exit by */
    int num_flow;
    bool can_move;           /* texture coordinates the VS could compute */
    struct grate_moved moved;   /* ... that it does (grate_fp_key.move) */
@@ -242,7 +253,7 @@ grate_tgsi_to_vp(struct grate_vp_shader *vp, struct tgsi_parse_context *tgsi,
 struct grate_fp_key {
    uint32_t spec_bits;
    float flow[GRATE_FP_MAX_FLOW];            /* values of flow_user[] */
-   uint8_t flow_user[GRATE_FP_MAX_FLOW];
+   uint16_t flow_user[GRATE_FP_MAX_FLOW];
    uint8_t blend;
    uint8_t rgb_func, rgb_src, rgb_dst;       /* PIPE_BLEND_*, PIPE_BLENDFACTOR_* */
    uint8_t alpha_func, alpha_src, alpha_dst;

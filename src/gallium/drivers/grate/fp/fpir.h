@@ -47,6 +47,10 @@ struct fp_alu_src_operand {
    bool minus_one;
    bool sub_reg_select_high;
    unsigned index;
+   /* while compiling: a uniform slot (fp_alu_src_uniform), numbered into
+    * the 32 registers (index 32 + slot) once constants are embedded */
+   bool uniform;
+   unsigned slot;
 };
 
 struct fp_alu_instr {

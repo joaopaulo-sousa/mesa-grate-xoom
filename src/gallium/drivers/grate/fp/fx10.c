@@ -84,8 +84,8 @@ fx10_uniform_range(struct fp_compiler *c, int slot)
 {
    const struct grate_fp_info *info = &c->fp->info;
 
-   if (BITSET_TEST(info->imm_mask, slot)) {
-      float v = fp20_to_float(info->consts[slot]);
+   if (BITSET_TEST(c->slots.imm_mask, slot)) {
+      float v = fp20_to_float(c->slots.consts[slot]);
       return (struct fx10_range) { v, v };
    }
    for (int i = 0; i < info->num_pre; i++)

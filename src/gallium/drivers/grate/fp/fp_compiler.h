@@ -233,6 +233,7 @@ struct fp_compiler {
                               EXEC e works on row e % seq_rows (sched_seq.c) */
    struct seq_readers *seq_readers;   /* sched_seq.c, while it runs */
    struct seq_alloc_mem *seq_mem;     /* ... and its register items */
+   struct grate_fp_slots slots;       /* uniform slots while it compiles */
    struct fp_seq_exec seq_exec[FP_SEQ_MAX_EXECS];
 
    int packet_exec[FP_MAX_PACKETS];

@@ -32,13 +32,17 @@ fp_alu_src_reg(int index)
    return src;
 }
 
+/* Uniform slot "slot": register 32 + slot once fp_info_uniforms numbers
+ * what the program still reads after embedding constants */
 struct fp_alu_src_operand
-fp_alu_src_uniform(int index)
+fp_alu_src_uniform(int slot)
 {
-   assert(index >= 0 && index < GRATE_FP_NUM_CONSTS);
+   assert(slot >= 0 && slot < GRATE_FP_MAX_SLOTS);
    struct fp_alu_src_operand src = {
-      .index = 32 + index,
-      .datatype = FP_DATATYPE_FP20
+      .index = 32 + slot % GRATE_FP_NUM_CONSTS,
+      .datatype = FP_DATATYPE_FP20,
+      .uniform = true,
+      .slot = slot,
    };
    return src;
 }
@@ -73,11 +77,11 @@ fp_const_slot(struct fp_compiler *c, float value)
    int i;
 
    for (i = 0; i < GRATE_FP_MAX_SLOTS; i++)
-      if (BITSET_TEST(fp->info.imm_mask, i) && fp->info.consts[i] == fp20)
+      if (BITSET_TEST(c->slots.imm_mask, i) && c->slots.consts[i] == fp20)
          return i;
 
    for (i = 0; i < GRATE_FP_MAX_SLOTS; i++)
-      if (!BITSET_TEST(fp->info.used_mask, i))
+      if (!BITSET_TEST(c->slots.used_mask, i))
          break;
    if (i == GRATE_FP_MAX_SLOTS) {
       c->fp->info.out_of_uniforms = true;
@@ -85,9 +89,9 @@ fp_const_slot(struct fp_compiler *c, float value)
       return 0;
    }
 
-   fp->info.consts[i] = fp20;
-   BITSET_SET(fp->info.imm_mask, i);
-   BITSET_SET(fp->info.used_mask, i);
+   c->slots.consts[i] = fp20;
+   BITSET_SET(c->slots.imm_mask, i);
+   BITSET_SET(c->slots.used_mask, i);
    return i;
 }
 
@@ -100,13 +104,13 @@ fp_uniform_slot(struct fp_compiler *c, int index, int comp)
    int user = index * 4 + comp;
 
    for (int i = 0; i < GRATE_FP_MAX_SLOTS; i++)
-      if (BITSET_TEST(info->user_mask, i) && info->user_index[i] == user)
+      if (BITSET_TEST(c->slots.user_mask, i) && c->slots.user_index[i] == user)
          return i;
    for (int i = 0; i < GRATE_FP_MAX_SLOTS; i++)
-      if (!BITSET_TEST(info->used_mask, i)) {
-         info->user_index[i] = user;
-         BITSET_SET(info->user_mask, i);
-         BITSET_SET(info->used_mask, i);
+      if (!BITSET_TEST(c->slots.used_mask, i)) {
+         c->slots.user_index[i] = user;
+         BITSET_SET(c->slots.user_mask, i);
+         BITSET_SET(c->slots.used_mask, i);
          return i;
       }
    c->fp->info.out_of_uniforms = true;
@@ -156,8 +160,17 @@ fp_alu_src_one(void)
  * upload them (grate_fp_info.reads_uniforms).
  */
 static void
-fp_embed_constants(struct grate_fp_shader *fp)
+fp_remap_uniforms(struct fp_compiler *c, const int *map, int n);
+
+/*
+ * Immediates into the ALU packets that leave ALU3 free (up to three each,
+ * imm0..imm2, any slot of the packet reads them), as the NVIDIA compiler
+ * does: they need no uniform register then (fp_info_uniforms)
+ */
+static void
+fp_embed_constants(struct fp_compiler *c)
 {
+   struct grate_fp_shader *fp = c->fp;
    struct grate_fp_info *info = &fp->info;
    const struct fp_alu_instr nop = fp_alu_nop();
    bool embed = !debug_get_bool_option("GRATE_FP_NO_EMBED", false);
@@ -168,42 +181,112 @@ fp_embed_constants(struct grate_fp_shader *fp)
       if (info->pre[i].dst != GRATE_FP_PRE_NO_DST)
          BITSET_SET(pre, info->pre[i].dst);
 
-   info->reads_uniforms = false;
    list_for_each_entry(struct fp_alu_instr_packet, pk, &fp->alu_instructions, link) {
       bool free3 = embed && !memcmp(&pk->slots[3], &nop, sizeof(nop));
 
       for (int k = 0; k < 4; k++) {
          struct fp_alu_instr *a = &pk->slots[k];
-         unsigned old_c = a->src[2].index;
+         struct fp_alu_src_operand old_c = a->src[2];
 
          for (int j = 0; j < 3; j++) {
             struct fp_alu_src_operand *s = &a->src[j];
-            if (s->index < 32 || s->index >= 64)
+            if (!s->uniform)
                continue;
-            unsigned slot = s->index - 32;
+            unsigned slot = s->slot;
             if (!free3 || k == 3 || s->datatype != FP_DATATYPE_FP20 ||
-                !BITSET_TEST(info->imm_mask, slot) || BITSET_TEST(pre, slot)) {
-               info->reads_uniforms = true;
+                !BITSET_TEST(c->slots.imm_mask, slot) || BITSET_TEST(pre, slot))
                continue;
-            }
             unsigned e = 0;
-            while (e < pk->num_imm && pk->imm[e] != info->consts[slot])
+            while (e < pk->num_imm && pk->imm[e] != c->slots.consts[slot])
                e++;
             if (e == pk->num_imm) {
-               if (pk->num_imm == 3) {
-                  info->reads_uniforms = true;
+               if (pk->num_imm == 3)
                   continue;
-               }
-               pk->imm[pk->num_imm++] = info->consts[slot];
+               pk->imm[pk->num_imm++] = c->slots.consts[slot];
             }
             s->index = FP_EMBEDDED_REG(e);
+            s->uniform = false;
          }
          /* rD repeats rC's register (or rB's): keep it on rC's */
-         if (a->src[3].index == old_c)
+         if (a->src[3].index == old_c.index && a->src[3].uniform == old_c.uniform &&
+             a->src[3].slot == old_c.slot) {
             a->src[3].index = a->src[2].index;
-         else if (a->rd_enable && a->src[3].index >= 32 && a->src[3].index < 64)
-            info->reads_uniforms = true;
+            a->src[3].uniform = a->src[2].uniform;
+            a->src[3].slot = a->src[2].slot;
+         }
       }
+   }
+}
+
+/*
+ * The uniform registers: the slots the program still reads once constants
+ * are embedded, numbered 0 .. 31 (registers 32 ..), into the info
+ */
+static void
+fp_info_uniforms(struct fp_compiler *c)
+{
+   struct grate_fp_info *info = &c->fp->info;
+   BITSET_DECLARE(read, GRATE_FP_MAX_SLOTS);
+   int map[GRATE_FP_MAX_SLOTS];
+   int n = 0;
+
+   BITSET_ZERO(read);
+   list_for_each_entry(struct fp_alu_instr_packet, pk, &c->fp->alu_instructions, link)
+      for (int k = 0; k < 4; k++)
+         for (int j = 0; j < 4; j++) {
+            const struct fp_alu_src_operand *s = &pk->slots[k].src[j];
+            if (s->uniform && (j < 3 || pk->slots[k].rd_enable))
+               BITSET_SET(read, s->slot);
+         }
+   for (int i = 0; i < info->moved.num_nodes; i++)
+      for (int k = 0; k < 3; k++)
+         if (info->moved.nodes[i][k].kind == GRATE_MOVED_UNIFORM)
+            BITSET_SET(read, info->moved.nodes[i][k].index);
+   for (int i = 0; i < info->moved.num_outs; i++)
+      for (int k = 0; k < info->moved.out[i].num_roots; k++)
+         if (info->moved.out[i].root[k].kind == GRATE_MOVED_UNIFORM)
+            BITSET_SET(read, info->moved.out[i].root[k].index);
+
+   for (int i = 0; i < GRATE_FP_MAX_SLOTS; i++)
+      map[i] = BITSET_TEST(read, i) ? n++ : -1;
+   if (n > GRATE_FP_NUM_CONSTS && !c->failed) {
+      info->out_of_uniforms = true;
+      fp_fail(c, "too many uniforms");
+   }
+   BITSET_ZERO(info->used_mask);
+   BITSET_ZERO(info->imm_mask);
+   BITSET_ZERO(info->user_mask);
+   memset(info->consts, 0, sizeof(info->consts));
+   memset(info->user_index, 0, sizeof(info->user_index));
+   info->reads_uniforms = false;
+   if (c->failed)
+      return;
+
+   fp_remap_uniforms(c, map, n);
+   list_for_each_entry(struct fp_alu_instr_packet, pk, &c->fp->alu_instructions, link)
+      for (int k = 0; k < 4; k++)
+         for (int j = 0; j < 4; j++) {
+            struct fp_alu_src_operand *s = &pk->slots[k].src[j];
+            if (!s->uniform)
+               continue;
+            if (map[s->slot] < 0) {   /* rD without rd_enable: never read */
+               s->index = 31;
+               s->uniform = false;
+               continue;
+            }
+            s->slot = map[s->slot];
+            s->index = 32 + s->slot;
+            info->reads_uniforms = true;
+         }
+
+   memcpy(info->consts, c->slots.consts, sizeof(info->consts));
+   memcpy(info->user_index, c->slots.user_index, sizeof(info->user_index));
+   for (int i = 0; i < n; i++) {
+      BITSET_SET(info->used_mask, i);
+      if (BITSET_TEST(c->slots.imm_mask, i))
+         BITSET_SET(info->imm_mask, i);
+      if (BITSET_TEST(c->slots.user_mask, i))
+         BITSET_SET(info->user_mask, i);
    }
 }
 
@@ -1131,8 +1214,8 @@ fp_opnd_is_const(struct fp_compiler *c, const struct fp_opnd *o, float v)
    if (o->kind == FP_OPND_ONE)
       return v == 1.0f;
    return o->kind == FP_OPND_UNIFORM &&
-          BITSET_TEST(c->fp->info.imm_mask, o->index) &&
-          c->fp->info.consts[o->index] == grate_float_to_fp20(v);
+          BITSET_TEST(c->slots.imm_mask, o->index) &&
+          c->slots.consts[o->index] == grate_float_to_fp20(v);
 }
 
 /*
@@ -1301,10 +1384,10 @@ emit_tgsi_instr(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
          info->lod_bias[smp] = bias;
          info->lod_bias_mask |= 1u << smp;
       } else if (smp < 16 && b.kind == FP_OPND_UNIFORM && !b.absolute &&
-                 BITSET_TEST(c->fp->info.user_mask, b.index)) {
+                 BITSET_TEST(c->slots.user_mask, b.index)) {
          /* a uniform: known at draw time (grate_state.c emit_textures) */
          struct grate_fp_info *info = &c->fp->info;
-         unsigned user = info->user_index[b.index];
+         unsigned user = c->slots.user_index[b.index];
          bool neg = b.negate;
          if ((info->lod_bias_user_mask & (1u << smp)) &&
              (info->lod_bias_user[smp] != user ||
@@ -1829,6 +1912,53 @@ fp_relayout(struct fp_compiler *c)
  * keep their index (grate_fp_spec refers to them) and are evaluated all
  * the same.
  */
+/* The uniform slots of map[] (old slot -> new, -1: dropped), n of them:
+ * the slot arrays, the preshader results and the vertex shader's uniforms
+ * of the moved coordinates */
+static void
+fp_remap_uniforms(struct fp_compiler *c, const int *map, int n)
+{
+   struct grate_fp_info *info = &c->fp->info;
+   struct grate_fp_slots *old = MALLOC_STRUCT(grate_fp_slots);
+   if (!old) {
+      fp_fail(c, "out of memory");
+      return;
+   }
+   memcpy(old, &c->slots, sizeof(*old));
+   memset(c->slots.consts, 0, sizeof(c->slots.consts));
+   memset(c->slots.user_index, 0, sizeof(c->slots.user_index));
+   BITSET_ZERO(c->slots.used_mask);
+   BITSET_ZERO(c->slots.imm_mask);
+   BITSET_ZERO(c->slots.user_mask);
+   for (int i = 0; i < GRATE_FP_MAX_SLOTS; i++) {
+      if (map[i] < 0)
+         continue;
+      c->slots.consts[map[i]] = old->consts[i];
+      c->slots.user_index[map[i]] = old->user_index[i];
+      if (BITSET_TEST(old->imm_mask, i))
+         BITSET_SET(c->slots.imm_mask, map[i]);
+      if (BITSET_TEST(old->user_mask, i))
+         BITSET_SET(c->slots.user_mask, map[i]);
+   }
+   FREE(old);
+   for (int i = 0; i < n; i++)
+      BITSET_SET(c->slots.used_mask, i);
+
+   for (int i = 0; i < info->num_pre; i++)
+      if (info->pre[i].dst != GRATE_FP_PRE_NO_DST)
+         info->pre[i].dst = map[info->pre[i].dst] >= 0 ? map[info->pre[i].dst] :
+                                                         GRATE_FP_PRE_NO_DST;
+
+   for (int i = 0; i < info->moved.num_nodes; i++)
+      for (int k = 0; k < 3; k++)
+         if (info->moved.nodes[i][k].kind == GRATE_MOVED_UNIFORM)
+            info->moved.nodes[i][k].index = map[info->moved.nodes[i][k].index];
+   for (int i = 0; i < info->moved.num_outs; i++)
+      for (int k = 0; k < info->moved.out[i].num_roots; k++)
+         if (info->moved.out[i].root[k].kind == GRATE_MOVED_UNIFORM)
+            info->moved.out[i].root[k].index = map[info->moved.out[i].root[k].index];
+}
+
 static void
 fp_compact_uniforms(struct fp_compiler *c)
 {
@@ -1861,43 +1991,9 @@ fp_compact_uniforms(struct fp_compiler *c)
 
    for (int i = 0; i < GRATE_FP_MAX_SLOTS; i++)
       map[i] = BITSET_TEST(read, i) ? n++ : -1;
-   if (n > GRATE_FP_NUM_CONSTS) {
-      c->fp->info.out_of_uniforms = true;
-      fp_fail(c, "too many uniforms");
-      return;
-   }
-
-   uint32_t consts[GRATE_FP_NUM_CONSTS] = { 0 };
-   uint8_t user_index[GRATE_FP_NUM_CONSTS] = { 0 };
-   BITSET_DECLARE(imm_mask, GRATE_FP_MAX_SLOTS);
-   BITSET_DECLARE(user_mask, GRATE_FP_MAX_SLOTS);
-   BITSET_ZERO(imm_mask);
-   BITSET_ZERO(user_mask);
-   for (int i = 0; i < GRATE_FP_MAX_SLOTS; i++) {
-      if (map[i] < 0)
-         continue;
-      consts[map[i]] = info->consts[i];
-      user_index[map[i]] = info->user_index[i];
-      if (BITSET_TEST(info->imm_mask, i))
-         BITSET_SET(imm_mask, map[i]);
-      if (BITSET_TEST(info->user_mask, i))
-         BITSET_SET(user_mask, map[i]);
-   }
-
-   memset(info->consts, 0, sizeof(info->consts));
-   memset(info->user_index, 0, sizeof(info->user_index));
-   memcpy(info->consts, consts, sizeof(consts));
-   memcpy(info->user_index, user_index, sizeof(user_index));
-   BITSET_COPY(info->imm_mask, imm_mask);
-   BITSET_COPY(info->user_mask, user_mask);
-   BITSET_ZERO(info->used_mask);
-   for (int i = 0; i < n; i++)
-      BITSET_SET(info->used_mask, i);
-
-   for (int i = 0; i < info->num_pre; i++)
-      if (info->pre[i].dst != GRATE_FP_PRE_NO_DST)
-         info->pre[i].dst = map[info->pre[i].dst] >= 0 ? map[info->pre[i].dst] :
-                                                         GRATE_FP_PRE_NO_DST;
+   /* more than the registers: constants embedded in the ALU packets
+    * (fp_embed_constants) may still bring it down, fp_info_uniforms counts */
+   fp_remap_uniforms(c, map, n);
 
    for (int i = 0; i < c->num_units; i++) {
       struct fp_unit *u = &c->units[i];
@@ -1907,9 +2003,6 @@ fp_compact_uniforms(struct fp_compiler *c)
          if (u->slots[k].src[j].kind == FP_OPND_UNIFORM)
             u->slots[k].src[j].index = map[u->slots[k].src[j].index];
    }
-   for (int i = 0; i < num_msrc; i++)
-      if (msrc[i]->kind == GRATE_MOVED_UNIFORM)
-         msrc[i]->index = map[msrc[i]->index];
 }
 
 /* Drop units whose value is never used */
@@ -1996,9 +2089,9 @@ fp_eval(struct fp_compiler *c, struct fp_opnd o, float *v)
       x = 1.0f;
       break;
    case FP_OPND_UNIFORM:
-      if (!BITSET_TEST(c->fp->info.imm_mask, o.index))
+      if (!BITSET_TEST(c->slots.imm_mask, o.index))
          return false;
-      x = fp20_to_float(c->fp->info.consts[o.index]);
+      x = fp20_to_float(c->slots.consts[o.index]);
       break;
    case FP_OPND_VALUE:
       if (!fp_eval_unit(c, o.index, &x))
@@ -2076,8 +2169,8 @@ fp_deps(struct fp_compiler *c, struct fp_opnd o, BITSET_WORD *users)
    case FP_OPND_ONE:
       return true;
    case FP_OPND_UNIFORM:
-      if (BITSET_TEST(c->fp->info.user_mask, o.index))
-         BITSET_SET(users, c->fp->info.user_index[o.index]);
+      if (BITSET_TEST(c->slots.user_mask, o.index))
+         BITSET_SET(users, c->slots.user_index[o.index]);
       return true;
    case FP_OPND_VALUE:
       break;
@@ -2465,6 +2558,9 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    fp->info.num_links = 0;
    fp->info.color_input = -1;
    fp->info.max_tram_row = 1;
+   BITSET_ZERO(c->slots.used_mask);
+   BITSET_ZERO(c->slots.imm_mask);
+   BITSET_ZERO(c->slots.user_mask);
    BITSET_ZERO(fp->info.used_mask);
    BITSET_ZERO(fp->info.imm_mask);
    BITSET_ZERO(fp->info.user_mask);
@@ -2604,7 +2700,8 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
       fp_emit_seq(c);
    else
       fp_emit_rows(c);
-   fp_embed_constants(fp);
+   fp_embed_constants(c);
+   fp_info_uniforms(c);
    fp_build_links(c);
    fp->info.num_rows = c->seq ? MAX2(c->seq_rows, 1) : c->num_execs;
    fp->info.failed = c->failed;

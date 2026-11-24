@@ -53,12 +53,12 @@ fp_pre_opnd(struct fp_compiler *c, const struct fp_opnd *o, const int *pre_of,
       p->value = o->kind == FP_OPND_ONE;
       return true;
    case FP_OPND_UNIFORM:
-      if (BITSET_TEST(info->imm_mask, o->index)) {
+      if (BITSET_TEST(c->slots.imm_mask, o->index)) {
          p->kind = GRATE_FP_PRE_CONST;
-         p->value = fp20_to_float(info->consts[o->index]);
+         p->value = fp20_to_float(c->slots.consts[o->index]);
       } else {
          p->kind = GRATE_FP_PRE_USER;
-         p->index = info->user_index[o->index];
+         p->index = c->slots.user_index[o->index];
       }
       return true;
    case FP_OPND_VALUE:
@@ -131,10 +131,10 @@ fp_pre_value01(const struct grate_fp_info *info, const struct grate_fp_pre *p)
 }
 
 static int
-fp_pre_slot(struct grate_fp_info *info)
+fp_pre_slot(struct fp_compiler *c)
 {
    for (int i = 0; i < GRATE_FP_MAX_SLOTS; i++)
-      if (!BITSET_TEST(info->used_mask, i))
+      if (!BITSET_TEST(c->slots.used_mask, i))
          return i;
    return -1;
 }
@@ -204,12 +204,12 @@ fp_preshade(struct fp_compiler *c)
          if (o->kind != FP_OPND_VALUE || pre_of[o->index] < 0)
             continue;
          if (slot_of[o->index] < 0) {
-            int slot = fp_pre_slot(info);
+            int slot = fp_pre_slot(c);
             if (slot < 0) {
                fp_fail(c, "too many uniforms");
                return;
             }
-            BITSET_SET(info->used_mask, slot);
+            BITSET_SET(c->slots.used_mask, slot);
             slot_of[o->index] = slot;
             info->pre[pre_of[o->index]].dst = slot;
          }
@@ -289,8 +289,8 @@ fp_spec_const(struct fp_compiler *c, const int *pre_at_slot, const bool *known,
       *v = 1.0f;
       break;
    case FP_OPND_UNIFORM:
-      if (BITSET_TEST(info->imm_mask, o->index))
-         *v = fp20_to_float(info->consts[o->index]);
+      if (BITSET_TEST(c->slots.imm_mask, o->index))
+         *v = fp20_to_float(c->slots.consts[o->index]);
       else if (fp_spec_find(c, pre_at_slot, o, true, &bit))
          *v = bit;
       else
@@ -331,8 +331,8 @@ fp_spec_has_slot(struct fp_compiler *c, float v)
    uint32_t fp20 = grate_float_to_fp20(v);
 
    for (int i = 0; i < GRATE_FP_MAX_SLOTS; i++)
-      if (!BITSET_TEST(info->used_mask, i) ||
-          (BITSET_TEST(info->imm_mask, i) && info->consts[i] == fp20))
+      if (!BITSET_TEST(c->slots.used_mask, i) ||
+          (BITSET_TEST(c->slots.imm_mask, i) && c->slots.consts[i] == fp20))
          return true;
    return false;
 }

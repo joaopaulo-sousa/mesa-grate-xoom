@@ -150,8 +150,8 @@ fp_opnd_known(struct fp_compiler *c, const struct fp_opnd *o, float *v)
       *v = 0.0f;
    else if (o->kind == FP_OPND_ONE)
       *v = 1.0f;
-   else if (o->kind == FP_OPND_UNIFORM && BITSET_TEST(c->fp->info.imm_mask, o->index))
-      *v = fp20_to_float(c->fp->info.consts[o->index]);
+   else if (o->kind == FP_OPND_UNIFORM && BITSET_TEST(c->slots.imm_mask, o->index))
+      *v = fp20_to_float(c->slots.consts[o->index]);
    else
       return false;
    if (o->minus_one)
