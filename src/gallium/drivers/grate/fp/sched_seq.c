@@ -971,7 +971,13 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
          x->ipl_input[k] = -1;
       x->first_packet = packet;
    }
-   return remaining == 0;
+
+   /* more rows: each EXEC without a packet gets an empty one (emission),
+    * and they count against the program's packets too */
+   int total = packet;
+   for (int e = 0; c->seq_rows > 1 && e < s->num_execs; e++)
+      total += !c->seq_exec[e].num_packets;
+   return remaining == 0 && total <= FP_MAX_PACKETS;
 }
 
 /*
@@ -1501,15 +1507,15 @@ fp_emit_seq(struct fp_compiler *c)
 
       if (x->cube_mfu) {
          /*
-          * Cube coordinates computed by the ALU, as the NVIDIA compiler
-          * does: rcp of register 8 + R's column (the major axis) into R,
-          * then S and T scaled by it.
+          * Cube or projective coordinates computed by the ALU, as the
+          * NVIDIA compiler does: rcp of register 8 + R's column (the major
+          * axis) or of q into that register, then S and T scaled by it.
           */
          int p = c->tex[x->tex].pair, r = 2 * (1 - p);
          struct fp_mfu_instr *mfu = CALLOC_STRUCT(fp_mfu_instr);
          list_inithead(&mfu->link);
          mfu->sfu.op = FP_SFU_OP_RCP;
-         mfu->sfu.reg = 8 + r;
+         mfu->sfu.reg = c->tex[x->tex].cube ? 8 + r : r;
          for (int k = 0; k < 2; k++) {
             mfu->mul[k].dst = FP_MFU_MUL_DST_ROW_REG_0 + 2 * p + k;
             mfu->mul[k].src[0] = FP_MFU_MUL_SRC_ROW_REG_0 + r;

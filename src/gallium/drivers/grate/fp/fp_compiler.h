@@ -196,16 +196,19 @@ struct fp_compiler {
    /* texture fetches; multi-row programs need coord = TGSI input
     * components 2*pair, +1 */
    struct {
-      /* s and t, then in sequential programs: a cube map's r (the MFU
-       * divides them by the major axis in the TEX EXEC) and a per-pixel
-       * LOD bias (txb), in the first and second register of the texel
-       * pair (the texel overwrites them) */
+      /* s and t, then in sequential programs: a cube map's r or a
+       * projective q (the MFU divides s and t by the major axis or by q in
+       * the TEX EXEC) and a per-pixel LOD bias (txb), in the first and
+       * second register of the texel pair (the texel overwrites them) */
       struct fp_opnd coord[4];
       uint8_t role[4];     /* enum fp_tex_role */
       int num_coords;
-      /* cube map: in a multi-row program R is coordinate 2 of the same
-       * varying, interpolated into that register, and the MFU divides */
+      /* cube map, projective fetch (TXP): in a multi-row program R or q
+       * is component r_comp of the same varying, interpolated into that
+       * register, and the MFU divides */
       bool cube;
+      bool proj;
+      int r_comp;
       int input;
       int pair;            /* register pair of the coordinates */
       int sampler;

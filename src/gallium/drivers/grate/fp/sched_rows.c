@@ -97,12 +97,12 @@ fp_assign_inputs(struct fp_compiler *c, bool packed)
          }
          c->exec_input[e][2 * (1 - p) + k] = -2;
       }
-      if (c->tex[n].cube) {
-         /* R: coordinate 2 into the first register of the texel pair. Not
-          * the component's fetch for the ALU: the texel overwrites it */
+      if (c->tex[n].cube || c->tex[n].proj) {
+         /* R or q into the first register of the texel pair. Not the
+          * component's fetch for the ALU: the texel overwrites it */
          int col = 2 * (1 - p);
          c->exec_input[e][col] = in;
-         c->exec_comp[e][col] = 2;
+         c->exec_comp[e][col] = c->tex[n].r_comp;
       }
       e++;
    }
@@ -624,18 +624,20 @@ fp_emit_rows(struct fp_compiler *c)
          }
 
          /*
-          * Cube map coordinates, as the NVIDIA compiler sets them up: an
-          * rcp of register 8 + R's column (the major axis, measured to be
-          * what that register gives) into R, then S and T scaled by it.
+          * Cube map and projective coordinates, as the NVIDIA compiler sets
+          * them up: an rcp of register 8 + R's column (the major axis,
+          * measured to be what that register gives) or of q into that
+          * register, then S and T scaled by it.
           */
          for (int n = 0; n < c->num_tex; n++) {
-            if (!c->tex[n].live || c->tex[n].exec != e || !c->tex[n].cube)
+            if (!c->tex[n].live || c->tex[n].exec != e ||
+                !(c->tex[n].cube || c->tex[n].proj))
                continue;
             int p = c->tex[n].pair, r = 2 * (1 - p);
             struct fp_mfu_instr *s = CALLOC_STRUCT(fp_mfu_instr);
             list_inithead(&s->link);
             s->sfu.op = FP_SFU_OP_RCP;
-            s->sfu.reg = 8 + r;
+            s->sfu.reg = c->tex[n].cube ? 8 + r : r;
             for (int k = 0; k < 2; k++) {
                s->mul[k].dst = FP_MFU_MUL_DST_ROW_REG_0 + 2 * p + k;
                s->mul[k].src[0] = FP_MFU_MUL_SRC_ROW_REG_0 + r;

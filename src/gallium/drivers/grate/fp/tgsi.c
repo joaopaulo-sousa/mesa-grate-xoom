@@ -635,6 +635,34 @@ emit_setcc(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
 }
 
 /*
+ * SSG: x < 0 ? -1 : (-x < 0 ? 1 : 0). The NVIDIA compiler (cgdump
+ * shaders/sign.glsl) takes the difference of two comparisons instead.
+ */
+static void
+emit_sign(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
+{
+   const struct tgsi_dst_register *dst = &inst->Dst[0].Register;
+   bool output = fp_color_write(c, dst);
+   struct fp_opnd x[4];
+
+   for (int i = 0; i < 4; i++)
+      if (dst->WriteMask & (1 << i))
+         x[i] = fp_src(c, &inst->Src[0].Register, i);
+
+   for (int i = 0; i < 4; i++) {
+      if (!(dst->WriteMask & (1 << i)))
+         continue;
+      struct fp_opnd pos = fp_val(c, FP_ALU_OP_CSEL, fp_opnd_modify(x[i], true, false),
+                                  fp_opnd_one(c, false), fp_opnd_zero(c, false));
+      struct fp_unit *u = fp_new_unit(c);
+      u->saturate = inst->Instruction.Saturate != 0;
+      fp_unit_op(&u->slots[0], FP_ALU_OP_CSEL, x[i],
+                 fp_opnd_modify(fp_opnd_one(c, output), true, false), pos);
+      fp_dst(c, u, dst, i);
+   }
+}
+
+/*
  * DP2/DP3/DP4 in slots 0..n-1 of one packet, slot k computing a[k] * b[k].
  * Measured on Tegra20: "send" on slot 1 and 2 adds their products to slot 0,
  * "recv" on slot 0 adds slot 3's product. Slot 0 then holds the sum; whether
@@ -730,13 +758,20 @@ fp_tex_varying(const struct fp_opnd *s, const struct fp_opnd *t)
           !t->negate && !t->absolute;
 }
 
+/*
+ * proj: TXP, s and t divided by q (the w of the coordinates). As the NVIDIA
+ * compiler does it (cgdump shaders/proj3.glsl, proj4.glsl): q goes to the
+ * first register of the texel pair, and the MFU of the TEX EXEC divides in
+ * place, "rcp q" then s, t *= the result, like a cube map's major axis.
+ */
 static void
 emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst,
-         const struct fp_opnd *bias)
+         const struct fp_opnd *bias, bool proj)
 {
    const struct tgsi_dst_register *dst = &inst->Dst[0].Register;
    struct fp_opnd s = fp_src(c, &inst->Src[0].Register, 0);
    struct fp_opnd t = fp_src(c, &inst->Src[0].Register, 1);
+   unsigned smp = inst->Src[1].Register.Index;
 
    bool cube = inst->Texture.Texture == TGSI_TEXTURE_CUBE;
    if (inst->Texture.Texture != TGSI_TEXTURE_2D &&
@@ -746,6 +781,32 @@ emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst,
    }
    struct fp_opnd cube_r = { 0 };
    bool cube_computed = false;
+   int r_comp = 2;
+   if (proj && cube) {
+      fp_fail(c, "projective cube map fetch");
+      return;
+   }
+   if (proj) {
+      struct fp_opnd q = fp_src(c, &inst->Src[0].Register, 3);
+      bool wrap = c->key && smp < 8 &&
+                  ((c->key->npot_s | c->key->npot_t) & (1u << smp));
+      if (wrap) {
+         /* the wrap below is of s/q, t/q: divided first */
+         struct fp_opnd rq = fp_sfu(c, FP_SFU_OP_RCP, q);
+         s = fp_val(c, FP_ALU_OP_MAD, s, rq, fp_opnd_zero(c, false));
+         t = fp_val(c, FP_ALU_OP_MAD, t, rq, fp_opnd_zero(c, false));
+         proj = false;
+      } else if (fp_tex_varying(&s, &t) && q.kind == FP_OPND_INPUT &&
+                 q.index == s.index && !q.negate && !q.absolute) {
+         r_comp = q.comp;
+      } else {
+         /* computed: the ALU writes copies the MFU divides in place */
+         s = fp_val(c, FP_ALU_OP_MAD, s, fp_opnd_one(c, false), fp_opnd_zero(c, false));
+         t = fp_val(c, FP_ALU_OP_MAD, t, fp_opnd_one(c, false), fp_opnd_zero(c, false));
+         cube_r = fp_val(c, FP_ALU_OP_MAD, q, fp_opnd_one(c, false), fp_opnd_zero(c, false));
+         cube_computed = true;
+      }
+   }
    if (cube) {
       struct fp_opnd r = fp_src(c, &inst->Src[0].Register, 2);
       if (!fp_tex_varying(&s, &t) || r.kind != FP_OPND_INPUT || r.index != s.index ||
@@ -771,7 +832,6 @@ emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst,
 
    /* repeat of a non-power-of-two texture: wrapped here, the TEX unit
     * does not (grate_npot_repeat) */
-   unsigned smp = inst->Src[1].Register.Index;
    if (!cube && c->key && smp < 8 && (c->key->npot_s & (1u << smp)))
       s = fp_sfu(c, FP_SFU_OP_FRC, s);
    if (!cube && c->key && smp < 8 && (c->key->npot_t & (1u << smp)))
@@ -821,6 +881,8 @@ emit_tex(struct fp_compiler *c, const struct tgsi_full_instruction *inst,
    c->tex[n].pair = varying && !(s.comp & 1) && t.comp == s.comp + 1 ? s.comp / 2 : 0;
    c->tex[n].sampler = inst->Src[1].Register.Index;
    c->tex[n].cube = cube;
+   c->tex[n].proj = proj;
+   c->tex[n].r_comp = r_comp;
    c->tex[n].exec = -1;
    c->tex[n].live = false;
 
@@ -1158,7 +1220,10 @@ emit_tgsi_instr(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
       break;
 
    case TGSI_OPCODE_TEX:
-      emit_tex(c, inst, NULL);
+      emit_tex(c, inst, NULL, false);
+      break;
+   case TGSI_OPCODE_TXP:
+      emit_tex(c, inst, NULL, true);
       break;
 
    case TGSI_OPCODE_TXB: {
@@ -1197,10 +1262,10 @@ emit_tgsi_instr(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
          if (neg)
             info->lod_bias_user_neg |= 1u << smp;
       } else {
-         emit_tex(c, inst, &b);
+         emit_tex(c, inst, &b, false);
          break;
       }
-      emit_tex(c, inst, NULL);
+      emit_tex(c, inst, NULL, false);
       break;
    }
 
@@ -1229,6 +1294,10 @@ emit_tgsi_instr(struct fp_compiler *c, const struct tgsi_full_instruction *inst)
    case TGSI_OPCODE_SEQ:
    case TGSI_OPCODE_SNE:
       emit_setcc(c, inst);
+      break;
+
+   case TGSI_OPCODE_SSG:
+      emit_sign(c, inst);
       break;
 
    default:
@@ -2238,19 +2307,19 @@ fp_match_flow(struct fp_program *p)
 }
 
 /*
- * A cube map of a varying .xyz in a program that ends up sequential: the
- * MFU divides in the TEX EXEC there too, on copies of the components the
- * ALU writes (emit_tex)
+ * A cube map or projective fetch of a varying in a program that ends up
+ * sequential: the MFU divides in the TEX EXEC there too, on copies of the
+ * components the ALU writes (emit_tex)
  */
 static void
-fp_cube_computed(struct fp_compiler *c, int n)
+fp_tex_div_computed(struct fp_compiler *c, int n)
 {
    struct fp_opnd in = { .kind = FP_OPND_INPUT, .index = c->tex[n].input };
 
    /* only s and t so far: a bias is not on varyings (emit_tex) */
    for (int k = 0; k < 3; k++) {
       struct fp_unit *u = fp_new_unit(c);
-      in.comp = k;
+      in.comp = k < 2 ? c->tex[n].coord[k].comp : c->tex[n].r_comp;
       fp_unit_op(&u->slots[0], FP_ALU_OP_MAD, in, fp_opnd_one(c, false),
                  fp_opnd_zero(c, false));
       u->live = true;
@@ -2373,8 +2442,9 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    if (!c->failed && !c->seq && !fp_sched_rows(c))
       c->seq = true;
    for (int n = 0; n < c->num_tex && !c->failed && c->seq; n++)
-      if (c->tex[n].live && c->tex[n].cube && fp_tex_coord(c, n, FP_TEX_R) < 0)
-         fp_cube_computed(c, n);
+      if (c->tex[n].live && (c->tex[n].cube || c->tex[n].proj) &&
+          fp_tex_coord(c, n, FP_TEX_R) < 0)
+         fp_tex_div_computed(c, n);
    if (!c->failed && c->seq) {
       /* and the sum it adds may take in a multiply, as when written so */
       fp_expand_blend_inv(c);
