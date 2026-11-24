@@ -567,8 +567,9 @@ seq_fetch_inputs(struct fp_compiler *c, struct seq_state *s,
    int rank = seq_pending_rank(c, s);
    /*
     * An EXEC interpolates with the weights of a barycentric setup in it or
-    * in one of the rows - 1 EXECs before (measured, asmtri exp-late): EXEC
-    * 0's covers the first round. More rows interpolate everything that fits
+    * in an earlier EXEC of the same round (measured, asmtri exp-late: one
+    * on the last row does not reach the next round's first): EXEC 0's
+    * covers the first round. More rows interpolate everything that fits
     * in the first round first; late_ipl (when that does not fit) fetches
     * when needed instead, as one row does, with a setup of its own in an
     * EXEC whose SFU is free (as NVIDIA does: cgdump shaders/big/bump.dis).
@@ -576,7 +577,7 @@ seq_fetch_inputs(struct fp_compiler *c, struct seq_state *s,
    bool just_in_time = c->seq_rows == 1 || s->late_ipl;
    bool by_rank = s->by_channel && just_in_time;
    bool covered = e < c->seq_rows ||
-                  (s->last_bary >= 0 && e - s->last_bary < c->seq_rows);
+                  (s->last_bary >= 0 && s->last_bary / c->seq_rows == e / c->seq_rows);
 
    if (c->seq_rows > 1 && !covered && !s->late_ipl)
       return false;
@@ -1103,6 +1104,24 @@ seq_busy(const struct seq_item *items, int num, const int *assigned,
    return false;
 }
 
+/* Whether an ALU unit of EXEC e reads the value or varying component o */
+static bool
+seq_read_in_exec(struct fp_compiler *c, const struct fp_opnd *o, int e)
+{
+   for (int i = 0; i < c->num_units; i++) {
+      struct fp_unit *r = &c->units[i];
+      if (!r->live || r->exec != e || !seq_is_alu(r))
+         continue;
+      fp_unit_foreach_src(r, k, j) {
+         const struct fp_opnd *x = &r->slots[k].src[j];
+         if (x->kind == o->kind && x->index == o->index &&
+             (o->kind != FP_OPND_INPUT || x->comp == o->comp))
+            return true;
+      }
+   }
+   return false;
+}
+
 static bool
 seq_alloc(struct fp_compiler *c, struct seq_state *s)
 {
@@ -1127,6 +1146,7 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
       items[num] = (struct seq_item) { .def = seq_alu_time(c, u, true), .last = -1, .reg = -1, .half = -1, .row = -1, .fx10 = u->fx10 };
       value_item[i] = num++;
    }
+#define SEQ_MFU_DEF(e, stage) (c->seq_rows > 1 && (e) > 0 ? SEQ_T((e) - 1, T_ALU) : SEQ_T(e, stage))
    /*
     * The MFU of an EXEC writes before the ALU of the one before reads
     * (asmtri exp-late h*: an ipl in EXEC k + 1 over a register the ALU of
@@ -1138,7 +1158,7 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
       for (int k = 0; k < 4; k++)
          if (s->fetch_exec[i][k] >= 0) {
             int e = s->fetch_exec[i][k];
-            int def = c->seq_rows > 1 && e > 0 ? SEQ_T(e - 1, T_ALU) : SEQ_T(e, T_MFU);
+            int def = SEQ_MFU_DEF(e, T_MFU);
             items[num] = (struct seq_item) { .def = def, .last = -1, .reg = s->fetch_reg[i][k], .half = -1, .row = -1 };
             input_item[i][k] = num++;
          }
@@ -1161,23 +1181,41 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
       items[it].row = row;
    }
 
-   /* the TEX and the PSEQ load write all four halves of their pair, read
-    * or not */
+   /*
+    * The TEX and the PSEQ load write all four halves of their pair, read
+    * or not, also before the ALU of the EXEC before reads (with more rows,
+    * as the ipl: asmtri exp-late w*, x*). Except where the fetch's own r or
+    * bias is (the texel pair): the TEX reads that first, so the texel
+    * starts there with the TEX, and no ALU of the EXEC before may read that
+    * coordinate (the texel would be there already).
+    */
    for (int n = 0; n < c->num_tex; n++) {
       if (!c->tex[n].live)
          continue;
-      int q = 1 - c->tex[n].pair, t = SEQ_T(c->tex[n].exec, T_TEX);
-      int base = 4 * SEQ_ROW(c, c->tex[n].exec);
+      int e = c->tex[n].exec;
+      int q = 1 - c->tex[n].pair, t = SEQ_T(e, T_TEX);
+      int base = 4 * SEQ_ROW(c, e);
+      bool own[2] = { false, false };
+      for (int k = 0; k < c->tex[n].num_coords; k++) {
+         int role = c->tex[n].role[k];
+         if (role < FP_TEX_R)
+            continue;
+         own[role - FP_TEX_R] = true;
+         if (c->seq_rows > 1 && e > 0 && seq_read_in_exec(c, &c->tex[n].coord[k], e - 1))
+            return false;
+      }
       for (int h = 0; h < 4; h++) {
-         items[num] = (struct seq_item) { .def = t, .last = t, .reg = base + 2 * q + h / 2, .half = h % 2, .row = -1 };
+         int def = own[h / 2] ? t : SEQ_MFU_DEF(e, T_TEX);
+         items[num] = (struct seq_item) { .def = def, .last = t, .reg = base + 2 * q + h / 2, .half = h % 2, .row = -1 };
          texel_item[n][h] = num++;
       }
    }
    if (c->dst_used) {
       int q = c->dst_pair, t = SEQ_T(s->dst_exec, T_PSEQ);
+      int def = SEQ_MFU_DEF(s->dst_exec, T_PSEQ);
       int base = 4 * SEQ_ROW(c, s->dst_exec);
       for (int h = 0; h < 4; h++) {
-         items[num] = (struct seq_item) { .def = t, .last = t, .reg = base + 2 * q + h / 2, .half = h % 2, .row = -1 };
+         items[num] = (struct seq_item) { .def = def, .last = t, .reg = base + 2 * q + h / 2, .half = h % 2, .row = -1 };
          dst_item[h] = num++;
       }
    }
@@ -1229,6 +1267,7 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
       }
    }
 #undef SEQ_READ
+#undef SEQ_MFU_DEF
 
    /* colour channels own their half from the first write on */
    for (int i = 0; i < c->num_units; i++) {
