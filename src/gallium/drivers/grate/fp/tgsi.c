@@ -1903,7 +1903,9 @@ emit_tgsi_declaration(struct fp_compiler *c, const struct tgsi_full_declaration 
  * from constants, or from uniforms, which then make variants compiled for
  * their values (grate_fp_key.flow); a loop left by a test on the pixel runs
  * every iteration up to FP_MAX_LOOP_ITERATIONS, each pixel keeping the
- * values of its last one.
+ * values of its last one. The NVIDIA compiler unrolls only loops with a
+ * constant count (cgdump shaders/loopuni.glsl, loopdyn.glsl: "profile does
+ * not support for statements").
  */
 
 static bool fp_eval_unit(struct fp_compiler *c, int i, float *v);
@@ -2231,7 +2233,8 @@ fp_run(struct fp_compiler *c, const struct fp_program *p, int start, int end)
             memset(f->exit_written, 0, sizeof(f->exit_written));
             memset(f->exit_outv_written, 0, sizeof(f->exit_outv_written));
             for (int n = 0; ; n++) {
-               if (n == FP_MAX_LOOP_ITERATIONS) {
+               if (n == (f->alive.kind == FP_PRED_VALUE ? FP_MAX_LOOP_ITERATIONS :
+                         FP_MAX_KNOWN_LOOP_ITERATIONS)) {
                   fp_fail(c, "loop runs too long to unroll");
                   return;
                }
@@ -2363,7 +2366,11 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    fp->info.lod_bias_user_mask = fp->info.lod_bias_user_neg = 0;
    memset(fp->info.lod_bias, 0, sizeof(fp->info.lod_bias));
    fp->info.num_pre = 0;
-   fp->info.num_flow = 0;
+   /* the uniforms of the variant's key, then any a loop needs as well (a
+    * counter stepped by another uniform shows only once the first is
+    * known): grate_fs_select compiles again for all of them */
+   fp->info.num_flow = key->num_flow;
+   memcpy(fp->info.flow_user, key->flow_user, sizeof(fp->info.flow_user));
    fp->num_immediates = 0;
 
    c->fp = fp;

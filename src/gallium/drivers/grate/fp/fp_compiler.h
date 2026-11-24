@@ -127,7 +127,11 @@ struct fp_pred {
 };
 
 #define FP_MAX_FLOW_DEPTH 16
+/* iterations unrolled: of a loop some pixels may still be in, and of one
+ * whose exit is known when compiling (the units run out first if it does
+ * any work; this bounds one that does none) */
 #define FP_MAX_LOOP_ITERATIONS 32
+#define FP_MAX_KNOWN_LOOP_ITERATIONS 1024
 
 struct fp_compiler {
    struct grate_fp_shader *fp;
