@@ -2534,6 +2534,59 @@ fp_tex_copy_shared_coords(struct fp_compiler *c)
    }
 }
 
+/*
+ * The copies a cube map or projective fetch divides in place (emit_tex) are
+ * unnecessary for a plain ALU value nothing else reads: the MFU can then
+ * divide that value's register itself, as the NVIDIA compiler does (cgdump
+ * shaders/cubebig: r = trunc(x) computed into the coordinate register).
+ */
+static void
+fp_fold_coord_copies(struct fp_compiler *c)
+{
+   int readers[FP_MAX_UNITS] = { 0 };
+
+   for (int i = 0; i < c->num_units; i++) {
+      struct fp_unit *u = &c->units[i];
+      if (!u->live)
+         continue;
+      fp_unit_foreach_src(u, k, j)
+         if (u->slots[k].src[j].kind == FP_OPND_VALUE)
+            readers[u->slots[k].src[j].index]++;
+   }
+   for (int n = 0; n < c->num_tex; n++)
+      for (int k = 0; c->tex[n].live && k < c->tex[n].num_coords; k++)
+         if (c->tex[n].coord[k].kind == FP_OPND_VALUE)
+            readers[c->tex[n].coord[k].index]++;
+
+   for (int n = 0; n < c->num_tex; n++) {
+      if (!c->tex[n].live || fp_tex_coord(c, n, FP_TEX_R) < 0)
+         continue;
+      for (int k = 0; k < c->tex[n].num_coords; k++) {
+         struct fp_opnd *o = &c->tex[n].coord[k];
+         if (c->tex[n].role[k] == FP_TEX_BIAS || o->kind != FP_OPND_VALUE ||
+             readers[o->index] != 1)
+            continue;
+         struct fp_unit *m = &c->units[o->index];
+         struct fp_unit_slot *ms = &m->slots[0];
+         struct fp_opnd *y = &ms->src[0];
+         if (!fp_unit_has_value(m) || m->num_slots != 1 || m->sfu || m->sfu_copy ||
+             m->saturate || m->scale || m->condition || m->blend_inv ||
+             m->output_chan >= 0 || ms->op != FP_ALU_OP_MAD ||
+             ms->accumulate_this || ms->accumulate_other || ms->square_c ||
+             !fp_opnd_is_const(c, &ms->src[1], 1.0f) ||
+             !fp_opnd_is_const(c, &ms->src[2], 0.0f) ||
+             y->kind != FP_OPND_VALUE || y->negate || y->absolute ||
+             y->twice || y->minus_one || readers[y->index] != 1)
+            continue;
+         struct fp_unit *v = &c->units[y->index];
+         if (v->sfu || v->sfu_copy || v->output_chan >= 0)
+            continue;
+         *o = *y;
+         m->live = false;
+      }
+   }
+}
+
 void
 grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
                  const struct grate_fp_key *key, bool trunc_abs, int max_pre)
@@ -2664,6 +2717,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
       /* and the sum it adds may take in a multiply, as when written so */
       fp_expand_blend_inv(c);
       fp_fuse_mad(c);
+      fp_fold_coord_copies(c);
    }
    if (!c->failed && c->seq && !fp_sched_seq(c))
       fp_fail(c, "shader too big (out of ALU packets or registers)");

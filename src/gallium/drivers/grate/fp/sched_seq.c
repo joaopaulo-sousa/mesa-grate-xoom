@@ -438,6 +438,50 @@ seq_fixed_free(struct fp_compiler *c, const struct seq_owner *own, int e)
           !seq_item_needed(c, own->kind, own->a, own->b, e, -1);
 }
 
+/* Whether the fixed item "own" is read after unit w writes: in a later EXEC,
+ * or in a later packet of w's (those up to w's packet read before it
+ * writes, as r = trunc(x) over x; the TEX and MFU of w's EXEC before) */
+static bool
+seq_read_after(struct fp_compiler *c, const struct seq_owner *own,
+               const struct fp_unit *w)
+{
+   if (seq_item_needed(c, own->kind, own->a, own->b, w->exec + 1, -1))
+      return true;
+   for (int i = 0; i < c->num_units; i++) {
+      struct fp_unit *u = &c->units[i];
+      if (!u->live || u->exec != w->exec || u->packet <= w->packet)
+         continue;
+      fp_unit_foreach_src(u, k, j)
+         if (seq_opnd_is(&u->slots[k].src[j], own->kind, own->a, own->b))
+            return true;
+   }
+   return false;
+}
+
+/*
+ * Whether the computed coordinates of fetch n can take the registers pair p
+ * puts them in (s, t in 2p, 2p + 1; r, a bias in 2q, 2q + 1): each value
+ * owns its register from its own write on (seq_alloc), so a fixed item
+ * there must not be read after that write.
+ */
+static bool
+seq_coord_regs_free(struct fp_compiler *c, const struct seq_owner *owner,
+                    int n, int base, int p)
+{
+   for (int k = 0; k < c->tex[n].num_coords; k++) {
+      const struct fp_opnd *o = &c->tex[n].coord[k];
+      if (o->kind != FP_OPND_VALUE)
+         continue;
+      int role = c->tex[n].role[k];
+      int reg = base + (role < FP_TEX_R ? 2 * p + role : 2 * (1 - p) + role - FP_TEX_R);
+      const struct seq_owner *own = &owner[reg];
+      if (own->kind == SEQ_OUT ||
+          (own->kind != SEQ_NONE && seq_read_after(c, own, &c->units[o->index])))
+         return false;
+   }
+   return true;
+}
+
 /* Register halves live after EXEC e */
 static int
 seq_live_items(struct fp_compiler *c, const struct seq_owner *owner, int e)
@@ -529,24 +573,58 @@ seq_is_coord(struct fp_compiler *c, int i, int comp)
    return false;
 }
 
-/* A register the MFU of this EXEC can interpolate input i component comp
+/*
+ * A register the MFU of this EXEC can interpolate input i component comp
  * into, -1 if none: r(comp) preferably, the column the linker would give it
- * anyway, else any free one (the TRAM layout follows, fp/linker.c) */
+ * anyway, else any free one (the TRAM layout follows, fp/linker.c). A
+ * texture coordinate goes where its TEX reads it: s in the first register
+ * of a pair, t in the second, next to the other one if that is there
+ * already (any component in any column: .yz or .zx as well as .xy).
+ */
 static int
-seq_fetch_reg(struct fp_compiler *c, const struct seq_owner *owner,
+seq_fetch_reg(struct fp_compiler *c, struct seq_state *s, const struct seq_owner *owner,
               const struct fp_seq_exec *x, int i, int comp, int e)
 {
-   bool coord = seq_is_coord(c, i, comp);
    int base = 4 * SEQ_ROW(c, e);
+#define SEQ_COL_FREE(col) (x->ipl_input[col] < 0 && seq_fixed_free(c, &owner[base + (col)], e))
 
-   for (int k = 0; k < 4; k++) {
-      int col = (comp + k) % 4;
-      if (coord && col != comp)
-         break;
-      if (x->ipl_input[col] < 0 && seq_fixed_free(c, &owner[base + col], e))
-         return base + col;
+   for (int n = 0; n < c->num_tex; n++) {
+      if (!c->tex[n].live)
+         continue;
+      for (int k = 0; k < 2 && k < c->tex[n].num_coords; k++) {
+         if (!seq_opnd_is(&c->tex[n].coord[k], SEQ_INPUT, i, comp))
+            continue;
+         const struct fp_opnd *o = &c->tex[n].coord[1 - k];
+         int other = o->kind == FP_OPND_INPUT ? s->fetch_reg[o->index][o->comp] : -1;
+         bool other_in = o->kind == FP_OPND_INPUT;
+         for (int p = 0; p < 2; p++) {
+            int col = 2 * p + k, ocol = 2 * p + 1 - k;
+            if (!SEQ_COL_FREE(col))
+               continue;
+            if (other_in && other >= 0 ? other == base + ocol :
+                other_in ? SEQ_COL_FREE(ocol) : true)
+               return base + col;
+         }
+         return -1;
+      }
    }
+
+   /* computed s, t and r (a cube map's, always) or q go to r0, r1, r2 with
+    * pair 0 (below): other components keep out of them while such a fetch
+    * is to come, as the NVIDIA compiler has them (cgdump shaders/cubebig:
+    * x in r3 for r = trunc(x)) */
+   bool triple = false;
+   for (int n = 0; n < c->num_tex; n++)
+      triple |= c->tex[n].live && c->tex[n].exec < 0 &&
+                fp_tex_coord(c, n, FP_TEX_R) >= 0;
+   for (int pass = triple ? 0 : 1; pass < 2; pass++)
+      for (int k = 0; k < 4; k++) {
+         int col = (comp + k) % 4;
+         if ((pass || col == 3) && SEQ_COL_FREE(col))
+            return base + col;
+      }
    return -1;
+#undef SEQ_COL_FREE
 }
 
 /* The lowest rank of the work left but the colour writes (constant ones
@@ -668,7 +746,7 @@ seq_fetch_inputs(struct fp_compiler *c, struct seq_state *s,
              live + 2 > limit ||
              (fetched >= cap && !seq_is_coord(c, o->index, comp)))
             continue;
-         int r = seq_fetch_reg(c, owner, x, o->index, comp, e);
+         int r = seq_fetch_reg(c, s, owner, x, o->index, comp, e);
          if (r < 0)
             continue;
          x->ipl_input[r % 4] = o->index;
@@ -932,6 +1010,11 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
          int base = 4 * SEQ_ROW(c, e);
          for (int p = 0; p < 2; p++) {
             struct fp_opnd *s0 = &c->tex[n].coord[0], *s1 = &c->tex[n].coord[1];
+            /* a cube map's computed coordinates: pair 0 only, r in r2, as
+             * the NVIDIA compiler does (rcp r10); with pair 1, r in r0 and
+             * rcp r8, random.texture.fragment.38 renders wrong */
+            if (p == 1 && c->tex[n].cube && fp_tex_coord(c, n, FP_TEX_R) >= 0)
+               continue;
             if ((s0->kind == FP_OPND_INPUT &&
                  s->fetch_reg[s0->index][s0->comp] != base + 2 * p) ||
                 (s1->kind == FP_OPND_INPUT &&
@@ -941,11 +1024,9 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
             if (!seq_fixed_free(c, &owner[base + 2 * q], e) ||
                 !seq_fixed_free(c, &owner[base + 2 * q + 1], e))
                continue;
-            /* computed coordinates go to pair p: no fixed item may be there */
-            if ((s0->kind == FP_OPND_VALUE && owner[base + 2 * p].kind != SEQ_NONE &&
-                 !seq_fixed_free(c, &owner[base + 2 * p], e)) ||
-                (s1->kind == FP_OPND_VALUE && owner[base + 2 * p + 1].kind != SEQ_NONE &&
-                 !seq_fixed_free(c, &owner[base + 2 * p + 1], e)))
+            /* computed coordinates: no fixed item may be in their registers
+             * while they are there */
+            if (!seq_coord_regs_free(c, owner, n, base, p))
                continue;
             c->tex[n].exec = e;
             c->tex[n].pair = p;
