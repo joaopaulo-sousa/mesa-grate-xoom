@@ -29,7 +29,7 @@
 #define FP_MAX_PACKETS_PER_EXEC 3
 #endif
 #define FP_MAX_PACKETS 64
-#define FP_MAX_TEXTURES 4
+#define FP_MAX_TEXTURES 16       /* texture fetches of a program */
 #define FP_TRAM_ROWS 16
 
 #define FP_ALU_RESULT_REG(s) (24 + (s))

@@ -367,32 +367,44 @@ seq_coord_of(struct fp_compiler *c, int i, int n)
 }
 
 /*
- * Whether computing unit i, a texture coordinate, has to wait: one row has
- * two register pairs, the coordinates of a fetch and its texel. With those
- * of another fetch computed and its TEX still to come, both would hold a
- * pair and neither TEX find one for its texel (a 2D fetch and a cube map's
- * three coordinates). The next ones still go in the EXEC of that TEX.
+ * Whether computing unit i, a texture coordinate, has to wait: with the
+ * coordinates of other fetches computed and their TEXs still to come, it
+ * may only take a register while there stays room for a texel pair ("room"
+ * halves left after it), else the coordinates hold the registers and no TEX
+ * finds a pair for its texel (one row: a 2D fetch and a cube map's three
+ * coordinates; more: a blur's taps, all computed at once). The next ones
+ * still go in the EXEC of such a TEX; those of a fetch begun do not wait.
  */
 static bool
-seq_coord_waits(struct fp_compiler *c, int i)
+seq_coord_waits(struct fp_compiler *c, int i, int room)
 {
-   if (c->seq_rows > 1)
-      return false;
    bool coord = false;
-   for (int n = 0; n < c->num_tex && !coord; n++)
-      coord = c->tex[n].live && seq_coord_of(c, i, n);
+   for (int n = 0; n < c->num_tex && !coord; n++) {
+      if (!c->tex[n].live || !seq_coord_of(c, i, n))
+         continue;
+      coord = true;
+      /* the rest of a fetch begun goes on: it frees its registers sooner */
+      for (int k = 0; k < c->tex[n].num_coords; k++) {
+         struct fp_opnd *o = &c->tex[n].coord[k];
+         if (o->kind == FP_OPND_VALUE && o->index != i && c->units[o->index].exec >= 0)
+            return false;
+      }
+   }
    if (!coord)
       return false;
+   int pending = 0;
    for (int m = 0; m < c->num_tex; m++) {
       if (!c->tex[m].live || c->tex[m].exec >= 0 || seq_coord_of(c, i, m))
          continue;
       for (int k = 0; k < c->tex[m].num_coords; k++) {
          struct fp_opnd *o = &c->tex[m].coord[k];
-         if (o->kind == FP_OPND_VALUE && c->units[o->index].exec >= 0)
-            return true;
+         if (o->kind == FP_OPND_VALUE && c->units[o->index].exec >= 0) {
+            pending++;
+            break;
+         }
       }
    }
-   return false;
+   return pending > 0 && room < 4;
 }
 
 /* Whether a cube map's r and a bias of fetch n are there for EXEC e */
@@ -957,14 +969,15 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
             for (int i = 0; i < c->num_units; i++) {
                struct fp_unit *u = &c->units[i];
                if (!u->live || !seq_is_alu(u) || u->exec >= 0 ||
-                   !seq_unit_ready(c, s, owner, i, e, packet) ||
-                   seq_coord_waits(c, i))
+                   !seq_unit_ready(c, s, owner, i, e, packet))
                   continue;
                if (u->num_slots > 1 ? (mask & ((1u << u->num_slots) - 1)) != 0 :
                                       mask == 0xf)
                   continue;
                int delta = seq_unit_delta(c, i, e);
                int room = limit - (reserve && s->dst_exec < 0 ? 4 : 0);
+               if (seq_coord_waits(c, i, room - seq_live_items(c, owner, e) - MAX2(delta, 0)))
+                  continue;
                if (delta > 0 && seq_live_items(c, owner, e) + delta > room &&
                    !seq_forwardable(c, s, i, e, packet, p))
                   continue;
