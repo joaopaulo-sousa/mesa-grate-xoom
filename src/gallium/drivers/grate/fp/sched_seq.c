@@ -56,6 +56,10 @@ struct seq_state {
    int dst_exec;
    /* units, then texture fetches, in the order phase 1 considers them */
    bool by_channel;
+   /* more rows: varyings fetched when needed, in any round, not all in the
+    * first (seq_fetch_inputs) */
+   bool late_ipl;
+   int last_bary;                      /* EXEC of the last barycentric setup */
    int order[FP_MAX_UNITS + FP_MAX_TEXTURES];
    int rank[FP_MAX_UNITS + FP_MAX_TEXTURES];
 };
@@ -561,17 +565,26 @@ seq_fetch_inputs(struct fp_compiler *c, struct seq_state *s,
    bool any = false;
    int live = seq_live_items(c, owner, e - 1);
    int rank = seq_pending_rank(c, s);
-   /* more rows: the first round interpolates (later ones measured not to,
-    * asmtri exp-wrap6), so everything that fits, channel by channel or not */
-   bool by_rank = s->by_channel && c->seq_rows == 1;
+   /*
+    * An EXEC interpolates with the weights of a barycentric setup in it or
+    * in one of the rows - 1 EXECs before (measured, asmtri exp-late): EXEC
+    * 0's covers the first round. More rows interpolate everything that fits
+    * in the first round first; late_ipl (when that does not fit) fetches
+    * when needed instead, as one row does, with a setup of its own in an
+    * EXEC whose SFU is free (as NVIDIA does: cgdump shaders/big/bump.dis).
+    */
+   bool just_in_time = c->seq_rows == 1 || s->late_ipl;
+   bool by_rank = s->by_channel && just_in_time;
+   bool covered = e < c->seq_rows ||
+                  (s->last_bary >= 0 && e - s->last_bary < c->seq_rows);
 
-   if (c->seq_rows > 1 && e >= c->seq_rows)
+   if (c->seq_rows > 1 && !covered && !s->late_ipl)
       return false;
 
    /* ... spread over the rows of that round, so that each keeps registers
     * for the values its SFU ops work on (in place, on their own row) */
    int cap = 4;
-   if (c->seq_rows > 1) {
+   if (c->seq_rows > 1 && !s->late_ipl) {
       bool used[FP_MAX_INPUTS][4] = { { false } };
       int total = 0;
       for (int i = 0; i < c->num_units; i++)
@@ -608,15 +621,15 @@ seq_fetch_inputs(struct fp_compiler *c, struct seq_state *s,
 
       if (i < c->num_units) {
          struct fp_unit *u = &c->units[i];
-         /* one row: when the rest is there, to keep registers free; more:
-          * now or never (only the first round interpolates) */
+         /* just in time: when the rest is there, to keep registers free;
+          * else everything in the first round */
          if (!u->live || u->exec >= 0 ||
-             (c->seq_rows == 1 && !seq_others_ready(c, s, u, e, FP_OPND_INPUT)))
+             (just_in_time && !seq_others_ready(c, s, u, e, FP_OPND_INPUT)))
             continue;
          /* colour writes wait for the rest (seq_unit_ready): their
           * varyings would only take registers meanwhile */
          if (u->output_chan >= 0 && !c->redirect_output && !s->by_channel &&
-             c->seq_rows == 1) {
+             just_in_time) {
             bool pending = false;
             for (int r = 0; r < c->num_units; r++)
                pending |= c->units[r].live && c->units[r].output_chan < 0 &&
@@ -654,6 +667,11 @@ seq_fetch_inputs(struct fp_compiler *c, struct seq_state *s,
          fetched++;
          any = true;
       }
+   }
+   /* weights of its own (its SFU is free: seq_schedule) */
+   if (any && !covered) {
+      x->bary = true;
+      s->last_bary = e;
    }
    return any;
 }
@@ -818,6 +836,7 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
    memset(s->fetch_exec, -1, sizeof(s->fetch_exec));
    memset(s->fetch_reg, -1, sizeof(s->fetch_reg));
    s->dst_exec = -1;
+   s->last_bary = -1;
    seq_order(c, s);
    for (int i = 0; i < c->num_units; i++) {
       c->units[i].exec = c->units[i].packet = -1;
@@ -1108,10 +1127,19 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
       items[num] = (struct seq_item) { .def = seq_alu_time(c, u, true), .last = -1, .reg = -1, .half = -1, .row = -1, .fx10 = u->fx10 };
       value_item[i] = num++;
    }
+   /*
+    * The MFU of an EXEC writes before the ALU of the one before reads
+    * (asmtri exp-late h*: an ipl in EXEC k + 1 over a register the ALU of
+    * EXEC k reads gives it the new value; from k + 2 on the old one): with
+    * more rows, a component fetched in EXEC e owns its register from that
+    * ALU on.
+    */
    for (int i = 0; i < FP_MAX_INPUTS; i++)
       for (int k = 0; k < 4; k++)
          if (s->fetch_exec[i][k] >= 0) {
-            items[num] = (struct seq_item) { .def = SEQ_T(s->fetch_exec[i][k], T_MFU), .last = -1, .reg = s->fetch_reg[i][k], .half = -1, .row = -1 };
+            int e = s->fetch_exec[i][k];
+            int def = c->seq_rows > 1 && e > 0 ? SEQ_T(e - 1, T_ALU) : SEQ_T(e, T_MFU);
+            items[num] = (struct seq_item) { .def = def, .last = -1, .reg = s->fetch_reg[i][k], .half = -1, .row = -1 };
             input_item[i][k] = num++;
          }
    /* an SFU works in place: the item of its operand, a value or a varying
@@ -1303,11 +1331,14 @@ seq_try(struct fp_compiler *c, int step)
 {
    struct seq_state s;
 
-   /* program order first: channel by channel takes more EXECs */
+   /* program order first: channel by channel takes more EXECs; more rows:
+    * varyings in the first round first, then fetched late */
+   for (int late = 0; late < (c->seq_rows > 1 ? 2 : 1); late++)
    for (int by_channel = 0; by_channel < 2; by_channel++)
    for (c->out_pair = 1; c->out_pair >= 0; c->out_pair--)
    for (int limit = 2 * SEQ_REGS(c); limit > 0; limit -= step) {
       s.by_channel = by_channel;
+      s.late_ipl = late;
       if (!seq_schedule(c, &s, limit)) {
          if (grate_debug & GRATE_DEBUG_TGSI)
             fprintf(stderr, "GRATE FRAG: sequential schedule failed (limit %d%s)\n",
@@ -1503,8 +1534,9 @@ fp_emit_seq(struct fp_compiler *c)
 {
    struct grate_fp_shader *fp = c->fp;
 
-   /* more rows: the weights are set up once, in EXEC 0 (the later
-    * interpolating EXECs carry them over, as in multi-row programs) */
+   /* more rows: the weights are set up in EXEC 0 for the first round (the
+    * later interpolating EXECs carry them over) and where seq_fetch_inputs
+    * asked for them again (late_ipl) */
    bool any_ipl = false;
    for (int e = 0; e < c->num_execs; e++)
       for (int k = 0; k < 4; k++)
@@ -1521,7 +1553,7 @@ fp_emit_seq(struct fp_compiler *c)
       bool ipl = false;
       for (int k = 0; k < 4; k++)
          ipl |= x->ipl_input[k] >= 0;
-      bool bary = c->seq_rows == 1 ? ipl : e == 0 && any_ipl;
+      bool bary = c->seq_rows == 1 ? ipl : (e == 0 && any_ipl) || x->bary;
       if (ipl || bary || x->sfu_unit >= 0) {
          struct fp_mfu_instr *mfu = CALLOC_STRUCT(fp_mfu_instr);
          list_inithead(&mfu->link);

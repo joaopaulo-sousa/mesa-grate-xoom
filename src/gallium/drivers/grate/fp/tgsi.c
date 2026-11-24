@@ -2405,6 +2405,41 @@ fp_tex_div_computed(struct fp_compiler *c, int n)
    c->tex[n].pair = 0;
 }
 
+/*
+ * A sequential program's fetch with one computed coordinate and one
+ * straight from a varying that another fetch reads too: the varying's
+ * register ties both fetches to its pair, and one texel blocks the other's
+ * (glmark2 bump-height: s + step with t, after s with t). A copy of it is a
+ * value like the other coordinate, free to go to any pair, as the NVIDIA
+ * compiler does (cgdump shaders/big/bump.dis).
+ */
+static void
+fp_tex_copy_shared_coords(struct fp_compiler *c)
+{
+   for (int n = 0; n < c->num_tex; n++) {
+      if (!c->tex[n].live || fp_tex_coord(c, n, FP_TEX_R) >= 0)
+         continue;
+      for (int k = 0; k < 2; k++) {
+         struct fp_opnd *o = &c->tex[n].coord[k];
+         if (o->kind != FP_OPND_INPUT || c->tex[n].coord[1 - k].kind != FP_OPND_VALUE)
+            continue;
+         bool shared = false;
+         for (int m = 0; m < c->num_tex && !shared; m++)
+            for (int j = 0; m != n && c->tex[m].live && j < c->tex[m].num_coords; j++)
+               shared |= c->tex[m].coord[j].kind == FP_OPND_INPUT &&
+                         c->tex[m].coord[j].index == o->index &&
+                         c->tex[m].coord[j].comp == o->comp;
+         if (!shared)
+            continue;
+         struct fp_unit *u = fp_new_unit(c);
+         fp_unit_op(&u->slots[0], FP_ALU_OP_MAD, *o, fp_opnd_one(c, false),
+                    fp_opnd_zero(c, false));
+         u->live = true;
+         *o = fp_opnd_value(c, u);
+      }
+   }
+}
+
 void
 grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
                  const struct grate_fp_key *key, bool trunc_abs, int max_pre)
@@ -2528,6 +2563,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
           fp_tex_coord(c, n, FP_TEX_R) < 0)
          fp_tex_div_computed(c, n);
    if (!c->failed && c->seq) {
+      fp_tex_copy_shared_coords(c);
       /* and the sum it adds may take in a multiply, as when written so */
       fp_expand_blend_inv(c);
       fp_fuse_mad(c);

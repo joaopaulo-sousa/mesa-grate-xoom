@@ -104,6 +104,7 @@ struct fp_seq_exec {
    int tex;                /* texture fetch, -1 if none */
    bool cube_mfu;          /* the MFU divides its cube coordinates */
    bool pseq;              /* destination colour load */
+   bool bary;              /* barycentric setup (its SFU): ipl here and after */
    int first_packet;
    int num_packets;
 };
