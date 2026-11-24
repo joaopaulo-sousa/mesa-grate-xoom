@@ -176,6 +176,7 @@ struct grate_fp_info {
    int color_input;
    int max_tram_row;       /* TRAM rows used */
    int num_rows;            /* pixel packet rows (r0-r3, r4-r7, ...) */
+   bool sequential;         /* EXECs in passes over the rows (fp/sched_seq.c) */
    /* ALU uniform registers: user uniform components, immediates (fp20,
     * already converted) and preshader results (the compiler works with
     * more slots, struct grate_fp_slots) */

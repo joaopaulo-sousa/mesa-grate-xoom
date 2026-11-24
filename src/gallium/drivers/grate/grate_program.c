@@ -223,19 +223,39 @@ grate_delete_vs_state(struct pipe_context *pcontext, void *hwcso)
    FREE(so);
 }
 
+static void
+grate_fs_free(struct grate_fp_shader *fp)
+{
+   list_for_each_entry_safe(struct fp_instr, i, &fp->fp_instructions, link)
+      FREE(i);
+   list_for_each_entry_safe(struct fp_alu_instr_packet, i, &fp->alu_instructions, link)
+      FREE(i);
+   list_for_each_entry_safe(struct fp_mfu_instr, i, &fp->mfu_instructions, link)
+      FREE(i);
+   grate_fp_info_fini(&fp->info);
+}
+
+static void
+grate_fs_translate(struct grate_fp_shader *fp, const struct tgsi_token *tokens,
+                   const struct grate_fp_key *key, bool trunc_abs, int max_pre)
+{
+   struct tgsi_parse_context parser;
+   unsigned ok = tgsi_parse_init(&parser, tokens);
+   assert(ok == TGSI_PARSE_OK);
+   (void)ok;
+   grate_tgsi_to_fp(fp, &parser, key, trunc_abs, max_pre);
+   tgsi_parse_free(&parser);
+}
+
 /* Compile a fragment program variant into its command stream */
 static void
 grate_fs_compile(enum drm_tegra_soc_id soc_id, const struct tgsi_token *tokens,
                  const struct grate_fp_key *key, struct grate_fs_variant *v)
 {
-   struct tgsi_parse_context parser;
-   unsigned ok = tgsi_parse_init(&parser, tokens);
-   assert(ok == TGSI_PARSE_OK);
-
    struct grate_fp_shader fp;
    bool trunc_abs = false;
    int max_pre = GRATE_FP_MAX_PRE;
-   grate_tgsi_to_fp(&fp, &parser, key, trunc_abs, max_pre);
+   grate_fs_translate(&fp, tokens, key, trunc_abs, max_pre);
 
    /*
     * Compiled again when it fails:
@@ -254,17 +274,26 @@ grate_fs_compile(enum drm_tegra_soc_id soc_id, const struct tgsi_token *tokens,
          trunc_abs = true;
       else
          break;
-      list_for_each_entry_safe(struct fp_instr, i, &fp.fp_instructions, link)
-         FREE(i);
-      list_for_each_entry_safe(struct fp_alu_instr_packet, i, &fp.alu_instructions, link)
-         FREE(i);
-      list_for_each_entry_safe(struct fp_mfu_instr, i, &fp.mfu_instructions, link)
-         FREE(i);
-      grate_fp_info_fini(&fp.info);
-      tgsi_parse_free(&parser);
-      ok = tgsi_parse_init(&parser, tokens);
-      assert(ok == TGSI_PARSE_OK);
-      grate_tgsi_to_fp(&fp, &parser, key, trunc_abs, max_pre);
+      grate_fs_free(&fp);
+      grate_fs_translate(&fp, tokens, key, trunc_abs, max_pre);
+   }
+
+   /* a sequential program that fits on more rows with fract(x) may fit on
+    * fewer with |x|: fewer rows, more pixels in flight */
+   if (!fp.info.failed && fp.info.sequential && fp.info.num_rows > 1 &&
+       fp.info.varying_trunc && !trunc_abs) {
+      struct grate_fp_shader alt;
+      grate_fs_translate(&alt, tokens, key, true, max_pre);
+      if (!alt.info.failed && alt.info.num_rows < fp.info.num_rows) {
+         grate_fs_free(&fp);
+         fp = alt;
+         /* the lists' heads moved with the struct */
+         list_replace(&alt.fp_instructions, &fp.fp_instructions);
+         list_replace(&alt.alu_instructions, &fp.alu_instructions);
+         list_replace(&alt.mfu_instructions, &fp.mfu_instructions);
+      } else {
+         grate_fs_free(&alt);
+      }
    }
 
    /* say which shader draws magenta, to have something to work from (not

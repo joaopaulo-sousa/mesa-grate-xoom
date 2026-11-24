@@ -2758,6 +2758,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    fp_info_uniforms(c);
    fp_build_links(c);
    fp->info.num_rows = c->seq ? MAX2(c->seq_rows, 1) : c->num_execs;
+   fp->info.sequential = c->seq;
    fp->info.failed = c->failed;
    fp->info.pre = fp->info.num_pre ?
                   mem_dup(c->pre, fp->info.num_pre * sizeof(c->pre[0])) : NULL;

@@ -1515,21 +1515,14 @@ seq_try(struct fp_compiler *c, int step)
  * cost of pixels in flight. The TEX and the PSEQ load of EXEC e work on the
  * pairs of row e % rows, as in multi-row programs (fstest and dEQP texture,
  * blend and depth_stencil with every program on 1 and on 3 rows,
- * GRATE_FP_SEQ / GRATE_FP_SEQ_ROWS: the same pixels). Cube maps keep one
- * row: their MFU coordinate setup uses absolute registers.
- */
-static bool
-seq_rows_ok(struct fp_compiler *c)
-{
-   for (int n = 0; n < c->num_tex; n++)
-      if (c->tex[n].live && fp_tex_coord(c, n, FP_TEX_R) >= 0)
-         return false;
-   return true;
-}
-
-/* One row, fp20 values first; fixed10 halves for those that may (fx10.c)
+ * GRATE_FP_SEQ / GRATE_FP_SEQ_ROWS: the same pixels). So does the MFU
+ * division of computed cube map and projective coordinates: its registers,
+ * rcp r(8 + c) of a cube map's too, are row-relative (asmtri exp-cube).
+ *
+ * One row, fp20 values first; fixed10 halves for those that may (fx10.c)
  * only when the program does not fit otherwise (GRATE_FP_FX10=0 turns them
- * off); then more rows, the same way. */
+ * off); then more rows, the same way.
+ */
 static bool
 seq_sched_rows(struct fp_compiler *c)
 {
@@ -1538,8 +1531,6 @@ seq_sched_rows(struct fp_compiler *c)
    int min_rows = getenv("GRATE_FP_SEQ_ROWS") ? CLAMP(atoi(getenv("GRATE_FP_SEQ_ROWS")), 1, 4) : 1;
 
    for (c->seq_rows = min_rows; c->seq_rows <= 4; c->seq_rows++) {
-      if (c->seq_rows > 1 && !seq_rows_ok(c))
-         break;
       for (int i = 0; i < c->num_units; i++)
          c->units[i].fx10 = false;
       if (seq_try(c, 2))
