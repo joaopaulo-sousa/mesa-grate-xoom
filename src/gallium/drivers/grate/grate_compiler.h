@@ -35,7 +35,7 @@ struct grate_vp_shader {
  * compiler allocates up to GRATE_FP_MAX_SLOTS while it works and keeps the
  * ones the final program reads (fp_compact_uniforms). */
 #define GRATE_FP_NUM_CONSTS 32
-#define GRATE_FP_MAX_SLOTS 128
+#define GRATE_FP_MAX_SLOTS 512
 /* user uniform components a shader may declare (64 vec4: Qt Quick's
  * shaders declare more than the GLES2 minimum of 16); only those it reads
  * take a register, a program reading more than there are fails to compile */
@@ -48,8 +48,8 @@ struct grate_vp_shader {
  * slot dst to op(a[0] * b[0] + ... + a[n-1] * b[n-1], c), as the ALU would,
  * or to the special function sfu of a[0].
  */
-#define GRATE_FP_MAX_PRE 64
-#define GRATE_FP_PRE_NO_DST 0xff
+#define GRATE_FP_MAX_PRE 256
+#define GRATE_FP_PRE_NO_DST 0xffff
 
 enum grate_fp_pre_kind {
    GRATE_FP_PRE_USER,      /* user uniform "index" (index * 4 + comp) */
@@ -59,7 +59,7 @@ enum grate_fp_pre_kind {
 
 struct grate_fp_pre_opnd {
    uint8_t kind;
-   uint8_t index;
+   uint16_t index;
    bool negate;
    bool absolute;
    float value;
@@ -68,7 +68,7 @@ struct grate_fp_pre_opnd {
 struct grate_fp_pre {
    uint8_t op;             /* enum fp_alu_op */
    uint8_t sfu;            /* enum fp_sfu_op, or 0: an ALU operation */
-   uint8_t dst;            /* uniform slot, GRATE_FP_PRE_NO_DST: not read */
+   uint16_t dst;           /* uniform slot, GRATE_FP_PRE_NO_DST: not read */
    uint8_t num_products;
    bool saturate;
    bool value01;           /* always 0.0 or 1.0 (a comparison) */
@@ -124,11 +124,11 @@ enum grate_moved_kind {
 
 struct grate_moved_src {
    uint8_t kind;
-   uint8_t index;
    uint8_t comp;
    uint8_t negate;
+   uint8_t pad;
+   uint16_t index;
    uint16_t semantic;
-   uint16_t pad;
 };
 
 struct grate_moved {
@@ -182,7 +182,7 @@ struct grate_fp_info {
     * the descriptor at draw time, negated for the samplers in _neg */
    uint8_t lod_bias_user[16];
    uint16_t lod_bias_user_mask, lod_bias_user_neg;
-   struct grate_fp_pre pre[GRATE_FP_MAX_PRE];
+   struct grate_fp_pre *pre;   /* num_pre of them, freed by grate_fp_info_fini */
    int num_pre;
    struct grate_fp_spec spec[GRATE_FP_MAX_SPEC];
    int num_spec;
@@ -192,6 +192,7 @@ struct grate_fp_info {
    struct grate_moved moved;   /* ... that it does (grate_fp_key.move) */
    bool failed;             /* did not fit: the program draws magenta */
    bool varying_trunc;      /* TRUNC of a varying as fract(x) (see trunc_abs) */
+   bool out_of_uniforms;    /* failed for the uniform registers */
    bool reads_uniforms;     /* the ALU reads uniform registers: upload them */
 };
 
@@ -200,6 +201,10 @@ grate_float_to_fp20(float f);
 
 float
 fp20_to_float(uint32_t v);
+
+/* Free what grate_tgsi_to_fp allocated for info */
+void
+grate_fp_info_fini(struct grate_fp_info *info);
 
 /* Fill in the preshader slots of consts[] (user: the user uniforms) */
 void
@@ -258,8 +263,10 @@ struct grate_fp_key {
    float blend_color[4];
 };
 
+/* max_pre: preshader entries at most (GRATE_FP_MAX_PRE); fewer keep more
+ * of the work in the program, which may then read fewer uniforms */
 void
 grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
-                 const struct grate_fp_key *key, bool trunc_abs);
+                 const struct grate_fp_key *key, bool trunc_abs, int max_pre);
 
 #endif

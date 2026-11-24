@@ -232,24 +232,38 @@ grate_fs_compile(enum drm_tegra_soc_id soc_id, const struct tgsi_token *tokens,
    assert(ok == TGSI_PARSE_OK);
 
    struct grate_fp_shader fp;
-   grate_tgsi_to_fp(&fp, &parser, key, false);
+   bool trunc_abs = false;
+   int max_pre = GRATE_FP_MAX_PRE;
+   grate_tgsi_to_fp(&fp, &parser, key, trunc_abs, max_pre);
 
    /*
-    * TRUNC of a varying is compiled as fract(x) so that a multi-row program
-    * can run the SFU on the interpolated register; a sequential program has
-    * fewer registers for its extra values and may only fit with |x|.
+    * Compiled again when it fails:
+    * - for the uniform registers, with half the preshader entries it took:
+    *   each result read takes a register, the work left in the program
+    *   may read fewer;
+    * - TRUNC of a varying is compiled as fract(x) so that a multi-row
+    *   program can run the SFU on the interpolated register; a sequential
+    *   program has fewer registers for its extra values and may only fit
+    *   with |x|.
     */
-   if (fp.info.failed && fp.info.varying_trunc) {
+   while (fp.info.failed) {
+      if (fp.info.out_of_uniforms && fp.info.num_pre)
+         max_pre = fp.info.num_pre / 2;
+      else if (fp.info.varying_trunc && !trunc_abs)
+         trunc_abs = true;
+      else
+         break;
       list_for_each_entry_safe(struct fp_instr, i, &fp.fp_instructions, link)
          FREE(i);
       list_for_each_entry_safe(struct fp_alu_instr_packet, i, &fp.alu_instructions, link)
          FREE(i);
       list_for_each_entry_safe(struct fp_mfu_instr, i, &fp.mfu_instructions, link)
          FREE(i);
+      grate_fp_info_fini(&fp.info);
       tgsi_parse_free(&parser);
       ok = tgsi_parse_init(&parser, tokens);
       assert(ok == TGSI_PARSE_OK);
-      grate_tgsi_to_fp(&fp, &parser, key, true);
+      grate_tgsi_to_fp(&fp, &parser, key, trunc_abs, max_pre);
    }
 
    /* say which shader draws magenta, to have something to work from (not
@@ -428,7 +442,7 @@ grate_create_fs_state(struct pipe_context *pcontext,
                     &so->variants[0]);
    so->num_variants = 1;
    so->blob = so->variants[0].blob;
-   so->info = so->variants[0].info;
+   so->info = &so->variants[0].info;
    return so;
 }
 
@@ -522,6 +536,7 @@ grate_fs_variant(struct grate_context *context,
       /* replace one, never the opaque variant 0 */
       i = 1 + so->next_evict++ % (GRATE_FS_MAX_VARIANTS - 1);
       FREE(so->variants[i].blob.commands);
+      grate_fp_info_fini(&so->variants[i].info);
    }
    grate_fs_compile(context->drm->soc_id, so->base.tokens, key,
                     &so->variants[i]);
@@ -576,6 +591,7 @@ grate_fs_update(struct grate_context *context)
 
    /* texture coordinates the vertex shader can compute: when both fit */
    if (vv && v->info.can_move) {
+      struct grate_fp_key vkey = v->key;
       key.move = 1;
       struct grate_fs_variant *mv = grate_fs_select(context, so, key, user, user_len);
       struct grate_vs_variant *mvv = !mv->info.failed && mv->info.moved.num_outs ?
@@ -583,11 +599,14 @@ grate_fs_update(struct grate_context *context)
       if (mvv) {
          v = mv;
          vv = mvv;
+      } else if (memcmp(&v->key, &vkey, sizeof(vkey))) {
+         /* compiling those replaced it */
+         v = grate_fs_variant(context, so, &vkey);
       }
    }
 
    so->blob = v->blob;
-   so->info = v->info;
+   so->info = &v->info;
    if (vv)
       grate_vs_use(vs, vv);
 }
@@ -595,7 +614,7 @@ grate_fs_update(struct grate_context *context)
 void
 grate_fs_consts(struct grate_context *context, uint32_t *consts)
 {
-   const struct grate_fp_info *fpinfo = &context->fshader->info;
+   const struct grate_fp_info *fpinfo = context->fshader->info;
    const struct pipe_constant_buffer *cb =
       &context->constant_buffer[MESA_SHADER_FRAGMENT];
    const float *user = cb->user_buffer;
@@ -626,8 +645,10 @@ grate_delete_fs_state(struct pipe_context *pcontext, void *hwcso)
    struct grate_fragment_shader_state *so = hwcso;
 
    grate_trace();
-   for (unsigned i = 0; i < so->num_variants; i++)
+   for (unsigned i = 0; i < so->num_variants; i++) {
       FREE(so->variants[i].blob.commands);
+      grate_fp_info_fini(&so->variants[i].info);
+   }
    FREE((void *)so->base.tokens);
    FREE(so);
 }

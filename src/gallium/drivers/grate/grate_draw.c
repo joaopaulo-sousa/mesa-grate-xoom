@@ -326,7 +326,7 @@ grate_draw_range(struct grate_context *context, const struct pipe_draw_info *inf
 static bool
 grate_draw_reads_written(struct grate_context *context, struct grate_stream *stream)
 {
-   uint32_t mask = context->fshader ? context->fshader->info.sampler_mask : 0;
+   uint32_t mask = context->fshader ? context->fshader->info->sampler_mask : 0;
 
    u_foreach_bit(i, mask) {
       struct pipe_sampler_view *view = context->sampler_views[i];
@@ -363,7 +363,7 @@ grate_draw_vbo(struct pipe_context *pcontext,
 
    /* the fragment program variant for the bound blend state */
    grate_fs_update(context);
-   if (context->fshader && context->fshader->info.failed && !indirect &&
+   if (context->fshader && context->fshader->info->failed && !indirect &&
        grate_twopass_draw(context, info, drawid_offset, draws, num_draws))
       return;
 

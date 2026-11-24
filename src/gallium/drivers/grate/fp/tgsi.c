@@ -80,6 +80,7 @@ fp_const_slot(struct fp_compiler *c, float value)
       if (!BITSET_TEST(fp->info.used_mask, i))
          break;
    if (i == GRATE_FP_MAX_SLOTS) {
+      c->fp->info.out_of_uniforms = true;
       fp_fail(c, "too many uniforms");
       return 0;
    }
@@ -108,6 +109,7 @@ fp_uniform_slot(struct fp_compiler *c, int index, int comp)
          BITSET_SET(info->used_mask, i);
          return i;
       }
+   c->fp->info.out_of_uniforms = true;
    fp_fail(c, "too many uniforms");
    return 0;
 }
@@ -1594,11 +1596,15 @@ fp_cse(struct fp_compiler *c)
          }
          continue;
       }
-      if (!fp_unit_has_value(u) || u->num_slots != 1 || u->sfu || u->sfu_copy)
+      /* nor texture coordinates: each takes a register of its own, which
+       * the MFU of a cube or projective fetch divides in place */
+      if (!fp_unit_has_value(u) || u->num_slots != 1 || u->sfu || u->sfu_copy ||
+          fp_cse_tex_reads(c, i))
          continue;
       for (int p = 0; p < i; p++) {
          struct fp_unit *q = &c->units[p];
          if (remap[p] != p || q->output_chan >= 0 || q->num_slots != 1 ||
+             fp_cse_tex_reads(c, p) ||
              q->sfu || q->sfu_copy || q->saturate != u->saturate ||
              q->slots[0].op != u->slots[0].op ||
              q->slots[0].accumulate_this || q->slots[0].accumulate_other ||
@@ -1697,7 +1703,6 @@ fp_fuse_mad(struct fp_compiler *c)
    }
 }
 
-static void fp_dead_code(struct fp_compiler *c);
 
 /* What a value is a plain copy of (MAD x, 1, 0, possibly over a chain) */
 static struct fp_opnd
@@ -1727,9 +1732,21 @@ fp_relayout(struct fp_compiler *c)
    for (int n = 0; n < c->num_tex; n++) {
       struct fp_opnd s = fp_copy_source(c, c->tex[n].coord[0]);
       struct fp_opnd t = fp_copy_source(c, c->tex[n].coord[1]);
-      if (c->tex[n].input >= 0 || c->tex[n].num_coords > 2 ||
-          !fp_tex_varying(&s, &t))
+      if (c->tex[n].input >= 0 || !fp_tex_varying(&s, &t))
          continue;
+      if (c->tex[n].num_coords > 2) {
+         /* a cube map's r or a projective q of the same varying (moved,
+          * move.c): the TEX divides by it, as for one the program reads;
+          * a cube map wants s, t, r in .xyz */
+         struct fp_opnd r = fp_copy_source(c, c->tex[n].coord[2]);
+         if (c->tex[n].num_coords > 3 || c->tex[n].role[2] != FP_TEX_R ||
+             r.kind != FP_OPND_INPUT || r.index != s.index || r.negate ||
+             r.absolute || r.comp == s.comp || r.comp == t.comp ||
+             (c->tex[n].cube && (s.comp != 0 || t.comp != 1 || r.comp != 2)))
+            continue;
+         c->tex[n].num_coords = 2;
+         c->tex[n].r_comp = r.comp;
+      }
       c->tex[n].coord[0] = s;
       c->tex[n].coord[1] = t;
       c->tex[n].input = s.index;
@@ -1792,6 +1809,7 @@ fp_compact_uniforms(struct fp_compiler *c)
    for (int i = 0; i < GRATE_FP_MAX_SLOTS; i++)
       map[i] = BITSET_TEST(read, i) ? n++ : -1;
    if (n > GRATE_FP_NUM_CONSTS) {
+      c->fp->info.out_of_uniforms = true;
       fp_fail(c, "too many uniforms");
       return;
    }
@@ -1841,7 +1859,7 @@ fp_compact_uniforms(struct fp_compiler *c)
 }
 
 /* Drop units whose value is never used */
-static void
+void
 fp_dead_code(struct fp_compiler *c)
 {
    for (int i = c->num_units - 1; i >= 0; i--) {
@@ -2336,7 +2354,7 @@ fp_tex_div_computed(struct fp_compiler *c, int n)
 
 void
 grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
-                 const struct grate_fp_key *key, bool trunc_abs)
+                 const struct grate_fp_key *key, bool trunc_abs, int max_pre)
 {
    static const struct grate_fp_key key_none = { .colormask = 0xf };
    struct fp_compiler *c = CALLOC_STRUCT(fp_compiler);
@@ -2347,6 +2365,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
       key = &key_none;
    c->key = key;
    c->trunc_abs = trunc_abs;
+   c->max_pre = CLAMP(max_pre, 0, GRATE_FP_MAX_PRE);
    c->out_pair = 1;
    c->redirect_output = key && (key->blend || (key->colormask & 0xf) != 0xf);
 
@@ -2362,9 +2381,11 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    BITSET_ZERO(fp->info.user_mask);
    fp->info.sampler_mask = 0;
    fp->info.varying_trunc = false;
+   fp->info.out_of_uniforms = false;
    fp->info.lod_bias_mask = 0;
    fp->info.lod_bias_user_mask = fp->info.lod_bias_user_neg = 0;
    memset(fp->info.lod_bias, 0, sizeof(fp->info.lod_bias));
+   fp->info.pre = c->pre;
    fp->info.num_pre = 0;
    /* the uniforms of the variant's key, then any a loop needs as well (a
     * counter stepped by another uniform shows only once the first is
@@ -2425,6 +2446,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    fp_cse(c);
    fp_reassociate(c);
    fp_cse(c);
+   fp_fold_constants(c);
    fp_preshade(c);
    fp_specialize(c);
    fp_fold_copies(c);
@@ -2496,5 +2518,19 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    fp_build_links(c);
    fp->info.num_rows = c->seq ? MAX2(c->seq_rows, 1) : c->num_execs;
    fp->info.failed = c->failed;
+   fp->info.pre = fp->info.num_pre ?
+                  mem_dup(c->pre, fp->info.num_pre * sizeof(c->pre[0])) : NULL;
+   if (!fp->info.pre && fp->info.num_pre) {
+      fp->info.num_pre = 0;
+      fp->info.failed = true;
+   }
    FREE(c);
+}
+
+void
+grate_fp_info_fini(struct grate_fp_info *info)
+{
+   FREE(info->pre);
+   info->pre = NULL;
+   info->num_pre = 0;
 }

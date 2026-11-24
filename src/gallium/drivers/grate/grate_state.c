@@ -936,7 +936,7 @@ emit_program(struct grate_context *context, uint32_t **ptrp)
    emit_shader(stream, ptrp, &context->fshader->blob);
 
    /* fragment shader constants: ALU uniform registers 32.. */
-   const struct grate_fp_info *fpinfo = &context->fshader->info;
+   const struct grate_fp_info *fpinfo = context->fshader->info;
    if (fpinfo->reads_uniforms && !BITSET_IS_EMPTY(fpinfo->used_mask)) {
       uint32_t consts[GRATE_FP_NUM_CONSTS];
       grate_fs_consts(context, consts);
@@ -955,7 +955,7 @@ emit_program(struct grate_context *context, uint32_t **ptrp)
    cull_face_linker_setup |= context->rast->cull_face;
 
    /* depends on linking */
-   struct grate_fp_info *info = &context->fshader->info;
+   const struct grate_fp_info *info = context->fshader->info;
    cull_face_linker_setup |= TGR3D_SU_PARAM_LAST_INST(0 < info->num_links ?
                                                       (info->num_links - 1) : 0);
 
@@ -1000,7 +1000,7 @@ static void
 emit_textures(struct grate_context *context, uint32_t **ptrp)
 {
    struct grate_stream *stream = &context->gr3d->stream;
-   uint32_t mask = context->fshader ? context->fshader->info.sampler_mask : 0;
+   uint32_t mask = context->fshader ? context->fshader->info->sampler_mask : 0;
 
    u_foreach_bit(i, mask) {
       struct pipe_sampler_view *view = context->sampler_views[i];
@@ -1042,7 +1042,7 @@ emit_textures(struct grate_context *context, uint32_t **ptrp)
        */
       bool pot = util_is_power_of_two_nonzero(width) &&
                  util_is_power_of_two_nonzero(height);
-      unsigned levels = view->texture->last_level;
+      unsigned levels = res->b.last_level;
       bool mip = pot && levels && view->u.tex.first_level == 0 && sampler &&
                  sampler->min_mip_filter != PIPE_TEX_MIPFILTER_NONE;
       if (mip) {
@@ -1071,7 +1071,7 @@ emit_textures(struct grate_context *context, uint32_t **ptrp)
                TGR3D_TEX_TEXDESC_HI_HEIGHT(height);
       /* LOD bias, s4.4 (measured: 0x10 = one level): the sampler's plus
        * the shader's constant TXB bias */
-      const struct grate_fp_info *fpinfo = &context->fshader->info;
+      const struct grate_fp_info *fpinfo = context->fshader->info;
       int bias = fpinfo->lod_bias[i] +
                  (sampler ? (int)lroundf(sampler->lod_bias * 16.0f) : 0);
       if (fpinfo->lod_bias_user_mask & (1u << i)) {

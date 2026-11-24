@@ -149,6 +149,25 @@ fp_preshade(struct fp_compiler *c)
    memset(pre_of, -1, sizeof(pre_of));
    memset(slot_of, -1, sizeof(slot_of));
 
+   /* what the program still reads (constant folding leaves dead units),
+    * the liveness flags left as they were */
+   bool live[FP_MAX_UNITS], was_live[FP_MAX_UNITS], tex_was_live[FP_MAX_TEXTURES];
+   for (int i = 0; i < c->num_units; i++) {
+      was_live[i] = c->units[i].live;
+      c->units[i].live = false;
+   }
+   for (int n = 0; n < c->num_tex; n++) {
+      tex_was_live[n] = c->tex[n].live;
+      c->tex[n].live = false;
+   }
+   fp_dead_code(c);
+   for (int i = 0; i < c->num_units; i++) {
+      live[i] = c->units[i].live;
+      c->units[i].live = was_live[i];
+   }
+   for (int n = 0; n < c->num_tex; n++)
+      c->tex[n].live = tex_was_live[n];
+
    /* values that must be in a register: texture coordinates */
    for (int n = 0; n < c->num_tex; n++)
       for (int k = 0; k < c->tex[n].num_coords; k++)
@@ -159,9 +178,9 @@ fp_preshade(struct fp_compiler *c)
       struct fp_unit *u = &c->units[i];
       struct grate_fp_pre p;
 
-      if (!fp_unit_has_value(u) || keep[i] ||
+      if (!live[i] || !fp_unit_has_value(u) || keep[i] ||
           (u->num_slots > 1 && u->slots[0].op != FP_ALU_OP_MAD) ||
-          info->num_pre == GRATE_FP_MAX_PRE || !fp_pre_unit(c, u, pre_of, &p))
+          info->num_pre == c->max_pre || !fp_pre_unit(c, u, pre_of, &p))
          continue;
 
       int slot = fp_pre_slot(info);
@@ -310,22 +329,19 @@ fp_spec_has_slot(struct fp_compiler *c, float v)
 }
 
 /*
- * Specialize the program for c->key->spec_bits: the specialized preshader
- * results become constants, which fold through the units in order (CMP on
- * a known condition is a copy, x * 0 drops x, x * 1 is x). Units folded to
- * a copy hand their readers the operand copied; fp_dead_code then drops
- * them and whatever only they read.
+ * Constants fold through the units in order (CMP on a known condition is a
+ * copy, x * 0 drops x, x * 1 is x): immediates, and when specializing the
+ * preshader results of c->key->spec_bits. Units folded to a copy hand their
+ * readers the operand copied; fp_dead_code then drops them and whatever
+ * only they read.
  */
-void
-fp_specialize(struct fp_compiler *c)
+static void
+fp_fold(struct fp_compiler *c)
 {
    int pre_at_slot[GRATE_FP_MAX_SLOTS];
    struct fp_opnd repl[FP_MAX_UNITS];
    bool has_repl[FP_MAX_UNITS] = { false }, known[FP_MAX_UNITS] = { false };
    float kval[FP_MAX_UNITS];
-
-   if (!c->key || !c->key->spec || !c->fp->info.num_spec)
-      return;
 
    memset(pre_at_slot, -1, sizeof(pre_at_slot));
    for (int i = 0; i < c->fp->info.num_pre; i++)
@@ -424,14 +440,34 @@ fp_specialize(struct fp_compiler *c)
    for (int n = 0; n < c->num_tex; n++)
       for (int k = 0; k < c->tex[n].num_coords; k++) {
          struct fp_opnd *o = &c->tex[n].coord[k];
-         /* r and a bias stay values of their own (fp_sched_seq) */
-         if (o->kind != FP_OPND_VALUE || !has_repl[o->index] || k >= 2)
+         /* r and a bias stay values of their own (fp_sched_seq), and so do
+          * the s, t a cube or projective fetch divides in place */
+         if (o->kind != FP_OPND_VALUE || !has_repl[o->index] || k >= 2 ||
+             fp_tex_coord(c, n, FP_TEX_R) >= 0)
             continue;
          struct fp_opnd x = fp_spec_through(*o, repl[o->index]);
          if (!x.negate && !x.absolute &&
              (x.kind == FP_OPND_VALUE || x.kind == FP_OPND_INPUT))
             *o = x;
       }
+}
+
+/* What depends on immediates only: before the preshader, which would
+ * otherwise compute it per draw (comparisons of an unrolled loop's counter
+ * selecting uniforms, which then all stay read) */
+void
+fp_fold_constants(struct fp_compiler *c)
+{
+   fp_fold(c);
+}
+
+/* The variant for c->key->spec_bits: those preshader results as constants */
+void
+fp_specialize(struct fp_compiler *c)
+{
+   if (!c->key || !c->key->spec || !c->fp->info.num_spec)
+      return;
+   fp_fold(c);
 }
 
 static float

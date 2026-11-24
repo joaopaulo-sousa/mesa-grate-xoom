@@ -225,7 +225,7 @@ grate_twopass_draw(struct grate_context *context, const struct pipe_draw_info *i
    context->blend = &tp->opaque;
    grate_fs_update(context);
    context->blend = blend;
-   if (context->fshader->info.failed) {
+   if (context->fshader->info->failed) {
       grate_fs_update(context);
       return false;
    }

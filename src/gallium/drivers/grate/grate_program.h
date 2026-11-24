@@ -57,7 +57,7 @@ struct grate_fragment_shader_state {
 
    /* the variant for the bound blend state, set by grate_fs_update() */
    struct grate_shader_blob blob;
-   struct grate_fp_info info;
+   const struct grate_fp_info *info;  /* that variant's */
 
    bool discards;                     /* KILL/KILL_IF: discards fragments */
 

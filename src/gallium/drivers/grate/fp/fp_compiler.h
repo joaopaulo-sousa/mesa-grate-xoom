@@ -135,6 +135,9 @@ struct fp_pred {
 
 struct fp_compiler {
    struct grate_fp_shader *fp;
+   /* the preshader while compiling (info.pre), then copied at its size */
+   struct grate_fp_pre pre[GRATE_FP_MAX_PRE];
+   int max_pre;                   /* entries it may take */
    struct fp_unit units[FP_MAX_UNITS];
    int num_units;
    struct fp_opnd temps[FP_MAX_TEMPS][4];
@@ -296,7 +299,9 @@ bool fp_rows_sfu(const struct fp_compiler *c, const struct fp_unit *u);
 
 /* preshader.c */
 float fp20_to_float(uint32_t v);
+void fp_fold_constants(struct fp_compiler *c);
 void fp_preshade(struct fp_compiler *c);
+void fp_dead_code(struct fp_compiler *c);
 void fp_specialize(struct fp_compiler *c);
 
 /* linker.c */

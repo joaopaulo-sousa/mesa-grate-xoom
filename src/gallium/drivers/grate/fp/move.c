@@ -207,34 +207,38 @@ fp_move_coords(struct fp_compiler *c)
    memset(mv->node_of, -1, sizeof(mv->node_of));
    info->can_move = false;
 
-   /* the coordinates of dependent reads */
+   /* the coordinates of dependent reads: s, t and a cube map's r or a
+    * projective q (s/r, t/r are not linear, but the TEX divides varying
+    * ones itself, fp_relayout); not a bias */
    for (int n = 0; n < c->num_tex; n++) {
-      /* a cube map's s/r, t/r are not linear: they stay here */
-      if (c->tex[n].input >= 0 || c->tex[n].num_coords > 2 ||
+      int nc = c->tex[n].num_coords;
+      if (c->tex[n].input >= 0 ||
+          (nc > 2 && (nc > 3 || c->tex[n].role[2] != FP_TEX_R)) ||
           m->num_outs == GRATE_MOVED_MAX || input == FP_MAX_INPUTS)
          continue;
 
-      /* both coordinates, or none: drop what a failed one added */
+      /* all coordinates, or none: drop what a failed one added */
       struct grate_moved saved = *m;
       int saved_node_of[FP_MAX_UNITS];
       memcpy(saved_node_of, mv->node_of, sizeof(saved_node_of));
-      struct grate_moved_src root[2];
-      bool p[2];
-      if (!fp_move_src(c, mv, c->tex[n].coord[0], &root[0], &p[0]) ||
-          !fp_move_src(c, mv, c->tex[n].coord[1], &root[1], &p[1])) {
+      struct grate_moved_src root[3];
+      bool p[3], ok = true;
+      for (int j = 0; j < nc && ok; j++)
+         ok = fp_move_src(c, mv, c->tex[n].coord[j], &root[j], &p[j]);
+      if (!ok) {
          *m = saved;
          memcpy(mv->node_of, saved_node_of, sizeof(saved_node_of));
          continue;
       }
 
-      if (mv->num_undo + 2 > FP_MOVE_MAX_UNDO)
+      if (mv->num_undo + nc > FP_MOVE_MAX_UNDO)
          break;
       int k = m->num_outs++;
-      m->out[k].root[0] = root[0];
-      m->out[k].root[1] = root[1];
-      m->out[k].num_roots = 2;
+      for (int j = 0; j < nc; j++)
+         m->out[k].root[j] = root[j];
+      m->out[k].num_roots = nc;
       m->out[k].input = input;
-      for (int j = 0; j < 2; j++)
+      for (int j = 0; j < nc; j++)
          fp_move_set(mv, &c->tex[n].coord[j], (struct fp_opnd) {
             .kind = FP_OPND_INPUT, .index = input, .comp = j });
       input++;
