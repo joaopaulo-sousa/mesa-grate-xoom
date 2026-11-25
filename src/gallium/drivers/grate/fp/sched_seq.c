@@ -423,6 +423,62 @@ seq_extra_coords_ready(struct fp_compiler *c, struct seq_state *s, int n, int e)
    return true;
 }
 
+/* Whether SFU unit i is in the in-place chain that ends in coordinate o */
+static bool
+seq_sfu_chain_has(struct fp_compiler *c, const struct fp_opnd *o, int i)
+{
+   if (o->kind != FP_OPND_VALUE)
+      return false;
+   for (int w = o->index; c->units[w].sfu; ) {
+      if (w == i)
+         return true;
+      const struct fp_opnd *x = &c->units[w].slots[0].src[0];
+      if (x->kind != FP_OPND_VALUE)
+         break;
+      w = x->index;
+   }
+   return false;
+}
+
+/*
+ * Whether SFU unit i can go in EXEC e: an SFU result stays on its row, and
+ * a TEX reads its coordinates from one row, so the SFU chains of a fetch's
+ * coordinates go on the row of the first one begun (TXB of ex2(x).xy: s and
+ * t on two rows, and no TEX could run, random.all_features.fragment.92)
+ */
+static bool
+seq_sfu_row_ok(struct fp_compiler *c, int i, int e)
+{
+   int rows = c->seq_rows;
+
+   if (rows == 1)
+      return true;
+   for (int n = 0; n < c->num_tex; n++) {
+      if (!c->tex[n].live || c->tex[n].exec >= 0)
+         continue;
+      int mine = -1;
+      for (int k = 0; k < c->tex[n].num_coords && mine < 0; k++)
+         if (seq_sfu_chain_has(c, &c->tex[n].coord[k], i))
+            mine = k;
+      if (mine < 0)
+         continue;
+      for (int k = 0; k < c->tex[n].num_coords; k++) {
+         const struct fp_opnd *o = &c->tex[n].coord[k];
+         if (k == mine || o->kind != FP_OPND_VALUE)
+            continue;
+         for (int w = o->index; c->units[w].sfu; ) {
+            if (c->units[w].exec >= 0 && (e - c->units[w].exec) % rows)
+               return false;
+            const struct fp_opnd *x = &c->units[w].slots[0].src[0];
+            if (x->kind != FP_OPND_VALUE)
+               break;
+            w = x->index;
+         }
+      }
+   }
+   return true;
+}
+
 /* Whether the MFU of an EXEC has nothing to do yet */
 static bool
 seq_mfu_free(const struct fp_seq_exec *x)
@@ -987,7 +1043,8 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
             continue;
          struct fp_unit *u = &c->units[i];
          if (!u->live || seq_is_alu(u) || u->exec >= 0 ||
-             !seq_reg_ready(c, s, &u->slots[0].src[0], e, false))
+             !seq_reg_ready(c, s, &u->slots[0].src[0], e, false) ||
+             !seq_sfu_row_ok(c, i, e))
             continue;
          u->exec = e;
          x->sfu_unit = i;

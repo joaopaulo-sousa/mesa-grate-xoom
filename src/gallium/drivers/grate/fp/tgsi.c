@@ -1701,12 +1701,13 @@ fp_cse_tex_reads(const struct fp_compiler *c, int i)
 static void
 fp_cse(struct fp_compiler *c)
 {
-   int remap[FP_MAX_UNITS];
+   int remap[FP_MAX_UNITS], orig[FP_MAX_UNITS];
 
    for (int i = 0; i < c->num_units; i++) {
       struct fp_unit *u = &c->units[i];
 
       remap[i] = i;
+      orig[i] = u->slots[0].src[0].kind == FP_OPND_VALUE ? u->slots[0].src[0].index : -1;
       fp_unit_foreach_src(u, k, j) {
          struct fp_opnd *o = &u->slots[k].src[j];
          if (o->kind == FP_OPND_VALUE)
@@ -1716,8 +1717,21 @@ fp_cse(struct fp_compiler *c)
          /* the same function of the same value (scalar TGSI ops replicated,
           * rcp of an int divisor per channel): once. Not for texture
           * coordinates: s and t take a register each, even when equal */
-         if (fp_cse_tex_reads(c, i))
+         if (fp_cse_tex_reads(c, i)) {
+            /* ... and it works in place on its own copy and pre-op, not
+             * on ones merged into another chain: two SFU ops in one
+             * register (ex2(x).xy as s, t: random.all_features.fragment.92) */
+            for (int w = i; ; ) {
+               struct fp_opnd *x = &c->units[w].slots[0].src[0];
+               if (x->kind != FP_OPND_VALUE || orig[w] < 0)
+                  break;
+               x->index = orig[w];
+               w = orig[w];
+               if (!c->units[w].sfu && !c->units[w].sfu_copy)
+                  break;
+            }
             continue;
+         }
          const struct fp_opnd *x = fp_cse_sfu_source(c, u);
          for (int p = 0; p < i; p++) {
             struct fp_unit *q = &c->units[p];
