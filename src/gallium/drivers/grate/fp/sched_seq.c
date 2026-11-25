@@ -140,6 +140,27 @@ seq_is_alu(const struct fp_unit *u)
    return u->sfu == FP_SFU_OP_NOP;
 }
 
+/*
+ * Condition registers (measured, asmtri exp-crrows, exp-crlim): cr0..cr4N-1
+ * with N rows, one boolean per pixel, read as 0.0 or 1.0; a write of EXEC k
+ * is seen from k + 1 with up to 2 rows, from k + 2 with 4 (k + 1 gives the
+ * old value), so k + 2 from 3 rows on. The NVIDIA compiler keeps its
+ * comparisons there for the CSELs that select by them (cgdump
+ * shaders/toobig/atan2.dis: cr0..cr11 on 4 rows), which leaves r0..r15 to
+ * the values.
+ */
+static int
+seq_cr_count(const struct fp_compiler *c)
+{
+   return 4 * c->seq_rows;
+}
+
+static int
+seq_cr_latency(const struct fp_compiler *c)
+{
+   return c->seq_rows > 2 ? 2 : 1;
+}
+
 /* Whether operand o can be read by an ALU unit in EXEC e, packet p */
 static bool
 seq_alu_can_read(struct fp_compiler *c, struct seq_state *s,
@@ -154,6 +175,9 @@ seq_alu_can_read(struct fp_compiler *c, struct seq_state *s,
       int lat = c->seq_rows > 1 ? 2 : 1;
       if (d->exec < 0)
          return false;
+      /* a condition register: from a later EXEC only */
+      if (d->cr)
+         return d->exec + seq_cr_latency(c) <= e;
       if (!seq_is_alu(d))
          return d->exec == e || d->exec + lat <= e;
       return d->exec + lat <= e ||
@@ -213,7 +237,34 @@ enum seq_item_kind { SEQ_NONE, SEQ_VALUE, SEQ_INPUT, SEQ_TEXEL, SEQ_DST, SEQ_OUT
 static int
 seq_item_size(struct fp_compiler *c, enum seq_item_kind kind, int a)
 {
+   if (kind == SEQ_VALUE && c->units[a].cr)
+      return 0;      /* not in r0..r15 */
    return kind == SEQ_VALUE && c->units[a].fx10 ? 1 : 2;
+}
+
+/* Condition registers in use after EXEC e (their readers to come) */
+static int
+seq_live_cr(struct fp_compiler *c, int e)
+{
+   int n = 0;
+   for (int i = 0; i < c->num_units; i++) {
+      struct fp_unit *u = &c->units[i];
+      if (!u->live || !u->cr || u->exec < 0)
+         continue;
+      for (int r = 0; r < c->num_units; r++) {
+         struct fp_unit *x = &c->units[r];
+         if (!x->live || (x->exec >= 0 && x->exec <= e))
+            continue;
+         bool reads = false;
+         fp_unit_foreach_src(x, k, j)
+            reads |= x->slots[k].src[j].kind == FP_OPND_VALUE && x->slots[k].src[j].index == i;
+         if (reads) {
+            n++;
+            break;
+         }
+      }
+   }
+   return n;
 }
 
 static bool
@@ -992,7 +1043,7 @@ seq_forwardable(struct fp_compiler *c, struct seq_state *s, int i, int e,
 {
    int reader = -1;
 
-   if (p + 1 >= FP_MAX_PACKETS_PER_EXEC || c->units[i].output_chan >= 0)
+   if (p + 1 >= FP_MAX_PACKETS_PER_EXEC || c->units[i].output_chan >= 0 || c->units[i].cr)
       return false;
    for (int r = 0; r < c->num_units; r++) {
       struct fp_unit *u = &c->units[r];
@@ -1197,6 +1248,9 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
                if (u->num_slots > 1 ? (mask & ((1u << u->num_slots) - 1)) != 0 :
                                       mask == 0xf)
                   continue;
+               /* a comparison into a condition register while one is free */
+               if (u->cr && seq_live_cr(c, e) >= seq_cr_count(c))
+                  continue;
                int delta = seq_unit_delta(c, i, e);
                int room = limit - (reserve && s->dst_exec < 0 ? 4 : 0);
                if (seq_coord_waits(c, i, room - seq_live_items(c, owner, e) - MAX2(delta, 0)))
@@ -1277,7 +1331,8 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
    for (int e = 0; c->seq_rows > 1 && e < s->num_execs; e++)
       total += !c->seq_exec[e].num_packets && seq_needs_alu(c, e);
    if (total > FP_MAX_PACKETS)
-      SEQ_FAIL("phase 1: %d packets with the empty ones\n", total);
+      SEQ_FAIL("phase 1: %d packets with the empty ones (%d EXECs, %d packets of work)\n",
+               total, s->num_execs, packet);
    return true;
 }
 
@@ -1389,7 +1444,7 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
    /* values that need a register: read in a later EXEC, by an SFU or TEX */
    for (int i = 0; i < c->num_units; i++) {
       struct fp_unit *u = &c->units[i];
-      if (!u->live || u->output_chan >= 0)
+      if (!u->live || u->output_chan >= 0 || u->cr)
          continue;
       if (!seq_is_alu(u))
          continue;   /* in place: below, once the inputs have items */
@@ -1614,6 +1669,44 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
       u->reg = held ? assigned[value_item[i]] : -1;
       u->half = held ? assigned_half[value_item[i]] : -1;
    }
+
+   /* condition registers: from the write to the last CSEL reading it,
+    * greedy in the order of the writes */
+   int cr_last[16], cr_def[FP_MAX_UNITS], cr_end[FP_MAX_UNITS];
+   for (int k = 0; k < 16; k++)
+      cr_last[k] = -1;
+   for (int i = 0; i < c->num_units; i++) {
+      struct fp_unit *u = &c->units[i];
+      if (!u->live || !u->cr)
+         continue;
+      cr_def[i] = seq_alu_time(c, u, true);
+      cr_end[i] = cr_def[i];
+      for (int r = 0; r < c->num_units; r++) {
+         struct fp_unit *x = &c->units[r];
+         if (!x->live)
+            continue;
+         fp_unit_foreach_src(x, k, j)
+            if (x->slots[k].src[j].kind == FP_OPND_VALUE && x->slots[k].src[j].index == i)
+               cr_end[i] = MAX2(cr_end[i], seq_read_time(c, x));
+      }
+   }
+   for (;;) {
+      int next = -1;
+      for (int i = 0; i < c->num_units; i++)
+         if (c->units[i].live && c->units[i].cr && c->units[i].reg < 0 &&
+             (next < 0 || cr_def[i] < cr_def[next]))
+            next = i;
+      if (next < 0)
+         break;
+      int k;
+      for (k = 0; k < seq_cr_count(c) && cr_last[k] >= cr_def[next]; k++)
+         ;
+      if (k == seq_cr_count(c))
+         SEQ_FAIL("phase 2: no condition register for u%d\n", next);
+      cr_last[k] = cr_end[next];
+      c->units[next].reg = 64 + k / 2;
+      c->units[next].half = k % 2;
+   }
    return true;
 }
 
@@ -1670,8 +1763,119 @@ seq_try(struct fp_compiler *c, int step)
  * only when the program does not fit otherwise (GRATE_FP_FX10=0 turns them
  * off); then more rows, the same way.
  */
+/*
+ * CSEL(c, 1, 0) or CSEL(c, 0, 1) (a comparison on a value fp_fold_conditions
+ * could not take, as a varying): the same test of c as a tested MAD, which
+ * can write a condition register
+ */
+static void
+seq_csel_to_test(struct fp_compiler *c, struct fp_unit *u)
+{
+   struct fp_unit_slot *s = &u->slots[0];
+   float x, y;
+
+   if (!u->live || !seq_is_alu(u) || u->num_slots != 1 || s->op != FP_ALU_OP_CSEL ||
+       u->condition || u->scale || u->output_chan >= 0 || u->kill ||
+       !fp_opnd_known(c, &s->src[1], &x) || !fp_opnd_known(c, &s->src[2], &y) ||
+       !((x == 1.0f && y == 0.0f) || (x == 0.0f && y == 1.0f)))
+      return;
+   struct fp_opnd cond = s->src[0];
+   if (cond.minus_one || cond.twice)
+      return;
+   /* as fp_fold_conditions: c < 0 ? 1 : 0 is -c > 0, c < 0 ? 0 : 1 is
+    * c >= 0, -|c| < 0 ? 0 : 1 is c == 0 */
+   bool lt_one = x == 1.0f, negate;
+   enum fp_condition test;
+   if (cond.absolute) {
+      if (!cond.negate || lt_one)
+         return;
+      negate = false;
+      test = FP_CONDITION_EQUAL;
+   } else {
+      negate = cond.negate ^ lt_one;
+      test = lt_one ? FP_CONDITION_GREATER : FP_CONDITION_GEQUAL;
+   }
+   cond.negate = negate;
+   cond.absolute = false;
+   fp_unit_op(s, FP_ALU_OP_MAD, cond, fp_opnd_one(c, false), fp_opnd_zero(c, false));
+   u->condition = test;
+}
+
+/*
+ * Comparisons a condition register may hold: a tested MAD (1.0 or 0.0) the
+ * ALU reads. Narrow (wide = false): only CSELs read it, as their selector -c
+ * or -|c|, as the NVIDIA compiler has them. Wide: any ALU operand (a cr
+ * reads as 0.0 or 1.0, asmtri exp-imm-cr), and the CSELs choosing 1 or 0
+ * become tested MADs first (the program does not fit otherwise when this
+ * runs). Neither fits every program the other does
+ * (random.all_features.fragment.88 narrow, atan2 vec4 wide). Returns how
+ * many.
+ */
+static int
+seq_mark_cr(struct fp_compiler *c, bool on, bool wide)
+{
+   int n = 0;
+   for (int i = 0; on && wide && i < c->num_units; i++)
+      seq_csel_to_test(c, &c->units[i]);
+   for (int i = 0; i < c->num_units; i++) {
+      struct fp_unit *u = &c->units[i];
+      u->cr = false;
+      if (!on || !u->live || !seq_is_alu(u) || u->num_slots != 1 || !u->condition ||
+          u->output_chan >= 0 || u->kill || u->sfu_copy)
+         continue;
+      bool ok = true, read = false;
+      for (int r = 0; r < c->num_units && ok; r++) {
+         struct fp_unit *x = &c->units[r];
+         if (!x->live)
+            continue;
+         fp_unit_foreach_src(x, k, j) {
+            const struct fp_opnd *o = &x->slots[k].src[j];
+            if (o->kind != FP_OPND_VALUE || o->index != i)
+               continue;
+            read = true;
+            ok &= seq_is_alu(x) &&
+                  (wide || (x->num_slots == 1 && x->slots[0].op == FP_ALU_OP_CSEL &&
+                            k == 0 && j == 0 && o->negate && !o->twice && !o->minus_one));
+         }
+      }
+      for (int t = 0; t < c->num_tex && ok; t++)
+         for (int k = 0; k < c->tex[t].num_coords; k++)
+            ok &= !(c->tex[t].coord[k].kind == FP_OPND_VALUE && c->tex[t].coord[k].index == i);
+      if (ok && read) {
+         u->cr = true;
+         n++;
+      }
+   }
+   return n;
+}
+
+static bool seq_sched_rows_pass(struct fp_compiler *c);
+
+/*
+ * The search as before; when nothing fits, again with the comparisons in
+ * condition registers (GRATE_FP_CR=0 turns that off)
+ */
 static bool
 seq_sched_rows(struct fp_compiler *c)
+{
+   if (seq_sched_rows_pass(c))
+      return true;
+   if (getenv("GRATE_FP_CR") && !atoi(getenv("GRATE_FP_CR")))
+      return false;
+   for (int wide = 0; wide < 2; wide++) {
+      int n = seq_mark_cr(c, true, wide);
+      if (grate_debug & GRATE_DEBUG_TGSI)
+         fprintf(stderr, "GRATE FRAG: retrying with %d comparisons in condition registers%s\n",
+                 n, wide ? " (wide)" : "");
+      if (n && seq_sched_rows_pass(c))
+         return true;
+   }
+   seq_mark_cr(c, false, false);
+   return false;
+}
+
+static bool
+seq_sched_rows_pass(struct fp_compiler *c)
 {
    bool fx10_ok = !getenv("GRATE_FP_FX10") || atoi(getenv("GRATE_FP_FX10"));
    /* GRATE_FP_SEQ_ROWS: at least that many rows (to try them out) */

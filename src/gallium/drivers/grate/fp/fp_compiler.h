@@ -92,6 +92,8 @@ struct fp_unit {
    int reg;                /* register holding the value, -1 if none */
    bool fx10;              /* may be kept as a fixed10 half (fx10.c) */
    int half;               /* ... and is, in this half of reg; -1: fp20 */
+   bool cr;                /* a comparison kept in a condition register
+                              (sched_seq.c): reg 64 + k / 2, half k % 2 */
 };
 
 /* What one EXEC of a sequential program does (sched_seq.c) */
@@ -230,6 +232,7 @@ struct fp_compiler {
    bool seq;
    int out_pair;           /* colour register pair: 1 = r2/r3, 0 = r0/r1 (of
                               the last row) */
+   bool seq_cr;            /* sched_seq.c: comparisons in condition registers */
    int seq_rows;           /* pixel packet rows of a sequential program (1..4):
                               EXEC e works on row e % seq_rows (sched_seq.c) */
    struct seq_readers *seq_readers;   /* sched_seq.c, while it runs */
@@ -274,6 +277,7 @@ fp_output_half(int chan)
 /* tgsi.c */
 void fp_fail(struct fp_compiler *c, const char *msg);
 struct fp_unit *fp_new_unit(struct fp_compiler *c);
+bool fp_opnd_known(struct fp_compiler *c, const struct fp_opnd *o, float *v);
 struct fp_opnd fp_opnd_value(struct fp_compiler *c, struct fp_unit *u);
 struct fp_opnd fp_opnd_zero(struct fp_compiler *c, bool output);
 struct fp_opnd fp_opnd_one(struct fp_compiler *c, bool output);
