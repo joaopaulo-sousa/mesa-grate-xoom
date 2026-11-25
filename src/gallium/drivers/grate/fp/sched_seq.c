@@ -574,6 +574,30 @@ seq_is_coord(struct fp_compiler *c, int i, int comp)
 }
 
 /*
+ * Whether the pair at register "pair" holds varying coordinates of a fetch
+ * still to come other than n: the texel of either would then go over the
+ * other's coordinates, and neither TEX could run (mpv's YUV planes: two
+ * fetches of one varying's .xy and .zw)
+ */
+static bool
+seq_pair_holds_coords(struct fp_compiler *c, const struct seq_owner *owner,
+                      int pair, int n)
+{
+   for (int r = pair; r < pair + 2; r++) {
+      if (owner[r].kind != SEQ_INPUT)
+         continue;
+      for (int m = 0; m < c->num_tex; m++) {
+         if (m == n || !c->tex[m].live || c->tex[m].exec >= 0)
+            continue;
+         for (int k = 0; k < c->tex[m].num_coords; k++)
+            if (seq_opnd_is(&c->tex[m].coord[k], SEQ_INPUT, owner[r].a, owner[r].b))
+               return true;
+      }
+   }
+   return false;
+}
+
+/*
  * A register the MFU of this EXEC can interpolate input i component comp
  * into, -1 if none: r(comp) preferably, the column the linker would give it
  * anyway, else any free one (the TRAM layout follows, fp/linker.c). A
@@ -599,7 +623,7 @@ seq_fetch_reg(struct fp_compiler *c, struct seq_state *s, const struct seq_owner
          bool other_in = o->kind == FP_OPND_INPUT;
          for (int p = 0; p < 2; p++) {
             int col = 2 * p + k, ocol = 2 * p + 1 - k;
-            if (!SEQ_COL_FREE(col))
+            if (!SEQ_COL_FREE(col) || seq_pair_holds_coords(c, owner, base + 2 * (1 - p), n))
                continue;
             if (other_in && other >= 0 ? other == base + ocol :
                 other_in ? SEQ_COL_FREE(ocol) : true)
