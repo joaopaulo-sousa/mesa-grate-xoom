@@ -187,6 +187,7 @@ struct fp_compiler {
     */
    int first_pseudo, num_pseudo;
    bool trunc_abs;        /* TRUNC as |x| - fract(|x|) even of a varying */
+   struct grate_fp_opts opts;
    struct {
       int input, comp;       /* the varying component */
       enum fp_sfu_op op;

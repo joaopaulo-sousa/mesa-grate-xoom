@@ -237,13 +237,13 @@ grate_fs_free(struct grate_fp_shader *fp)
 
 static void
 grate_fs_translate(struct grate_fp_shader *fp, const struct tgsi_token *tokens,
-                   const struct grate_fp_key *key, bool trunc_abs, int max_pre)
+                   const struct grate_fp_key *key, const struct grate_fp_opts *opts)
 {
    struct tgsi_parse_context parser;
    unsigned ok = tgsi_parse_init(&parser, tokens);
    assert(ok == TGSI_PARSE_OK);
    (void)ok;
-   grate_tgsi_to_fp(fp, &parser, key, trunc_abs, max_pre);
+   grate_tgsi_to_fp(fp, &parser, key, opts);
    tgsi_parse_free(&parser);
 }
 
@@ -253,9 +253,8 @@ grate_fs_compile(enum drm_tegra_soc_id soc_id, const struct tgsi_token *tokens,
                  const struct grate_fp_key *key, struct grate_fs_variant *v)
 {
    struct grate_fp_shader fp;
-   bool trunc_abs = false;
-   int max_pre = GRATE_FP_MAX_PRE;
-   grate_fs_translate(&fp, tokens, key, trunc_abs, max_pre);
+   struct grate_fp_opts opts = { .max_pre = GRATE_FP_MAX_PRE };
+   grate_fs_translate(&fp, tokens, key, &opts);
 
    /*
     * Compiled again when it fails:
@@ -265,25 +264,31 @@ grate_fs_compile(enum drm_tegra_soc_id soc_id, const struct tgsi_token *tokens,
     * - TRUNC of a varying is compiled as fract(x) so that a multi-row
     *   program can run the SFU on the interpolated register; a sequential
     *   program has fewer registers for its extra values and may only fit
-    *   with |x|.
+    *   with |x|;
+    * - a dot product as a chain of MADs: more packets, but fewer registers
+    *   at a time.
     */
    while (fp.info.failed) {
       if (fp.info.out_of_uniforms && fp.info.num_pre)
-         max_pre = fp.info.num_pre / 2;
-      else if (fp.info.varying_trunc && !trunc_abs)
-         trunc_abs = true;
+         opts.max_pre = fp.info.num_pre / 2;
+      else if (fp.info.varying_trunc && !opts.trunc_abs)
+         opts.trunc_abs = true;
+      else if (fp.info.dots && !opts.split_dots)
+         opts.split_dots = true;
       else
          break;
       grate_fs_free(&fp);
-      grate_fs_translate(&fp, tokens, key, trunc_abs, max_pre);
+      grate_fs_translate(&fp, tokens, key, &opts);
    }
 
    /* a sequential program that fits on more rows with fract(x) may fit on
     * fewer with |x|: fewer rows, more pixels in flight */
    if (!fp.info.failed && fp.info.sequential && fp.info.num_rows > 1 &&
-       fp.info.varying_trunc && !trunc_abs) {
+       fp.info.varying_trunc && !opts.trunc_abs) {
       struct grate_fp_shader alt;
-      grate_fs_translate(&alt, tokens, key, true, max_pre);
+      struct grate_fp_opts alt_opts = opts;
+      alt_opts.trunc_abs = true;
+      grate_fs_translate(&alt, tokens, key, &alt_opts);
       if (!alt.info.failed && alt.info.num_rows < fp.info.num_rows) {
          grate_fs_free(&fp);
          fp = alt;

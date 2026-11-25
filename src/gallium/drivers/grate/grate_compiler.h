@@ -205,6 +205,7 @@ struct grate_fp_info {
    bool failed;             /* did not fit: the program draws magenta */
    bool varying_trunc;      /* TRUNC of a varying as fract(x) (see trunc_abs) */
    bool out_of_uniforms;    /* failed for the uniform registers */
+   bool dots;               /* has DP2/DP3/DP4 (see split_dots) */
    bool reads_uniforms;     /* the ALU reads uniform registers: upload them */
 };
 
@@ -286,10 +287,17 @@ struct grate_fp_key {
    float depth[2];
 };
 
-/* max_pre: preshader entries at most (GRATE_FP_MAX_PRE); fewer keep more
- * of the work in the program, which may then read fewer uniforms */
+/* How grate_tgsi_to_fp compiles a program, changed when it does not fit */
+struct grate_fp_opts {
+   /* preshader entries at most (GRATE_FP_MAX_PRE); fewer keep more of the
+    * work in the program, which may then read fewer uniforms */
+   int max_pre;
+   bool trunc_abs;          /* TRUNC as |x| - fract(|x|) even of a varying */
+   bool split_dots;         /* DPn as a chain of MADs, not one packet */
+};
+
 void
 grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
-                 const struct grate_fp_key *key, bool trunc_abs, int max_pre);
+                 const struct grate_fp_key *key, const struct grate_fp_opts *opts);
 
 #endif

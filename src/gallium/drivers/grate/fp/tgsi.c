@@ -791,7 +791,22 @@ emit_dot(struct fp_compiler *c, const struct tgsi_full_instruction *inst,
    }
 
    u->forward = false;
-   if (squares) {
+   c->fp->info.dots = true;
+   if (c->opts.split_dots) {
+      /*
+       * a chain of MADs, a[k] * b[k] + the sum so far: one packet more per
+       * term, but two registers read at a time instead of 2n, and those of
+       * the terms done are free for the rest (matrix.mul.dynamic_*_vec4_mat4:
+       * four DP4s of one varying with four others)
+       */
+      fp_unit_op(&u->slots[0], FP_ALU_OP_MAD, a[0], b[0], fp_opnd_zero(c, false));
+      u->forward = true;
+      for (int k = 1; k < n; k++) {
+         struct fp_unit *m = fp_new_unit(c);
+         fp_unit_op(&m->slots[0], FP_ALU_OP_MAD, a[k], b[k], fp_opnd_value(c, u));
+         u = m;
+      }
+   } else if (squares) {
       /*
        * dot(v, v): slot 0 computes rA * rB + rC * rD with rD = rC, two
        * squares, the others send it one square each. Measured: a sending
@@ -2603,7 +2618,7 @@ fp_fold_coord_copies(struct fp_compiler *c)
 
 void
 grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
-                 const struct grate_fp_key *key, bool trunc_abs, int max_pre)
+                 const struct grate_fp_key *key, const struct grate_fp_opts *opts)
 {
    static const struct grate_fp_key key_none = { .colormask = 0xf };
    struct fp_compiler *c = CALLOC_STRUCT(fp_compiler);
@@ -2613,8 +2628,9 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    if (!key)
       key = &key_none;
    c->key = key;
-   c->trunc_abs = trunc_abs;
-   c->max_pre = CLAMP(max_pre, 0, GRATE_FP_MAX_PRE);
+   c->opts = *opts;
+   c->trunc_abs = opts->trunc_abs;
+   c->max_pre = CLAMP(opts->max_pre, 0, GRATE_FP_MAX_PRE);
    c->out_pair = 1;
    c->redirect_output = key && (key->blend || (key->colormask & 0xf) != 0xf);
 
@@ -2634,6 +2650,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    fp->info.sampler_mask = 0;
    fp->info.varying_trunc = false;
    fp->info.out_of_uniforms = false;
+   fp->info.dots = false;
    fp->info.lod_bias_mask = 0;
    fp->info.lod_bias_user_mask = fp->info.lod_bias_user_neg = 0;
    memset(fp->info.lod_bias, 0, sizeof(fp->info.lod_bias));
