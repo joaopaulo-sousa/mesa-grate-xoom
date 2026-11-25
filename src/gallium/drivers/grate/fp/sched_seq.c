@@ -1243,6 +1243,8 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
          unsigned mask = 0;
          for (;;) {
             int best = -1, best_delta = 0;
+            /* the same for every candidate: it changes with a pick only */
+            int live = seq_live_items(c, owner, e);
             for (int i = 0; i < c->num_units; i++) {
                struct fp_unit *u = &c->units[i];
                if (!u->live || !seq_is_alu(u) || u->exec >= 0 ||
@@ -1256,9 +1258,9 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
                   continue;
                int delta = seq_unit_delta(c, i, e);
                int room = limit - (reserve && s->dst_exec < 0 ? 4 : 0);
-               if (seq_coord_waits(c, i, room - seq_live_items(c, owner, e) - MAX2(delta, 0)))
+               if (seq_coord_waits(c, i, room - live - MAX2(delta, 0)))
                   continue;
-               if (delta > 0 && seq_live_items(c, owner, e) + delta > room &&
+               if (delta > 0 && live + delta > room &&
                    !seq_forwardable(c, s, i, e, packet, p))
                   continue;
                if (best < 0 || delta < best_delta ||
