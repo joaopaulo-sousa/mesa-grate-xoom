@@ -810,6 +810,36 @@ seq_pair_holds_coords(struct fp_compiler *c, const struct seq_owner *owner,
 }
 
 /*
+ * Whether register reg (column col of this EXEC's row) holds, or this
+ * EXEC's MFU interpolates into it, a coordinate of a fetch to come other
+ * than n
+ */
+static bool
+seq_reg_holds_coords(struct fp_compiler *c, const struct seq_owner *owner, int reg, int n,
+                     const struct seq_state *s, const struct fp_seq_exec *x, int col)
+{
+   int a = -1, b = -1;
+   if (x->ipl_input[col] >= 0) {
+      a = x->ipl_input[col];
+      b = x->ipl_comp[col];
+   } else if (owner[reg].kind == SEQ_INPUT) {
+      a = owner[reg].a;
+      b = owner[reg].b;
+   }
+   if (a < 0)
+      return false;
+   for (int m = 0; m < c->num_tex; m++) {
+      if (m == n || !c->tex[m].live || c->tex[m].exec >= 0)
+         continue;
+      for (int k = 0; k < c->tex[m].num_coords; k++)
+         if (seq_opnd_is(&c->tex[m].coord[k], SEQ_INPUT, a, b))
+            return true;
+   }
+   (void)s;
+   return false;
+}
+
+/*
  * A register the MFU of this EXEC can interpolate input i component comp
  * into, -1 if none: r(comp) preferably, the column the linker would give it
  * anyway, else any free one (the TRAM layout follows, fp/linker.c). A
@@ -836,6 +866,16 @@ seq_fetch_reg(struct fp_compiler *c, struct seq_state *s, const struct seq_owner
          for (int p = 0; p < 2; p++) {
             int col = 2 * p + k, ocol = 2 * p + 1 - k;
             if (!SEQ_COL_FREE(col) || seq_pair_holds_coords(c, owner, base + 2 * (1 - p), n))
+               continue;
+            /* nor next to another fetch's coordinate: the pair is that
+             * fetch's (two alias interpolations of the blur's t, each
+             * beside a computed s, took one pair and neither TEX ran) */
+            if (!other_in && seq_reg_holds_coords(c, owner, base + ocol, n, s, x, ocol))
+               continue;
+            /* an alias beside a computed coordinate: where that one can
+             * go, the column free (not the varying the coordinates are
+             * computed from, held all along) */
+            if (!other_in && c->input_alias[i] && !SEQ_COL_FREE(ocol))
                continue;
             if (other_in && other >= 0 ? other == base + ocol :
                 other_in ? SEQ_COL_FREE(ocol) : true)
@@ -2177,7 +2217,7 @@ fp_emit_seq(struct fp_compiler *c)
                if (x->ipl_input[k] < 0)
                   continue;
                mfu->var[k].op = FP_VAR_OP_FP20;
-               mfu->var[k].tram_row = fp_tram_row(c, x->ipl_input[k],
+               mfu->var[k].tram_row = fp_tram_row(c, fp_input_real(c, x->ipl_input[k]),
                                                   x->ipl_comp[k], k);
             }
          } else {

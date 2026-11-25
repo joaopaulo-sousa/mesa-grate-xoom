@@ -207,6 +207,8 @@ struct grate_fp_info {
    bool out_of_uniforms;    /* failed for the uniform registers */
    bool dots;               /* has DP2/DP3/DP4 (see split_dots) */
    bool seq_too_big;        /* the sequential scheduler found no fit */
+   bool input_aliases;      /* interpolates a varying again for a fetch (no_alias) */
+   int num_execs;           /* EXECs of the program */
    bool reads_uniforms;     /* the ALU reads uniform registers: upload them */
 };
 
@@ -298,6 +300,9 @@ struct grate_fp_opts {
    /* the sequential scheduler's slower last tries (condition registers,
     * one fetch at a time), after every other option failed */
    bool seq_fallbacks;
+   /* shared varying texture coordinates copied, not interpolated again
+    * (fp_tex_copy_shared_coords) */
+   bool no_alias;
 };
 
 void

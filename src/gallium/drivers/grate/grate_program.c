@@ -306,6 +306,32 @@ grate_fs_compile(enum drm_tegra_soc_id soc_id, const struct tgsi_token *tokens,
       }
    }
 
+   /*
+    * Interpolating a shared varying coordinate again for each fetch holds
+    * no register before its TEX (glmark2 bump: 3 rows, 27 EXECs -> 2, 22),
+    * but the schedule may also come out longer than with copies (blur:
+    * 24 -> 40 EXECs): both, the one with fewer EXECs (rows on a tie), which
+    * is what the frame time follows (blur on the Xoom: 33 EXECs 8 fps, 24
+    * EXECs on more rows 12 fps)
+    */
+   if (!fp.info.failed && fp.info.input_aliases && !opts.no_alias) {
+      struct grate_fp_shader alt;
+      struct grate_fp_opts alt_opts = opts;
+      alt_opts.no_alias = true;
+      grate_fs_translate(&alt, tokens, key, &alt_opts);
+      if (!alt.info.failed &&
+          (alt.info.num_execs < fp.info.num_execs ||
+           (alt.info.num_execs == fp.info.num_execs && alt.info.num_rows < fp.info.num_rows))) {
+         grate_fs_free(&fp);
+         fp = alt;
+         list_replace(&alt.fp_instructions, &fp.fp_instructions);
+         list_replace(&alt.alu_instructions, &fp.alu_instructions);
+         list_replace(&alt.mfu_instructions, &fp.mfu_instructions);
+      } else {
+         grate_fs_free(&alt);
+      }
+   }
+
    /* say which shader draws magenta, to have something to work from (not
     * the generic version of one that gets specialized at draw time) */
    if (fp.info.failed && fp.info.num_flow == (key ? key->num_flow : 0) &&

@@ -2536,9 +2536,12 @@ fp_tex_div_computed(struct fp_compiler *c, int n)
  * A sequential program's fetch with one computed coordinate and one
  * straight from a varying that another fetch reads too: the varying's
  * register ties both fetches to its pair, and one texel blocks the other's
- * (glmark2 bump-height: s + step with t, after s with t). A copy of it is a
- * value like the other coordinate, free to go to any pair, as the NVIDIA
- * compiler does (cgdump shaders/big/bump.dis).
+ * (glmark2 bump-height: s + step with t, after s with t). It gets an
+ * interpolation of its own: an alias input, interpolated into whatever pair
+ * the fetch takes and when it runs, as the NVIDIA compiler does (cgdump
+ * shaders/blur: ipl t1 in the EXECs of later fetches), which holds no
+ * register before and lets the texel go over it. A copy (a value like the
+ * other coordinate, cgdump shaders/big/bump.dis) when the inputs run out.
  */
 static void
 fp_tex_copy_shared_coords(struct fp_compiler *c)
@@ -2558,6 +2561,13 @@ fp_tex_copy_shared_coords(struct fp_compiler *c)
                          c->tex[m].coord[j].comp == o->comp;
          if (!shared)
             continue;
+         int alias = c->num_inputs + c->num_input_aliases;
+         if (!c->opts.no_alias && alias < FP_MAX_INPUTS) {
+            c->input_alias[alias] = fp_input_real(c, o->index) + 1;
+            c->num_input_aliases++;
+            o->index = alias;
+            continue;
+         }
          struct fp_unit *u = fp_new_unit(c);
          fp_unit_op(&u->slots[0], FP_ALU_OP_MAD, *o, fp_opnd_one(c, false),
                     fp_opnd_zero(c, false));
@@ -2656,6 +2666,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    fp->info.out_of_uniforms = false;
    fp->info.dots = false;
    fp->info.seq_too_big = false;
+   fp->info.input_aliases = false;
    fp->info.lod_bias_mask = 0;
    fp->info.lod_bias_user_mask = fp->info.lod_bias_user_neg = 0;
    memset(fp->info.lod_bias, 0, sizeof(fp->info.lod_bias));
@@ -2797,6 +2808,8 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    fp_build_links(c);
    fp->info.num_rows = c->seq ? MAX2(c->seq_rows, 1) : c->num_execs;
    fp->info.sequential = c->seq;
+   fp->info.input_aliases = c->num_input_aliases > 0 && !c->failed;
+   fp->info.num_execs = c->num_execs;
    fp->info.failed = c->failed;
    fp->info.pre = fp->info.num_pre ?
                   mem_dup(c->pre, fp->info.num_pre * sizeof(c->pre[0])) : NULL;
