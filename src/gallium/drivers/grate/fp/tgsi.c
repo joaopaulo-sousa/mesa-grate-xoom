@@ -1487,8 +1487,12 @@ uint32_t
 fp_tex_word(const struct fp_compiler *c, int n, int coord_pair)
 {
    /* bit 12: txb, the LOD bias from the second register of the texel pair */
+   /* bit 5: the texel pair, the other one or (same_pair) the coordinates'
+    * own, as the NVIDIA compiler has it for 2D fetches (cgdump
+    * shaders/blur: tex r2, r3, tex0, r2, r3, r0) */
+   int texel_pair = c->tex[n].same_pair ? coord_pair : 1 - coord_pair;
    return (c->tex[n].sampler & 0xf) | coord_pair << 4 |
-          (1 - coord_pair) << 5 | 1 << 10 |
+          texel_pair << 5 | 1 << 10 |
           (fp_tex_coord(c, n, FP_TEX_BIAS) >= 0) << 12;
 }
 

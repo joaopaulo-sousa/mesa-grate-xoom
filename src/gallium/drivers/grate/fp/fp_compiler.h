@@ -222,6 +222,8 @@ struct fp_compiler {
       int r_comp;
       int input;
       int pair;            /* register pair of the coordinates */
+      bool same_pair;      /* sequential: the texel overwrites them (pair),
+                              else it goes to the other pair */
       int sampler;
       int exec;
       bool live;
@@ -234,6 +236,12 @@ struct fp_compiler {
                               the last row) */
    bool seq_cr;            /* sched_seq.c: comparisons in condition registers */
    bool seq_tex_serial;    /* sched_seq.c: one fetch's computed coordinates at a time */
+   bool seq_tex_inplace;   /* sched_seq.c: texels over their coordinates where they may */
+   /* sequential programs: inputs num_inputs.. that are another
+    * interpolation of input input_alias[i] - 1 (0: none), for a fetch
+    * whose texel goes over it (fp_tex_copy_shared_coords) */
+   uint8_t input_alias[FP_MAX_INPUTS];
+   int num_input_aliases;
    int seq_rows;           /* pixel packet rows of a sequential program (1..4):
                               EXEC e works on row e % seq_rows (sched_seq.c) */
    struct seq_readers *seq_readers;   /* sched_seq.c, while it runs */
@@ -279,6 +287,13 @@ fp_output_half(int chan)
 void fp_fail(struct fp_compiler *c, const char *msg);
 struct fp_unit *fp_new_unit(struct fp_compiler *c);
 bool fp_opnd_known(struct fp_compiler *c, const struct fp_opnd *o, float *v);
+
+/* The TGSI input an input index interpolates (itself or an alias's) */
+static inline int
+fp_input_real(const struct fp_compiler *c, int input)
+{
+   return c->input_alias[input] ? c->input_alias[input] - 1 : input;
+}
 struct fp_opnd fp_opnd_value(struct fp_compiler *c, struct fp_unit *u);
 struct fp_opnd fp_opnd_zero(struct fp_compiler *c, bool output);
 struct fp_opnd fp_opnd_one(struct fp_compiler *c, bool output);
@@ -303,7 +318,6 @@ void fp_expand_blend_inv(struct fp_compiler *c);
 void fp_fold_conditions(struct fp_compiler *c);
 void fp_move_coords(struct fp_compiler *c);
 bool fp_opnd_is_const(struct fp_compiler *c, const struct fp_opnd *o, float v);
-bool fp_opnd_known(struct fp_compiler *c, const struct fp_opnd *o, float *v);
 bool fp_rows_sfu(const struct fp_compiler *c, const struct fp_unit *u);
 
 /* preshader.c */

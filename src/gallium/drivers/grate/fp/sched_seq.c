@@ -149,6 +149,13 @@ seq_is_alu(const struct fp_unit *u)
  * shaders/toobig/atan2.dis: cr0..cr11 on 4 rows), which leaves r0..r15 to
  * the values.
  */
+/* The register pair of fetch n's texel (in its row) */
+static int
+seq_texel_pair(const struct fp_compiler *c, int n)
+{
+   return c->tex[n].same_pair ? c->tex[n].pair : 1 - c->tex[n].pair;
+}
+
 static int
 seq_cr_count(const struct fp_compiler *c)
 {
@@ -404,7 +411,7 @@ seq_half_needed(struct fp_compiler *c, enum seq_item_kind kind, int a,
          if (!seq_opnd_is(o, kind, a, 0))
             continue;
          int h = fp_output_half(o->comp);
-         int pair = kind == SEQ_TEXEL ? 1 - c->tex[a].pair : c->dst_pair;
+         int pair = kind == SEQ_TEXEL ? seq_texel_pair(c, a) : c->dst_pair;
          int base = 4 * SEQ_ROW(c, kind == SEQ_TEXEL ? c->tex[a].exec : c->dst_exec);
          if (base + 2 * pair + h / 2 == reg && h % 2 == high)
             return true;
@@ -627,6 +634,40 @@ seq_read_after(struct fp_compiler *c, const struct seq_owner *own,
             return true;
    }
    return false;
+}
+
+/*
+ * Whether fetch n's texel may overwrite its s and t (same_pair) in EXEC e:
+ * a 2D fetch without r or a bias, whose coordinates nothing reads after
+ * this TEX, nor the ALU of EXEC e - 1 with more rows (the texel lands
+ * before it reads, as from the other pair: asmtri exp-late w*)
+ */
+static bool
+seq_tex_inplace_ok(struct fp_compiler *c, int n, int e)
+{
+   int before = c->seq_rows > 1 ? e - 1 : e;
+   struct seq_readers *rd = c->seq_readers;
+
+   if (!c->seq_tex_inplace || c->tex[n].num_coords != 2 || c->tex[n].cube || c->tex[n].proj)
+      return false;
+   for (int k = 0; k < 2; k++) {
+      const struct fp_opnd *o = &c->tex[n].coord[k];
+      if (o->kind != FP_OPND_VALUE && o->kind != FP_OPND_INPUT)
+         return false;
+      /* every other reader (seq_readers: units, fetches as -1 - n) done
+       * before */
+      int key = seq_reader_key(o);
+      for (int j = rd->start[key]; j < rd->start[key + 1]; j++) {
+         int r = rd->list[j];
+         int exec = r < 0 ? c->tex[-1 - r].exec : c->units[r].exec;
+         bool live = r < 0 ? c->tex[-1 - r].live : c->units[r].live;
+         if (r == -1 - n || !live)
+            continue;
+         if (exec < 0 || exec >= before)
+            return false;
+      }
+   }
+   return true;
 }
 
 /*
@@ -1088,6 +1129,22 @@ seq_dump(struct fp_compiler *c, struct seq_state *s, const struct seq_owner *own
 {
    static const char kinds[] = "uvitd01s";   /* by enum fp_opnd_kind */
 
+   for (int n = 0; n < c->num_tex; n++) {
+      if (!c->tex[n].live)
+         continue;
+      fprintf(stderr, "GRATE FRAG:   tex%d e%d pair %d%s:", n, c->tex[n].exec, c->tex[n].pair,
+              c->tex[n].same_pair ? " (texel over it)" : "");
+      for (int k = 0; k < c->tex[n].num_coords; k++) {
+         const struct fp_opnd *o = &c->tex[n].coord[k];
+         if (o->kind == FP_OPND_VALUE)
+            fprintf(stderr, " u%d", o->index);
+         else if (o->kind == FP_OPND_INPUT)
+            fprintf(stderr, " in%d.%d (fetched e%d r%d)", o->index, o->comp,
+                    s->fetch_exec[o->index][o->comp], s->fetch_reg[o->index][o->comp]);
+      }
+      fprintf(stderr, "\n");
+   }
+
    for (int r = 0; r < SEQ_REGS(c); r++)
       fprintf(stderr, "GRATE FRAG:   r%d: owner kind %d (%d.%d)\n", r,
               owner[r].kind, owner[r].a, owner[r].b);
@@ -1197,14 +1254,23 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
              !seq_reg_ready(c, s, &c->tex[n].coord[0], e, true) ||
              !seq_reg_ready(c, s, &c->tex[n].coord[1], e, true) ||
              !seq_extra_coords_ready(c, s, n, e) ||
-             (fp_tex_coord(c, n, FP_TEX_R) >= 0 && !seq_mfu_free(x)) ||
-             /* the texel takes a pair; r and a bias are already in it */
-             seq_live_items(c, owner, e - 1) + 4 -
-                2 * (c->tex[n].num_coords - 2) > limit)
+             (fp_tex_coord(c, n, FP_TEX_R) >= 0 && !seq_mfu_free(x)))
+            continue;
+         /* the texel takes a pair (r and a bias are already in it), or
+          * the coordinates' own */
+         bool room = seq_live_items(c, owner, e - 1) + 4 -
+                     2 * (c->tex[n].num_coords - 2) <= limit;
+         bool inplace = seq_tex_inplace_ok(c, n, e);
+         if (!room && !inplace)
             continue;
          /* the TEX works on the pairs of its EXEC's row */
          int base = 4 * SEQ_ROW(c, e);
-         for (int p = 0; p < 2; p++) {
+         for (int pq = 0; pq < 4 && x->tex < 0; pq++) {
+            int p = pq / 2;
+            /* the texel over the coordinates first, where it may */
+            bool same = (pq % 2) == 0;
+            if (same ? !inplace : !room)
+               continue;
             struct fp_opnd *s0 = &c->tex[n].coord[0], *s1 = &c->tex[n].coord[1];
             /* a cube map's computed coordinates: pair 0 only, r in r2, as
              * the NVIDIA compiler does (rcp r10); with pair 1, r in r0 and
@@ -1216,9 +1282,9 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
                 (s1->kind == FP_OPND_INPUT &&
                  s->fetch_reg[s1->index][s1->comp] != base + 2 * p + 1))
                continue;
-            int q = 1 - p;
-            if (!seq_fixed_free(c, &owner[base + 2 * q], e) ||
-                !seq_fixed_free(c, &owner[base + 2 * q + 1], e))
+            int q = same ? p : 1 - p;
+            if (!same && (!seq_fixed_free(c, &owner[base + 2 * q], e) ||
+                          !seq_fixed_free(c, &owner[base + 2 * q + 1], e)))
                continue;
             /* computed coordinates: no fixed item may be in their registers
              * while they are there */
@@ -1226,13 +1292,13 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
                continue;
             c->tex[n].exec = e;
             c->tex[n].pair = p;
+            c->tex[n].same_pair = same;
             owner[base + 2 * q] = owner[base + 2 * q + 1] =
                (struct seq_owner) { SEQ_TEXEL, n, 0 };
             x->tex = n;
             x->cube_mfu = fp_tex_coord(c, n, FP_TEX_R) >= 0;
             remaining--;
             progress = true;
-            break;
          }
       }
 
@@ -1504,11 +1570,18 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
       if (!c->tex[n].live)
          continue;
       int e = c->tex[n].exec;
-      int q = 1 - c->tex[n].pair, t = SEQ_T(e, T_TEX);
+      int q = seq_texel_pair(c, n), t = SEQ_T(e, T_TEX);
       int base = 4 * SEQ_ROW(c, e);
       bool own[2] = { false, false };
       for (int k = 0; k < c->tex[n].num_coords; k++) {
          int role = c->tex[n].role[k];
+         if (role < FP_TEX_R && c->tex[n].same_pair) {
+            /* s and t under the texel, read just before it lands */
+            own[0] = own[1] = true;
+            if (c->seq_rows > 1 && e > 0 && seq_read_in_exec(c, &c->tex[n].coord[k], e - 1))
+               SEQ_FAIL("phase 2: s/t of tex%d read by the ALU of EXEC %d\n", n, e - 1);
+            continue;
+         }
          if (role < FP_TEX_R)
             continue;
          own[role - FP_TEX_R] = true;
@@ -1570,7 +1643,7 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
          int role = c->tex[n].role[k];
          int want = 4 * SEQ_ROW(c, c->tex[n].exec) +
                     (role < FP_TEX_R ? 2 * p + role : 2 * (1 - p) + (role - FP_TEX_R));
-         SEQ_READ(it, SEQ_T(c->tex[n].exec, T_TEX) - (role >= FP_TEX_R));
+         SEQ_READ(it, SEQ_T(c->tex[n].exec, T_TEX) - (role >= FP_TEX_R || c->tex[n].same_pair));
          if (items[it].reg >= 0 && items[it].reg != want)
             SEQ_FAIL("phase 2: coordinate %d of tex%d (%s%d) in r%d, wanted in r%d\n", k, n,
                      o->kind == FP_OPND_VALUE ? "u" : "in", o->index, items[it].reg, want);
@@ -1857,35 +1930,59 @@ seq_mark_cr(struct fp_compiler *c, bool on, bool wide)
 static bool seq_sched_rows_pass(struct fp_compiler *c);
 
 /*
- * The search as before; when nothing fits, again with the comparisons in
- * condition registers (GRATE_FP_CR=0 turns that off)
+ * The search, with texels over their coordinates where they may (as the
+ * NVIDIA compiler has them: one register pair per fetch, fewer rows;
+ * GRATE_FP_INPLACE=0 turns that off). When nothing fits, as the last
+ * translation's last tries (seq_fallbacks): without them, then with the
+ * comparisons in condition registers (GRATE_FP_CR=0 turns those off), then
+ * the fetches one at a time, each with texels over coordinates and without.
  */
 static bool
 seq_sched_rows(struct fp_compiler *c)
 {
+   bool inplace = !getenv("GRATE_FP_INPLACE") || atoi(getenv("GRATE_FP_INPLACE"));
+
+   c->seq_tex_inplace = inplace;
    if (seq_sched_rows_pass(c))
       return true;
-   if (!c->opts.seq_fallbacks || (getenv("GRATE_FP_CR") && !atoi(getenv("GRATE_FP_CR"))))
+   if (!c->opts.seq_fallbacks)
       return false;
-   for (int wide = 0; wide < 2; wide++) {
-      int n = seq_mark_cr(c, true, wide);
+   if (inplace) {
+      c->seq_tex_inplace = false;
       if (grate_debug & GRATE_DEBUG_TGSI)
-         fprintf(stderr, "GRATE FRAG: retrying with %d comparisons in condition registers%s\n",
-                 n, wide ? " (wide)" : "");
-      if (n && seq_sched_rows_pass(c))
+         fprintf(stderr, "GRATE FRAG: retrying with texels beside their coordinates\n");
+      if (seq_sched_rows_pass(c))
          return true;
+   }
+   bool cr_ok = !getenv("GRATE_FP_CR") || atoi(getenv("GRATE_FP_CR"));
+   for (int ip = inplace; ip >= 0 && cr_ok; ip--) {
+      c->seq_tex_inplace = ip;
+      for (int wide = 0; wide < 2; wide++) {
+         int n = seq_mark_cr(c, true, wide);
+         if (grate_debug & GRATE_DEBUG_TGSI)
+            fprintf(stderr, "GRATE FRAG: retrying with %d comparisons in condition registers%s%s\n",
+                    n, wide ? " (wide)" : "", ip ? ", texels over coordinates" : "");
+         if (n && seq_sched_rows_pass(c))
+            return true;
+      }
+      seq_mark_cr(c, false, false);
    }
    /* then the computed coordinates of one fetch at a time, without and with
     * the condition registers */
    if (c->num_tex > 1) {
       c->seq_tex_serial = true;
-      for (int cr = 0; cr < 2; cr++) {
-         int n = seq_mark_cr(c, cr, true);
-         if (grate_debug & GRATE_DEBUG_TGSI)
-            fprintf(stderr, "GRATE FRAG: retrying with the fetches one at a time%s\n",
-                    cr ? ", condition registers" : "");
-         if ((!cr || n) && seq_sched_rows_pass(c))
-            return true;
+      /* with texels over coordinates only (the uniform_api cube fetches
+       * need it; without, each pass more costs as much as the search) */
+      for (int ip = inplace; ip >= inplace; ip--) {
+         c->seq_tex_inplace = ip;
+         for (int cr = 0; cr < 1 + cr_ok; cr++) {
+            int n = seq_mark_cr(c, cr, true);
+            if (grate_debug & GRATE_DEBUG_TGSI)
+               fprintf(stderr, "GRATE FRAG: retrying with the fetches one at a time%s%s\n",
+                       cr ? ", condition registers" : "", ip ? ", texels over coordinates" : "");
+            if ((!cr || n) && seq_sched_rows_pass(c))
+               return true;
+         }
       }
       c->seq_tex_serial = false;
    }
@@ -1966,7 +2063,7 @@ seq_resolve(struct fp_compiler *c, const struct fp_opnd *o, int e, int p)
       break;
    case FP_OPND_TEXEL:
    case FP_OPND_DST: {
-      int pair = o->kind == FP_OPND_TEXEL ? 1 - c->tex[o->index].pair : c->dst_pair;
+      int pair = o->kind == FP_OPND_TEXEL ? seq_texel_pair(c, o->index) : c->dst_pair;
       int exec = o->kind == FP_OPND_TEXEL ? c->tex[o->index].exec : c->dst_exec;
       ret = fp_alu_src_row(4 * SEQ_ROW(c, exec) + 2 * pair + fp_output_half(o->comp) / 2);
       ret.datatype = FP_DATATYPE_FIXED10;
