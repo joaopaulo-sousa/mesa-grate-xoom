@@ -423,6 +423,61 @@ seq_extra_coords_ready(struct fp_compiler *c, struct seq_state *s, int n, int e)
    return true;
 }
 
+/*
+ * Whether EXEC e of a program on more rows needs an ALU packet, an empty one
+ * if it has none. Row 0 always (one there without kills the output, asmtri
+ * exp-noalu). Elsewhere a lone EXEC without one is fine (exp-noalu3), but
+ * the ALU latency counts packets, not EXECs: an ALU write of EXEC k read by
+ * the ALU of k + 2 across an EXEC k + 1 without a packet gives all zeros
+ * (exp-noalu4, 4 rows). So the packet stays where an ALU value written
+ * before e is read after it by the ALU within 2 EXECs. An SFU op reading it
+ * N EXECs on sees it across EXECs without one (exp-noalu5, N = 2..4); a
+ * TEX, not measured, keeps the packet within rows + 1.
+ */
+static int seq_pad_why;   /* 0 row 0, 1 ALU read, 2 SFU/TEX read (debug) */
+static bool
+seq_needs_alu(struct fp_compiler *c, int e)
+{
+   seq_pad_why = 0;
+   int rows = c->seq_rows;
+
+   if (rows == 1)
+      return false;
+   if (e % rows == 0 || getenv("GRATE_FP_ALL_PACKETS"))
+      return true;
+   for (int i = 0; i < c->num_units; i++) {
+      struct fp_unit *r = &c->units[i];
+      if (!r->live || r->exec <= e || !seq_is_alu(r))
+         continue;
+      int reach = 2;
+      fp_unit_foreach_src(r, k, j) {
+         const struct fp_opnd *o = &r->slots[k].src[j];
+         if (o->kind != FP_OPND_VALUE || !seq_is_alu(&c->units[o->index]))
+            continue;
+         int w = c->units[o->index].exec;
+         if (w < e && r->exec - w <= reach) {
+            seq_pad_why = 1;
+            return true;
+         }
+      }
+   }
+   for (int n = 0; n < c->num_tex; n++) {
+      if (!c->tex[n].live || c->tex[n].exec <= e)
+         continue;
+      for (int k = 0; k < c->tex[n].num_coords; k++) {
+         const struct fp_opnd *o = &c->tex[n].coord[k];
+         if (o->kind != FP_OPND_VALUE || !seq_is_alu(&c->units[o->index]))
+            continue;
+         int w = c->units[o->index].exec;
+         if (w < e && c->tex[n].exec - w <= rows + 1) {
+            seq_pad_why = 2;
+            return true;
+         }
+      }
+   }
+   return false;
+}
+
 /* Whether SFU unit i is in the in-place chain that ends in coordinate o */
 static bool
 seq_sfu_chain_has(struct fp_compiler *c, const struct fp_opnd *o, int i)
@@ -1220,7 +1275,7 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
     * and they count against the program's packets too */
    int total = packet;
    for (int e = 0; c->seq_rows > 1 && e < s->num_execs; e++)
-      total += !c->seq_exec[e].num_packets;
+      total += !c->seq_exec[e].num_packets && seq_needs_alu(c, e);
    if (total > FP_MAX_PACKETS)
       SEQ_FAIL("phase 1: %d packets with the empty ones\n", total);
    return true;
@@ -1842,9 +1897,14 @@ fp_emit_seq(struct fp_compiler *c)
       }
 
       inst->alu_sched.address = list_length(&fp->alu_instructions);
-      /* more rows: an EXEC without an ALU packet kills the output
-       * (measured, asmtri exp-wrap2..4), so an empty one */
-      if (c->seq_rows > 1 && !x->num_packets) {
+      /* more rows: an empty packet where one is needed (seq_needs_alu) */
+      if (!x->num_packets && c->seq_rows > 1 && (grate_debug & GRATE_DEBUG_TGSI)) {
+         bool pad = seq_needs_alu(c, e);
+         fprintf(stderr, "GRATE FRAG: EXEC %d without ALU: %s\n", e,
+                 !pad ? "no packet" : seq_pad_why == 0 ? "empty packet (row 0)" :
+                 seq_pad_why == 1 ? "empty packet (ALU read across)" : "empty packet (TEX read across)");
+      }
+      if (!x->num_packets && seq_needs_alu(c, e)) {
          struct fp_alu_instr_packet *pkt = CALLOC_STRUCT(fp_alu_instr_packet);
          list_inithead(&pkt->link);
          for (int k = 0; k < 4; k++)
@@ -1865,6 +1925,10 @@ fp_emit_seq(struct fp_compiler *c)
          list_addtail(&pkt->link, &fp->alu_instructions);
          inst->alu_sched.num_instructions++;
       }
+      /* none: address 0, as the NVIDIA compiler has it (after the 64th
+       * packet the next address would not fit in the 6 bits) */
+      if (!inst->alu_sched.num_instructions)
+         inst->alu_sched.address = 0;
 
       /* the store runs in the last pass */
       if (e == c->num_execs - 1)
