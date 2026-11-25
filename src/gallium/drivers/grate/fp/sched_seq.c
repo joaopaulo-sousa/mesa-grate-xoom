@@ -2058,9 +2058,102 @@ seq_sched_rows_pass(struct fp_compiler *c)
    return false;
 }
 
+/*
+ * When a sum term is there: 0 for a texel of a fetch at varying
+ * coordinates (its TEX can run at once), 1 for anything else
+ */
+static int
+seq_term_key(struct fp_compiler *c, const struct fp_opnd *a, const struct fp_opnd *b)
+{
+   const struct fp_opnd *ops[2] = { a, b };
+   for (int k = 0; k < 2; k++) {
+      if (ops[k]->kind != FP_OPND_TEXEL)
+         continue;
+      int n = ops[k]->index;
+      for (int j = 0; j < c->tex[n].num_coords; j++)
+         if (c->tex[n].coord[j].kind != FP_OPND_INPUT)
+            return 1;
+      return 0;
+   }
+   return 1;
+}
+
+/*
+ * A sum as a chain of MADs (acc = a * b + acc, each partial sum read by the
+ * next one only) takes its terms in program order, while the texels it
+ * sums come in the order their TEXs can run: the blur's centre tap, at
+ * varying coordinates, is fetched first and is the sixth term, its texel
+ * held meanwhile. The terms of texels at varying coordinates go first
+ * (floating point additions in another order: GLSL ES does not keep it).
+ */
+static void
+seq_reorder_sums(struct fp_compiler *c)
+{
+   int readers[FP_MAX_UNITS] = { 0 };
+   for (int i = 0; i < c->num_units; i++)
+      if (c->units[i].live)
+         fp_unit_foreach_src(&c->units[i], k, j)
+            if (c->units[i].slots[k].src[j].kind == FP_OPND_VALUE)
+               readers[c->units[i].slots[k].src[j].index]++;
+   for (int n = 0; n < c->num_tex; n++)
+      for (int k = 0; c->tex[n].live && k < c->tex[n].num_coords; k++)
+         if (c->tex[n].coord[k].kind == FP_OPND_VALUE)
+            readers[c->tex[n].coord[k].index]++;
+
+#define SEQ_SUM_LINK(u) ((u)->live && seq_is_alu(u) && (u)->num_slots == 1 && \
+                         (u)->slots[0].op == FP_ALU_OP_MAD && !(u)->saturate && !(u)->scale && \
+                         !(u)->condition && !(u)->kill && !(u)->sfu_copy && \
+                         !(u)->slots[0].accumulate_this && !(u)->slots[0].accumulate_other && \
+                         !(u)->slots[0].square_c)
+   bool done[FP_MAX_UNITS] = { false };
+   for (int t = c->num_units - 1; t >= 0; t--) {
+      if (done[t])
+         continue;
+      /* the chain ending at t: back through src[2] while that is a link
+       * read by the next one only */
+      int chain[64], len = 0;
+      for (int u = t; len < 64; ) {
+         struct fp_unit *x = &c->units[u];
+         if (!SEQ_SUM_LINK(x))
+            break;
+         chain[len++] = u;
+         done[u] = true;
+         const struct fp_opnd *acc = &x->slots[0].src[2];
+         if (acc->kind != FP_OPND_VALUE || acc->negate || acc->absolute || acc->twice ||
+             acc->minus_one || readers[acc->index] != 1 || !SEQ_SUM_LINK(&c->units[acc->index]))
+            break;
+         u = acc->index;
+      }
+      if (len < 3)
+         continue;
+      /* chain[len - 1] is the first link (its src[2] the base); stable
+       * sort of the terms (src[0], src[1]) by key */
+      struct fp_opnd ta[64], tb[64];
+      int key[64], m = 0;
+      for (int k = len - 1; k >= 0; k--) {
+         struct fp_unit_slot *sl = &c->units[chain[k]].slots[0];
+         ta[m] = sl->src[0];
+         tb[m] = sl->src[1];
+         key[m++] = seq_term_key(c, &sl->src[0], &sl->src[1]);
+      }
+      int pos = 0;
+      for (int want = 0; want < 2; want++)
+         for (int k = 0; k < m; k++)
+            if (key[k] == want) {
+               struct fp_unit_slot *sl = &c->units[chain[len - 1 - pos]].slots[0];
+               sl->src[0] = ta[k];
+               sl->src[1] = tb[k];
+               pos++;
+            }
+   }
+#undef SEQ_SUM_LINK
+}
+
 bool
 fp_sched_seq(struct fp_compiler *c)
 {
+   if (!getenv("GRATE_FP_SUM_ORDER") || atoi(getenv("GRATE_FP_SUM_ORDER")))
+      seq_reorder_sums(c);
    struct seq_readers *rd = MALLOC_STRUCT(seq_readers);
    struct seq_alloc_mem *mem = MALLOC_STRUCT(seq_alloc_mem);
    if (!rd || !mem) {
