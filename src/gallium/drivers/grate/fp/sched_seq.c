@@ -47,6 +47,12 @@
 #define T_ALU 3           /* ... + 2 * packet in the EXEC, + 1 for its writes */
 #define SEQ_T(e, stage) (8 * (4 * (e) + (stage)))
 #define SEQ_FOREVER (1 << 20)
+/* a schedule or allocation that cannot be: why, with GRATE_DEBUG=tgsi */
+#define SEQ_FAIL(...) do { \
+   if (grate_debug & GRATE_DEBUG_TGSI) \
+      fprintf(stderr, "GRATE FRAG: " __VA_ARGS__); \
+   return false; \
+} while (0)
 
 struct seq_state {
    int fetch_exec[FP_MAX_INPUTS][4];   /* EXEC interpolating input i comp c */
@@ -967,7 +973,7 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
       bool progress = false;
 
       if (e == FP_SEQ_MAX_EXECS)
-         return false;
+         SEQ_FAIL("phase 1: out of EXECs (%d)\n", e);
       memset(x, 0, sizeof(*x));
       x->sfu_unit = x->tex = -1;
       for (int k = 0; k < 4; k++)
@@ -1111,7 +1117,7 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
          if (!mask)
             break;
          if (packet == FP_MAX_PACKETS)
-            return false;
+            SEQ_FAIL("phase 1: out of packets at EXEC %d\n", e);
          packet++;
          x->num_packets++;
          progress = true;
@@ -1121,7 +1127,7 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
        * (more rows: an SFU may wait that many EXECs for its operand) */
       if (!progress && ++idle > c->seq_rows) {
          if (grate_debug & GRATE_DEBUG_TGSI) {
-            fprintf(stderr, "GRATE FRAG: stuck at EXEC %d, live %d:", e,
+            fprintf(stderr, "GRATE FRAG: phase 1: stuck at EXEC %d, live %d:", e,
                     seq_live_items(c, owner, e));
             for (int i = 0; i < c->num_units; i++)
                if (c->units[i].live && c->units[i].exec < 0)
@@ -1144,7 +1150,7 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
     * asmtri exp-rows3): empty ones to fill up */
    while (remaining == 0 && s->num_execs % c->seq_rows) {
       if (s->num_execs == FP_SEQ_MAX_EXECS)
-         return false;
+         SEQ_FAIL("phase 1: out of EXECs filling the rows\n");
       struct fp_seq_exec *x = &c->seq_exec[s->num_execs++];
       memset(x, 0, sizeof(*x));
       x->sfu_unit = x->tex = -1;
@@ -1158,7 +1164,9 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
    int total = packet;
    for (int e = 0; c->seq_rows > 1 && e < s->num_execs; e++)
       total += !c->seq_exec[e].num_packets;
-   return remaining == 0 && total <= FP_MAX_PACKETS;
+   if (total > FP_MAX_PACKETS)
+      SEQ_FAIL("phase 1: %d packets with the empty ones\n", total);
+   return true;
 }
 
 /*
@@ -1307,7 +1315,8 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
          continue;
       if ((items[it].row >= 0 && items[it].row != row) ||
           (items[it].reg >= 0 && items[it].reg / 4 != row))
-         return false;
+         SEQ_FAIL("phase 2: SFU u%d on row %d, its operand on row %d\n", i, row,
+                  items[it].row >= 0 ? items[it].row : items[it].reg / 4);
       items[it].row = row;
    }
 
@@ -1332,7 +1341,7 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
             continue;
          own[role - FP_TEX_R] = true;
          if (c->seq_rows > 1 && e > 0 && seq_read_in_exec(c, &c->tex[n].coord[k], e - 1))
-            return false;
+            SEQ_FAIL("phase 2: r/bias of tex%d read by the ALU of EXEC %d\n", n, e - 1);
       }
       for (int h = 0; h < 4; h++) {
          int def = own[h / 2] ? t : SEQ_MFU_DEF(e, T_TEX);
@@ -1382,7 +1391,7 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
          int it = o->kind == FP_OPND_VALUE ? value_item[o->index] :
                   input_item[o->index][o->comp];
          if (it < 0)
-            return false;
+            SEQ_FAIL("phase 2: coordinate %d of tex%d not in a register\n", k, n);
          /* the coordinates are read from pair p: s in 2p, t in 2p+1, as
           * fp20 values; a cube map's r (by the MFU) and a bias from the
           * texel pair, 2q and 2q+1, before the texel lands there */
@@ -1391,7 +1400,8 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
                     (role < FP_TEX_R ? 2 * p + role : 2 * (1 - p) + (role - FP_TEX_R));
          SEQ_READ(it, SEQ_T(c->tex[n].exec, T_TEX) - (role >= FP_TEX_R));
          if (items[it].reg >= 0 && items[it].reg != want)
-            return false;
+            SEQ_FAIL("phase 2: coordinate %d of tex%d (%s%d) in r%d, wanted in r%d\n", k, n,
+                     o->kind == FP_OPND_VALUE ? "u" : "in", o->index, items[it].reg, want);
          items[it].reg = want;
          items[it].fx10 = false;
       }
@@ -1463,7 +1473,7 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
          }
          if (r == SEQ_REGS(c)) {
             if (grate_debug & GRATE_DEBUG_TGSI)
-               fprintf(stderr, "GRATE FRAG: no register for item %d [%d, %d]%s row %d\n",
+               fprintf(stderr, "GRATE FRAG: phase 2: no register for item %d [%d, %d]%s row %d\n",
                        i, it->def, it->last, it->fx10 ? " (fixed10)" : "", it->row);
             if (grate_debug & GRATE_DEBUG_TGSI) {
                for (int k = 0; k < num; k++)
@@ -1478,7 +1488,7 @@ seq_alloc(struct fp_compiler *c, struct seq_state *s)
             h = -1;
       } else if (seq_busy(items, num, assigned, assigned_half, it, r, h)) {
          if (grate_debug & GRATE_DEBUG_TGSI)
-            fprintf(stderr, "GRATE FRAG: fixed r%d%s for item %d [%d, %d] busy\n",
+            fprintf(stderr, "GRATE FRAG: phase 2: fixed r%d%s for item %d [%d, %d] busy\n",
                     r, h < 0 ? "" : h ? ".h" : ".l", i, it->def, it->last);
          return false;
       }
@@ -1510,8 +1520,9 @@ seq_try(struct fp_compiler *c, int step)
       s.late_ipl = late;
       if (!seq_schedule(c, &s, limit)) {
          if (grate_debug & GRATE_DEBUG_TGSI)
-            fprintf(stderr, "GRATE FRAG: sequential schedule failed (limit %d%s)\n",
-                    limit, by_channel ? ", by channel" : "");
+            fprintf(stderr, "GRATE FRAG: sequential schedule failed (%d rows, limit %d%s%s%s)\n",
+                    c->seq_rows, limit, by_channel ? ", by channel" : "",
+                    late ? ", late" : "", c->units[0].fx10 || step == 1 ? ", fx10" : "");
          continue;
       }
       if (grate_debug & GRATE_DEBUG_TGSI)
