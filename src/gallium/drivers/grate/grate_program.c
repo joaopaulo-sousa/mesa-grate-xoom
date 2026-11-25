@@ -275,6 +275,11 @@ grate_fs_compile(enum drm_tegra_soc_id soc_id, const struct tgsi_token *tokens,
          opts.trunc_abs = true;
       else if (fp.info.dots && !opts.split_dots)
          opts.split_dots = true;
+      else if (fp.info.seq_too_big && !opts.seq_fallbacks &&
+               /* not for a generic version specialized at draw time */
+               fp.info.num_flow == (key ? key->num_flow : 0) &&
+               (!fp.info.num_spec || (key && key->spec)))
+         opts.seq_fallbacks = true;   /* slow: last */
       else
          break;
       grate_fs_free(&fp);

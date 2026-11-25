@@ -461,7 +461,10 @@ seq_coord_waits(struct fp_compiler *c, int i, int room)
          }
       }
    }
-   return pending > 0 && room < 4;
+   /* seq_tex_serial: those of the next fetch only, whatever the room (six
+    * fetches at constant coordinates, all ready in EXEC 0, would take every
+    * register before the first TEX: uniform_api ...sampler2D_samplerCube) */
+   return pending > 0 && (room < 4 || c->seq_tex_serial);
 }
 
 /* Whether a cube map's r and a bias of fetch n are there for EXEC e */
@@ -1860,7 +1863,7 @@ seq_sched_rows(struct fp_compiler *c)
 {
    if (seq_sched_rows_pass(c))
       return true;
-   if (getenv("GRATE_FP_CR") && !atoi(getenv("GRATE_FP_CR")))
+   if (!c->opts.seq_fallbacks || (getenv("GRATE_FP_CR") && !atoi(getenv("GRATE_FP_CR"))))
       return false;
    for (int wide = 0; wide < 2; wide++) {
       int n = seq_mark_cr(c, true, wide);
@@ -1869,6 +1872,20 @@ seq_sched_rows(struct fp_compiler *c)
                  n, wide ? " (wide)" : "");
       if (n && seq_sched_rows_pass(c))
          return true;
+   }
+   /* then the computed coordinates of one fetch at a time, without and with
+    * the condition registers */
+   if (c->num_tex > 1) {
+      c->seq_tex_serial = true;
+      for (int cr = 0; cr < 2; cr++) {
+         int n = seq_mark_cr(c, cr, true);
+         if (grate_debug & GRATE_DEBUG_TGSI)
+            fprintf(stderr, "GRATE FRAG: retrying with the fetches one at a time%s\n",
+                    cr ? ", condition registers" : "");
+         if ((!cr || n) && seq_sched_rows_pass(c))
+            return true;
+      }
+      c->seq_tex_serial = false;
    }
    seq_mark_cr(c, false, false);
    return false;

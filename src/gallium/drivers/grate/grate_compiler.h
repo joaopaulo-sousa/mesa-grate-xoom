@@ -206,6 +206,7 @@ struct grate_fp_info {
    bool varying_trunc;      /* TRUNC of a varying as fract(x) (see trunc_abs) */
    bool out_of_uniforms;    /* failed for the uniform registers */
    bool dots;               /* has DP2/DP3/DP4 (see split_dots) */
+   bool seq_too_big;        /* the sequential scheduler found no fit */
    bool reads_uniforms;     /* the ALU reads uniform registers: upload them */
 };
 
@@ -294,6 +295,9 @@ struct grate_fp_opts {
    int max_pre;
    bool trunc_abs;          /* TRUNC as |x| - fract(|x|) even of a varying */
    bool split_dots;         /* DPn as a chain of MADs, not one packet */
+   /* the sequential scheduler's slower last tries (condition registers,
+    * one fetch at a time), after every other option failed */
+   bool seq_fallbacks;
 };
 
 void

@@ -233,6 +233,7 @@ struct fp_compiler {
    int out_pair;           /* colour register pair: 1 = r2/r3, 0 = r0/r1 (of
                               the last row) */
    bool seq_cr;            /* sched_seq.c: comparisons in condition registers */
+   bool seq_tex_serial;    /* sched_seq.c: one fetch's computed coordinates at a time */
    int seq_rows;           /* pixel packet rows of a sequential program (1..4):
                               EXEC e works on row e % seq_rows (sched_seq.c) */
    struct seq_readers *seq_readers;   /* sched_seq.c, while it runs */

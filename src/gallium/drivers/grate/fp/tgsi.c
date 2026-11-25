@@ -2651,6 +2651,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    fp->info.varying_trunc = false;
    fp->info.out_of_uniforms = false;
    fp->info.dots = false;
+   fp->info.seq_too_big = false;
    fp->info.lod_bias_mask = 0;
    fp->info.lod_bias_user_mask = fp->info.lod_bias_user_neg = 0;
    memset(fp->info.lod_bias, 0, sizeof(fp->info.lod_bias));
@@ -2750,8 +2751,10 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
       fp_fuse_mad(c);
       fp_fold_coord_copies(c);
    }
-   if (!c->failed && c->seq && !fp_sched_seq(c))
+   if (!c->failed && c->seq && !fp_sched_seq(c)) {
       fp_fail(c, "shader too big (out of ALU packets or registers)");
+      fp->info.seq_too_big = true;
+   }
 
    if ((grate_debug & GRATE_DEBUG_TGSI) && !c->seq)
       fp_dump_rows(c);
