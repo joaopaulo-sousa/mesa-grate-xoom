@@ -3,6 +3,7 @@
 #include <stdio.h>
 
 #include "util/format/u_format.h"
+#include "util/u_blitter.h"
 #include "util/u_inlines.h"
 #include "util/u_memory.h"
 #include "util/u_pack_color.h"
@@ -412,10 +413,17 @@ grate_screen_resource_create(struct pipe_screen *pscreen,
    for (unsigned l = 0; l < levels; ++l) {
       unsigned lpitch = util_format_get_nblocksx(template->format, lw) * blocksize;
 
+      /* rows as the TEX unit reads a view from this level (emit_textures,
+       * see the pitch above): 16 bytes if the level is a power of two both
+       * ways, 64 if not. Cube maps keep the width alone, as measured. */
+      unsigned lrh = u_minify(template->height0, l);
+      bool lpot = util_is_power_of_two_nonzero(lw) &&
+                  (template->target == PIPE_TEXTURE_CUBE ||
+                   util_is_power_of_two_nonzero(lrh));
       if (l == 0)
          lpitch = resource->pitch;
       else
-         lpitch = align(lpitch, util_is_power_of_two_nonzero(lw) ? 16 : 64);
+         lpitch = align(lpitch, lpot ? 16 : 64);
 
       resource->level_offset[l] = size;
       resource->level_pitch[l] = lpitch;
@@ -658,6 +666,57 @@ grate_blit_cpu(struct pipe_context *pcontext, const struct pipe_blit_info *info)
       pcontext->texture_unmap(pcontext, dt);
 }
 
+/*
+ * Blits the 2D engine cannot do, by the 3D engine (u_blitter draws a
+ * rectangle reading the source with the filter asked): mipmap generation
+ * above all, which on the CPU took over a second for a 2048x1280 texture
+ * (glmark2 refract, every frame). Colour, 2D textures the TEX unit reads
+ * (rows as it expects them: sampler views) into ones it renders to.
+ */
+static bool
+grate_blit_3d(struct pipe_context *pcontext, const struct pipe_blit_info *info)
+{
+   struct grate_context *context = grate_context(pcontext);
+   struct pipe_screen *screen = pcontext->screen;
+   const struct pipe_resource *src = info->src.resource, *dst = info->dst.resource;
+
+   if (!context->blitter || !info->mask || (info->mask & ~PIPE_MASK_RGBA) ||
+       src->target != PIPE_TEXTURE_2D || dst->target != PIPE_TEXTURE_2D ||
+       !(src->bind & PIPE_BIND_SAMPLER_VIEW) || !(dst->bind & PIPE_BIND_RENDER_TARGET) ||
+       grate_resource(info->src.resource)->tiled ||
+       info->src.level >= GRATE_MAX_MIP_LEVELS || info->dst.level >= GRATE_MAX_MIP_LEVELS ||
+       util_format_is_depth_or_stencil(info->src.format) ||
+       util_format_is_depth_or_stencil(info->dst.format) ||
+       util_format_is_compressed(info->src.format) ||
+       util_format_is_compressed(info->dst.format) ||
+       (src == dst && info->src.level == info->dst.level) ||
+       !screen->is_format_supported(screen, info->src.format, PIPE_TEXTURE_2D, 0, 0,
+                                    PIPE_BIND_SAMPLER_VIEW) ||
+       !screen->is_format_supported(screen, info->dst.format, PIPE_TEXTURE_2D, 0, 0,
+                                    PIPE_BIND_RENDER_TARGET) ||
+       !util_blitter_is_blit_supported(context->blitter, info))
+      return false;
+
+   struct blitter_context *b = context->blitter;
+   util_blitter_save_blend(b, (void *)context->blend);
+   util_blitter_save_depth_stencil_alpha(b, context->zsa);
+   util_blitter_save_stencil_ref(b, &context->stencil_ref);
+   util_blitter_save_rasterizer(b, context->rast);
+   util_blitter_save_fragment_shader(b, context->fshader);
+   util_blitter_save_vertex_shader(b, context->vshader);
+   util_blitter_save_viewport(b, &context->viewport_state);
+   util_blitter_save_scissor(b, &context->scissor);
+   util_blitter_save_vertex_elements(b, context->vs);
+   util_blitter_save_vertex_buffers(b, context->vbs.vb, context->vbs.count);
+   util_blitter_save_framebuffer(b, &context->framebuffer.base);
+   util_blitter_save_fragment_sampler_states(b, ARRAY_SIZE(context->samplers),
+                                             (void **)context->samplers);
+   util_blitter_save_fragment_sampler_views(b, context->num_sampler_views,
+                                            context->sampler_views);
+   util_blitter_blit(b, info, NULL);
+   return true;
+}
+
 static void
 grate_blit(struct pipe_context *pcontext, const struct pipe_blit_info *info)
 {
@@ -677,7 +736,8 @@ grate_blit(struct pipe_context *pcontext, const struct pipe_blit_info *info)
        info->src.box.height != info->dst.box.height ||
        info->src.box.width < 0 || info->src.box.height < 0 || info->scissor_enable ||
        util_format_is_compressed(info->src.format)) {
-      grate_blit_cpu(pcontext, info);
+      if (!grate_blit_3d(pcontext, info))
+         grate_blit_cpu(pcontext, info);
       return;
    }
 

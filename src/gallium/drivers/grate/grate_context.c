@@ -6,6 +6,7 @@
 #include "util/u_inlines.h"
 #include "util/u_memory.h"
 #include "util/u_upload_mgr.h"
+#include "util/u_blitter.h"
 
 #include "grate_common.h"
 #include "grate_device.h"
@@ -82,6 +83,8 @@ grate_context_destroy(struct pipe_context *pcontext)
    grate_trace();
 
    grate_context_submit(context);
+   if (context->blitter)
+      util_blitter_destroy(context->blitter);
    grate_twopass_destroy(context, context->twopass);
    slab_destroy_child(&context->transfer_pool);
    if (context->spill_bo)
@@ -213,6 +216,8 @@ grate_screen_context_create(struct pipe_screen *pscreen,
    grate_context_program_init(&context->base);
    grate_context_vbo_init(&context->base);
    grate_context_draw_init(&context->base);
+
+   context->blitter = util_blitter_create(&context->base);
 
    return &context->base;
 }

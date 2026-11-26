@@ -64,6 +64,9 @@ struct grate_context {
    bool pseq_cmds_set;
 
    struct pipe_scissor_state scissor;
+   struct pipe_viewport_state viewport_state;   /* as bound, for u_blitter */
+   /* scaled, flipped and converting blits by the 3D engine (grate_blit) */
+   struct blitter_context *blitter;
    /* the viewport rectangle in framebuffer pixels: the hardware clips to
     * its guard band only, so draws are scissored to this (emit_scissor) */
    struct pipe_scissor_state viewport_rect;

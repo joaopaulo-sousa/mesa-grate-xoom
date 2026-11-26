@@ -27,6 +27,12 @@ grate_set_sample_mask(struct pipe_context *pcontext,
    grate_unimplemented();
 }
 
+/* no queries: u_blitter pauses them around its draws */
+static void
+grate_set_active_query_state(struct pipe_context *pcontext, bool enable)
+{
+}
+
 static void
 grate_set_constant_buffer(struct pipe_context *pcontext, enum mesa_shader_stage shader,
                           uint index, const struct pipe_constant_buffer *buffer)
@@ -132,6 +138,8 @@ grate_set_viewport_states(struct pipe_context *pcontext,
 
    assert(num_viewports == 1);
    assert(start_slot == 0);
+
+   context->viewport_state = viewports[0];
 
    context->depth_scale = viewports[0].scale[2];
    context->depth_translate = viewports[0].translate[2];
@@ -255,6 +263,7 @@ grate_context_state_init(struct pipe_context *pcontext)
    pcontext->bind_fs_state = grate_fp_state_bind;
    pcontext->bind_vs_state = grate_vp_state_bind;
    pcontext->set_sample_mask = grate_set_sample_mask;
+   pcontext->set_active_query_state = grate_set_active_query_state;
    pcontext->set_constant_buffer = grate_set_constant_buffer;
    pcontext->set_framebuffer_state = grate_set_framebuffer_state;
    pcontext->set_polygon_stipple = grate_set_polygon_stipple;
@@ -1076,7 +1085,13 @@ emit_textures(struct grate_context *context, uint32_t **ptrp)
        * brought up to date before the draw (grate_draw_vbo) */
       if (grate_npot_shadow(view, sampler) && res->shadow)
          res = res->shadow;
-      unsigned width = res->b.width0, height = res->b.height0;
+      /* a view from a level down (u_blitter's mipmap generation reads the
+       * level above the one it draws): that level as the base, its size,
+       * the levels below it if mipmapped */
+      unsigned first = view->target == PIPE_TEXTURE_CUBE ? 0 :
+                       MIN2(view->u.tex.first_level, GRATE_MAX_MIP_LEVELS - 1);
+      unsigned width = u_minify(res->b.width0, first);
+      unsigned height = u_minify(res->b.height0, first);
       uint32_t lo, hi;
 
       /* Z16: no depth format in the TEX unit, the bytes as L8A8
@@ -1113,11 +1128,12 @@ emit_textures(struct grate_context *context, uint32_t **ptrp)
        */
       bool pot = util_is_power_of_two_nonzero(width) &&
                  util_is_power_of_two_nonzero(height);
-      unsigned levels = res->b.last_level;
-      bool mip = pot && levels && view->u.tex.first_level == 0 && sampler &&
+      unsigned levels = MIN2(res->b.last_level, GRATE_MAX_MIP_LEVELS - 1);
+      levels = MIN2(levels, view->u.tex.last_level);
+      levels = levels > first ? levels - first : 0;
+      bool mip = pot && levels && sampler &&
                  sampler->min_mip_filter != PIPE_TEX_MIPFILTER_NONE;
       if (mip) {
-         levels = MIN2(levels, view->u.tex.last_level);
          hi = TGR3D_TEX_TEXDESC_HI_LOD_MAX(levels << 4);
          if (sampler->min_mip_filter == PIPE_TEX_MIPFILTER_LINEAR)
             lo |= TGR3D_TEX_TEXDESC_LO_LERP_MIP;
@@ -1159,7 +1175,8 @@ emit_textures(struct grate_context *context, uint32_t **ptrp)
       lo |= TGR3D_TEX_TEXDESC_LO_LOD_BIAS(CLAMP(bias, -256, 255) & 0x1ff);
 
       GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_TEX_TEXADDR(i), 1));
-      grate_stream_push_reloc(stream, ptrp, res->bo, 0, false);
+      grate_stream_push_reloc(stream, ptrp, res->bo, first ? res->level_offset[first] : 0,
+                              false);
       GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_TEX_TEXDESC_LO(i), 2));
       GRATE_PUSHBUF_WORD(*ptrp, lo);
       GRATE_PUSHBUF_WORD(*ptrp, hi);
