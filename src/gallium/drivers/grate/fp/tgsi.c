@@ -2745,6 +2745,14 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    fp_relayout(c);
    if (!c->failed)
       fp_compact_uniforms(c);
+   /*
+    * A program that branches on uniforms grate_fs_select specializes: only
+    * the variant for their values runs, the generic one is compiled for its
+    * info, its schedule would be lost (glamor's, 110-440 ms each on the
+    * Xoom, failing after the whole search)
+    */
+   if (fp->info.num_spec && !key->spec)
+      c->failed = true;
 
    /*
     * Multi-row programs have more registers, sequential ones room for more
