@@ -291,23 +291,34 @@ seq_opnd_is(const struct fp_opnd *o, enum seq_item_kind kind, int a, int b)
  * change while it is scheduled): units by index, texture fetch n as -1 - n.
  * Key: a unit's value, or FP_MAX_UNITS + 4 * input + component.
  */
-#define SEQ_KEYS (FP_MAX_UNITS + 4 * FP_MAX_INPUTS)
+#define SEQ_KEY_TEXEL(n) (FP_MAX_UNITS + 4 * FP_MAX_INPUTS + (n))
+#define SEQ_KEY_DST (FP_MAX_UNITS + 4 * FP_MAX_INPUTS + FP_MAX_TEXTURES)
+#define SEQ_KEYS (SEQ_KEY_DST + 1)
 struct seq_readers {
    int start[SEQ_KEYS + 1];
    int list[FP_MAX_UNITS * 12 + FP_MAX_TEXTURES * 4];
+   uint16_t coord_of[FP_MAX_UNITS];   /* fetches unit i is a coordinate of */
 };
 
 static int
 seq_reader_key(const struct fp_opnd *o)
 {
    return o->kind == FP_OPND_VALUE ? o->index :
-          o->kind == FP_OPND_INPUT ? FP_MAX_UNITS + 4 * o->index + o->comp : -1;
+          o->kind == FP_OPND_INPUT ? FP_MAX_UNITS + 4 * o->index + o->comp :
+          o->kind == FP_OPND_TEXEL ? SEQ_KEY_TEXEL(o->index) :
+          o->kind == FP_OPND_DST ? SEQ_KEY_DST : -1;
 }
 
 static void
 seq_build_readers(struct fp_compiler *c, struct seq_readers *rd)
 {
    int count[SEQ_KEYS] = { 0 };
+
+   memset(rd->coord_of, 0, sizeof(rd->coord_of));
+   for (int n = 0; n < c->num_tex; n++)
+      for (int k = 0; k < c->tex[n].num_coords; k++)
+         if (c->tex[n].coord[k].kind == FP_OPND_VALUE)
+            rd->coord_of[c->tex[n].coord[k].index] |= 1u << n;
 
    for (int pass = 0; pass < 2; pass++) {
       int fill[SEQ_KEYS];
@@ -353,8 +364,9 @@ seq_item_needed(struct fp_compiler *c, enum seq_item_kind kind, int a, int b,
                 int e, int except)
 {
    struct seq_readers *rd = c->seq_readers;
-   if (rd && (kind == SEQ_VALUE || kind == SEQ_INPUT)) {
-      int key = kind == SEQ_VALUE ? a : FP_MAX_UNITS + 4 * a + b;
+   if (rd && kind != SEQ_OUT && kind != SEQ_NONE) {
+      int key = kind == SEQ_VALUE ? a : kind == SEQ_INPUT ? FP_MAX_UNITS + 4 * a + b :
+                kind == SEQ_TEXEL ? SEQ_KEY_TEXEL(a) : SEQ_KEY_DST;
       for (int k = rd->start[key]; k < rd->start[key + 1]; k++) {
          int r = rd->list[k];
          if (r < 0) {
@@ -402,7 +414,13 @@ static bool
 seq_half_needed(struct fp_compiler *c, enum seq_item_kind kind, int a,
                 int reg, int high, int e, int except)
 {
-   for (int i = 0; i < c->num_units; i++) {
+   struct seq_readers *rd = c->seq_readers;
+   int key = kind == SEQ_TEXEL ? SEQ_KEY_TEXEL(a) : SEQ_KEY_DST;
+   int first = rd ? rd->start[key] : 0, end = rd ? rd->start[key + 1] : c->num_units;
+   for (int x = first; x < end; x++) {
+      int i = rd ? rd->list[x] : x;
+      if (i < 0)
+         continue;
       struct fp_unit *u = &c->units[i];
       if (!u->live || i == except || (u->exec >= 0 && u->exec < e))
          continue;
@@ -424,6 +442,8 @@ seq_half_needed(struct fp_compiler *c, enum seq_item_kind kind, int a,
 static bool
 seq_coord_of(struct fp_compiler *c, int i, int n)
 {
+   if (c->seq_readers)
+      return (c->seq_readers->coord_of[i] >> n) & 1;
    for (int k = 0; k < c->tex[n].num_coords; k++)
       if (seq_opnd_is(&c->tex[n].coord[k], SEQ_VALUE, i, 0))
          return true;
@@ -993,6 +1013,7 @@ seq_fetch_inputs(struct fp_compiler *c, struct seq_state *s,
          if (!u->live || u->exec >= 0 ||
              (just_in_time && !seq_others_ready(c, s, u, e, FP_OPND_INPUT)))
             continue;
+
          /* colour writes wait for the rest (seq_unit_ready): their
           * varyings would only take registers meanwhile */
          if (u->output_chan >= 0 && !c->redirect_output && !s->by_channel &&
@@ -1129,21 +1150,21 @@ seq_forwardable(struct fp_compiler *c, struct seq_state *s, int i, int e,
 
    if (p + 1 >= FP_MAX_PACKETS_PER_EXEC || c->units[i].output_chan >= 0 || c->units[i].cr)
       return false;
-   for (int r = 0; r < c->num_units; r++) {
-      struct fp_unit *u = &c->units[r];
-      if (!u->live)
-         continue;
-      fp_unit_foreach_src(u, k, j)
-         if (seq_opnd_is(&u->slots[k].src[j], SEQ_VALUE, i, 0)) {
-            if (reader >= 0 && reader != r)
-               return false;
-            reader = r;
-         }
-   }
-   for (int n = 0; n < c->num_tex; n++)
-      for (int k = 0; k < c->tex[n].num_coords; k++)
-         if (c->tex[n].live && seq_opnd_is(&c->tex[n].coord[k], SEQ_VALUE, i, 0))
+   /* its only reader, a unit (seq_readers: units, fetches as -1 - n) */
+   struct seq_readers *rd = c->seq_readers;
+   for (int x = rd->start[i]; x < rd->start[i + 1]; x++) {
+      int r = rd->list[x];
+      if (r < 0) {
+         if (c->tex[-1 - r].live)
             return false;
+         continue;
+      }
+      if (!c->units[r].live)
+         continue;
+      if (reader >= 0 && reader != r)
+         return false;
+      reader = r;
+   }
    if (reader < 0 || !seq_is_alu(&c->units[reader]) || c->units[reader].exec >= 0)
       return false;
 
@@ -1303,6 +1324,7 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
          bool inplace = seq_tex_inplace_ok(c, n, e);
          if (!room && !inplace)
             continue;
+
          /* the TEX works on the pairs of its EXEC's row */
          int base = 4 * SEQ_ROW(c, e);
          for (int pq = 0; pq < 4 && x->tex < 0; pq++) {
@@ -2149,9 +2171,41 @@ seq_reorder_sums(struct fp_compiler *c)
 #undef SEQ_SUM_LINK
 }
 
+/*
+ * Whether the program cannot fit however it is scheduled: an EXEC runs one
+ * SFU op and one TEX, a program has FP_SEQ_MAX_EXECS EXECs and
+ * FP_MAX_PACKETS packets of 4 slots (retroarch crt-geom: 227 SFU ops, the
+ * search took seconds to find that out)
+ */
+static bool
+seq_cannot_fit(struct fp_compiler *c)
+{
+   int sfu = 0, slots = 0, tex = 0;
+   for (int i = 0; i < c->num_units; i++) {
+      struct fp_unit *u = &c->units[i];
+      if (!u->live)
+         continue;
+      if (u->sfu)
+         sfu++;
+      else
+         slots += MAX2(u->num_slots, 1);
+   }
+   for (int n = 0; n < c->num_tex; n++)
+      tex += c->tex[n].live;
+   if (sfu > FP_SEQ_MAX_EXECS || tex > FP_SEQ_MAX_EXECS || slots > 4 * FP_MAX_PACKETS) {
+      if (grate_debug & GRATE_DEBUG_TGSI)
+         fprintf(stderr, "GRATE FRAG: cannot fit: %d SFU ops, %d TEX, %d ALU slots\n",
+                 sfu, tex, slots);
+      return true;
+   }
+   return false;
+}
+
 bool
 fp_sched_seq(struct fp_compiler *c)
 {
+   if (seq_cannot_fit(c))
+      return false;
    if (!getenv("GRATE_FP_SUM_ORDER") || atoi(getenv("GRATE_FP_SUM_ORDER")))
       seq_reorder_sums(c);
    struct seq_readers *rd = MALLOC_STRUCT(seq_readers);
