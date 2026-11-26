@@ -2079,7 +2079,7 @@ emit_tgsi_input(struct fp_compiler *c, const struct tgsi_full_declaration *decl)
                                              decl->Semantic.Index);
    c->input_interp[index] = decl->Interp.Interpolate;
    c->num_inputs = MAX2(c->num_inputs, index + 1);
-   if (decl->Declaration.Semantic == TGSI_SEMANTIC_COLOR)
+   if (decl->Declaration.Semantic && decl->Semantic.Name == TGSI_SEMANTIC_COLOR)
       c->fp->info.color_input = index;
 }
 
