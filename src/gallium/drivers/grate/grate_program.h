@@ -77,6 +77,9 @@ struct grate_fragment_shader_state {
    struct grate_fs_variant variants[GRATE_FS_MAX_VARIANTS];
    unsigned num_variants;
    unsigned next_evict;
+   /* the variant with coordinates moved to the vertex shader is compiled
+    * while one without works: not with the slow last tries then */
+   bool move_quick;
 };
 
 struct grate_context;

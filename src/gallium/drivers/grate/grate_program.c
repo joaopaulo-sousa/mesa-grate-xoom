@@ -376,9 +376,13 @@ grate_fp_chunks(struct grate_shader_blob *blob, const struct grate_fp_info *info
    blob->num_chunk_words = buf.size / sizeof(uint32_t);
 }
 
+/* quick: without the slow last tries (seq_fallbacks, seq_chunks), for a
+ * variant only worth having when it fits as easily as the one it would
+ * replace (texture coordinates moved to the vertex shader) */
 static void
 grate_fs_compile(enum drm_tegra_soc_id soc_id, const struct tgsi_token *tokens,
-                 const struct grate_fp_key *key, struct grate_fs_variant *v)
+                 const struct grate_fp_key *key, struct grate_fs_variant *v,
+                 bool quick)
 {
    struct grate_fp_shader fp;
    struct grate_fp_opts opts = {
@@ -407,12 +411,12 @@ grate_fs_compile(enum drm_tegra_soc_id soc_id, const struct tgsi_token *tokens,
          opts.trunc_abs = true;
       else if (fp.info.dots && !opts.split_dots)
          opts.split_dots = true;
-      else if (fp.info.seq_too_big && !opts.seq_fallbacks &&
+      else if (fp.info.seq_too_big && !opts.seq_fallbacks && !quick &&
                /* not for a generic version specialized at draw time */
                fp.info.num_flow == (key ? key->num_flow : 0) &&
                (!fp.info.num_spec || (key && key->spec)))
          opts.seq_fallbacks = true;   /* slow */
-      else if (fp.info.seq_too_big && !opts.seq_chunks &&
+      else if (fp.info.seq_too_big && !opts.seq_chunks && !quick &&
                fp.info.num_flow == (key ? key->num_flow : 0) &&
                (!fp.info.num_spec || (key && key->spec)))
          opts.seq_chunks = true;      /* several PSEQ passes: last */
@@ -615,7 +619,7 @@ grate_create_fs_state(struct pipe_context *pcontext,
 
    /* the opaque variant, used without blending */
    grate_fs_compile(context->drm->soc_id, so->base.tokens, &grate_fp_key_none,
-                    &so->variants[0]);
+                    &so->variants[0], false);
    grate_fs_upload_chunks(context, &so->variants[0].blob);
    so->num_variants = 1;
    so->blob = so->variants[0].blob;
@@ -785,7 +789,7 @@ grate_fs_variant(struct grate_context *context,
       grate_fp_info_fini(&so->variants[i].info);
    }
    grate_fs_compile(context->drm->soc_id, so->base.tokens, key,
-                    &so->variants[i]);
+                    &so->variants[i], key->move && so->move_quick);
    grate_fs_upload_chunks(context, &so->variants[i].blob);
    return &so->variants[i];
 }
@@ -840,6 +844,7 @@ grate_fs_update(struct grate_context *context)
    if (vv && v->info.can_move) {
       struct grate_fp_key vkey = v->key;
       key.move = 1;
+      so->move_quick = !v->info.failed;
       struct grate_fs_variant *mv = grate_fs_select(context, so, key, user, user_len);
       struct grate_vs_variant *mvv = !mv->info.failed && mv->info.moved.num_outs ?
                                      grate_vs_variant(vs, &mv->info.moved) : NULL;
