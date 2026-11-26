@@ -376,6 +376,32 @@ grate_fp_chunks(struct grate_shader_blob *blob, const struct grate_fp_info *info
    blob->num_chunk_words = buf.size / sizeof(uint32_t);
 }
 
+/* Compile with alt_opts too and keep that version if it takes fewer EXECs,
+ * or as many on fewer rows: what the frame time follows (glmark2 blur on the
+ * Xoom: 33 EXECs 8 fps, 24 EXECs on more rows 12 fps; 21 EXECs on 3 rows 12
+ * fps, 22 on 2 rows 10 fps) */
+static void
+grate_fs_try(struct grate_fp_shader *fp, struct grate_fp_opts *opts,
+             const struct tgsi_token *tokens, const struct grate_fp_key *key,
+             const struct grate_fp_opts *alt_opts)
+{
+   struct grate_fp_shader alt;
+   grate_fs_translate(&alt, tokens, key, alt_opts);
+   if (!alt.info.failed &&
+       (alt.info.num_execs < fp->info.num_execs ||
+        (alt.info.num_execs == fp->info.num_execs && alt.info.num_rows < fp->info.num_rows))) {
+      grate_fs_free(fp);
+      *fp = alt;
+      /* the lists' heads moved with the struct */
+      list_replace(&alt.fp_instructions, &fp->fp_instructions);
+      list_replace(&alt.alu_instructions, &fp->alu_instructions);
+      list_replace(&alt.mfu_instructions, &fp->mfu_instructions);
+      *opts = *alt_opts;
+   } else {
+      grate_fs_free(&alt);
+   }
+}
+
 /* quick: without the slow last tries (seq_fallbacks, seq_chunks), for a
  * variant only worth having when it fits as easily as the one it would
  * replace (texture coordinates moved to the vertex shader) */
@@ -441,6 +467,7 @@ grate_fs_compile(enum drm_tegra_soc_id soc_id, const struct tgsi_token *tokens,
          list_replace(&alt.fp_instructions, &fp.fp_instructions);
          list_replace(&alt.alu_instructions, &fp.alu_instructions);
          list_replace(&alt.mfu_instructions, &fp.mfu_instructions);
+         opts = alt_opts;
       } else {
          grate_fs_free(&alt);
       }
@@ -450,26 +477,27 @@ grate_fs_compile(enum drm_tegra_soc_id soc_id, const struct tgsi_token *tokens,
     * Interpolating a shared varying coordinate again for each fetch holds
     * no register before its TEX (glmark2 bump: 3 rows, 27 EXECs -> 2, 22),
     * but the schedule may also come out longer than with copies (blur:
-    * 24 -> 40 EXECs): both, the one with fewer EXECs (rows on a tie), which
-    * is what the frame time follows (blur on the Xoom: 33 EXECs 8 fps, 24
-    * EXECs on more rows 12 fps)
+    * 24 -> 40 EXECs): both (grate_fs_try)
     */
    if (!fp.info.failed && fp.info.input_aliases && !opts.no_alias) {
-      struct grate_fp_shader alt;
       struct grate_fp_opts alt_opts = opts;
       alt_opts.no_alias = true;
-      grate_fs_translate(&alt, tokens, key, &alt_opts);
-      if (!alt.info.failed &&
-          (alt.info.num_execs < fp.info.num_execs ||
-           (alt.info.num_execs == fp.info.num_execs && alt.info.num_rows < fp.info.num_rows))) {
-         grate_fs_free(&fp);
-         fp = alt;
-         list_replace(&alt.fp_instructions, &fp.fp_instructions);
-         list_replace(&alt.alu_instructions, &fp.alu_instructions);
-         list_replace(&alt.mfu_instructions, &fp.mfu_instructions);
-      } else {
-         grate_fs_free(&alt);
-      }
+      grate_fs_try(&fp, &opts, tokens, key, &alt_opts);
+   }
+
+   /*
+    * Critical path first comes out shorter for some programs, longer for
+    * others (glmark2 shading cel 28 -> 21 EXECs, 30 -> 32 fps; blur 21 on
+    * 3 rows -> 22 on 2): both (grate_fs_try), when the schedule is more than
+    * a round of its rows longer than the work needs (info.seq_bound; the
+    * fphost corpus: 8 programs shorter, none longer, 1150 EXECs instead of
+    * 1187)
+    */
+   if (!fp.info.failed && fp.info.sequential && !quick && !opts.seq_prio &&
+       fp.info.num_execs > fp.info.seq_bound + fp.info.num_rows) {
+      struct grate_fp_opts alt_opts = opts;
+      alt_opts.seq_prio = true;
+      grate_fs_try(&fp, &opts, tokens, key, &alt_opts);
    }
 
    /* say which shader draws magenta, to have something to work from (not

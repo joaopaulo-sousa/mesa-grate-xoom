@@ -217,6 +217,9 @@ struct grate_fp_info {
    bool seq_too_big;        /* the sequential scheduler found no fit */
    bool input_aliases;      /* interpolates a varying again for a fetch (no_alias) */
    int num_execs;           /* EXECs of the program */
+   /* a sequential program: the fewest EXECs its work could take, one TEX,
+    * one SFU op, 4 interpolated components and 3 ALU packets per EXEC */
+   int seq_bound;
    /* PSEQ passes of a sequential program: EXECs chunk_exec[k] up to
     * chunk_exec[k + 1] run as pass k (1: all in one, the usual way) */
    int num_chunks;
@@ -316,6 +319,11 @@ struct grate_fp_opts {
    /* shared varying texture coordinates copied, not interpolated again
     * (fp_tex_copy_shared_coords) */
    bool no_alias;
+   /* sequential: critical path first, the SFU op and, among ALU units that
+    * free as many registers, the one with the longest path to the end
+    * (shading cel 28 -> 21 EXECs; other programs come out longer, so
+    * grate_fs_compile keeps the better of the two) */
+   bool seq_prio;
 };
 
 void

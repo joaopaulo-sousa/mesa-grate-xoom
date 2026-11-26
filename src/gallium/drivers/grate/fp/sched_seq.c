@@ -91,6 +91,9 @@ struct seq_sched_mem {
    int alu0[FP_MAX_UNITS], alu[FP_MAX_UNITS];
    int num_alu0, num_alu;
    int ipl_total;   /* varying components read */
+   /* opts.seq_prio: the longest path from each unit (then fetch) to the
+    * end, in EXECs, for seq_try's rows */
+   int height[FP_MAX_UNITS + FP_MAX_TEXTURES];
 };
 
 struct seq_state {
@@ -1317,6 +1320,7 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
       x->first_packet = packet;
 
       /* MFU: an SFU op whose operand is in its register, else varyings */
+      int sfu_best = -1;
       for (int n_ = 0; n_ < m->num_sfu; n_++) {
          int i = m->sfu_order[s->by_channel][n_];
          struct fp_unit *u = &c->units[i];
@@ -1324,6 +1328,16 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
              !seq_reg_ready(c, s, &u->slots[0].src[0], e, false) ||
              !seq_sfu_row_ok(c, i, e))
             continue;
+         if (!c->opts.seq_prio) {
+            sfu_best = i;
+            break;
+         }
+         if (sfu_best < 0 || m->height[i] > m->height[sfu_best])
+            sfu_best = i;
+      }
+      for (int n_ = 0; sfu_best >= 0 && n_ < 1; n_++) {
+         int i = sfu_best;
+         struct fp_unit *u = &c->units[i];
          u->exec = e;
          c->seq_sched->scheduled[c->seq_sched->num_scheduled++] = i;
          seq_produced(c, i);
@@ -1459,8 +1473,12 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
                if (delta > 0 && live + delta > room &&
                    !seq_forwardable(c, s, i, e, packet, p))
                   continue;
-               if (best < 0 || delta < best_delta ||
-                   (delta == best_delta && s->rank[i] < s->rank[best])) {
+               bool higher = c->opts.seq_prio && best >= 0 && delta == best_delta &&
+                             m->height[i] > m->height[best];
+               bool lower = c->opts.seq_prio && best >= 0 && delta == best_delta &&
+                            m->height[i] < m->height[best];
+               if (best < 0 || delta < best_delta || (best >= 0 && higher) ||
+                   (delta == best_delta && !lower && s->rank[i] < s->rank[best])) {
                   best = i;
                   best_delta = delta;
                }
@@ -1993,6 +2011,36 @@ seq_try(struct fp_compiler *c, int step)
       if (rd->list[k] >= 0)
          pending0[rd->list[k]]++;
 
+   /* the critical path (opts.seq_prio): an ALU result is read by the ALU
+    * "lat" EXECs on, by the MFU and TEX "rows" on; an SFU result and a
+    * texel by the ALU of their own EXEC */
+   int *height = m->height;
+   memset(height, 0, (c->num_units + c->num_tex) * sizeof(int));
+   int lat = c->seq_rows > 1 ? 2 : 1;
+   for (bool changed = c->opts.seq_prio; changed; ) {
+      changed = false;
+      for (int i = n - 1; i >= 0; i--) {
+         int key = i < c->num_units ? i : SEQ_KEY_TEXEL(i - c->num_units);
+         bool alu_prod = i < c->num_units && seq_is_alu(&c->units[i]);
+         int h = 0;
+         for (int k = rd->start[key]; k < rd->start[key + 1]; k++) {
+            int r = rd->list[k], w, hr;
+            if (r >= 0) {
+               hr = height[r];
+               w = !seq_is_alu(&c->units[r]) ? c->seq_rows : alu_prod ? lat : 0;
+            } else {
+               hr = height[c->num_units + (-1 - r)];
+               w = c->seq_rows;
+            }
+            h = MAX2(h, w + hr);
+         }
+         if (h > height[i]) {
+            height[i] = h;
+            changed = true;
+         }
+      }
+   }
+
    /* program order first: channel by channel takes more EXECs; more rows:
     * varyings in the first round first, then fetched late */
    for (int late = 0; late < (c->seq_rows > 1 ? 2 : 1); late++)
@@ -2423,9 +2471,49 @@ seq_chunk(struct fp_compiler *c)
    return true;
 }
 
+/* info.seq_bound: an EXEC runs one TEX, one SFU op, 4 interpolations and
+ * FP_MAX_PACKETS_PER_EXEC ALU packets of 4 slots */
+static int
+seq_bound(struct fp_compiler *c)
+{
+   int sfu = 0, slots = 0, tex = 0, ipl = 0;
+   bool used[FP_MAX_INPUTS][4] = { { false } };
+   for (int i = 0; i < c->num_units; i++) {
+      struct fp_unit *u = &c->units[i];
+      if (!u->live)
+         continue;
+      if (u->sfu)
+         sfu++;
+      else
+         slots += MAX2(u->num_slots, 1);
+      fp_unit_foreach_src(u, k, j) {
+         struct fp_opnd *o = &u->slots[k].src[j];
+         if (o->kind == FP_OPND_INPUT && !used[o->index][o->comp]) {
+            used[o->index][o->comp] = true;
+            ipl++;
+         }
+      }
+   }
+   for (int n = 0; n < c->num_tex; n++) {
+      if (!c->tex[n].live)
+         continue;
+      tex++;
+      for (int k = 0; k < c->tex[n].num_coords; k++) {
+         struct fp_opnd *o = &c->tex[n].coord[k];
+         if (o->kind == FP_OPND_INPUT && !used[o->index][o->comp]) {
+            used[o->index][o->comp] = true;
+            ipl++;
+         }
+      }
+   }
+   return MAX2(MAX2(tex, sfu),
+               MAX2(DIV_ROUND_UP(ipl, 4), DIV_ROUND_UP(slots, 4 * FP_MAX_PACKETS_PER_EXEC)));
+}
+
 bool
 fp_sched_seq(struct fp_compiler *c)
 {
+   c->fp->info.seq_bound = seq_bound(c);
    if (seq_cannot_fit(c))
       return false;
    if (!getenv("GRATE_FP_SUM_ORDER") || atoi(getenv("GRATE_FP_SUM_ORDER")))

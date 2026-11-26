@@ -2667,6 +2667,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    fp->info.out_of_uniforms = false;
    fp->info.dots = false;
    fp->info.seq_too_big = false;
+   fp->info.seq_bound = 0;
    fp->info.input_aliases = false;
    fp->info.lod_bias_mask = 0;
    fp->info.lod_bias_user_mask = fp->info.lod_bias_user_neg = 0;
