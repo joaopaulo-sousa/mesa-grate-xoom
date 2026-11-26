@@ -60,6 +60,39 @@
    return false; \
 } while (0)
 
+/*
+ * Phase 1's memory: seq_try's orders of the work (seq_order, for by_channel
+ * 0 and 1), a packet's candidate units, the units scheduled so far and, for
+ * each, the EXEC from which its value is known to be read no more: once no
+ * reader is left from EXEC t on, none is from any later one, then or later
+ * in the schedule (readers only get EXECs), so seq_live_items asks once
+ */
+struct seq_sched_mem {
+   int order[2][FP_MAX_UNITS + FP_MAX_TEXTURES];
+   int rank[2][FP_MAX_UNITS + FP_MAX_TEXTURES];
+   int cand[FP_MAX_UNITS];
+   int scheduled[FP_MAX_UNITS];
+   int num_scheduled;
+   int dead_from[FP_MAX_UNITS];
+   /* per unit, its operands (values, varying components, texels, the
+    * destination) not yet computed, fetched or loaded: while any is, it
+    * cannot read them (seq_operands_ready); seq_try's start values */
+   int pending[FP_MAX_UNITS];
+   int pending0[FP_MAX_UNITS];
+   /* of the orders, the live SFU units (the MFU's candidates) and the work
+    * reading varyings (seq_fetch_inputs' candidates: the rest fetches
+    * nothing, and the order goes by rank, so skipping it changes nothing);
+    * the live ALU units by index, those not yet scheduled (seq_schedule
+    * drops the others as it goes) */
+   int sfu_order[2][FP_MAX_UNITS];
+   int num_sfu;
+   int ipl_order[2][FP_MAX_UNITS + FP_MAX_TEXTURES];
+   int num_ipl[2];
+   int alu0[FP_MAX_UNITS], alu[FP_MAX_UNITS];
+   int num_alu0, num_alu;
+   int ipl_total;   /* varying components read */
+};
+
 struct seq_state {
    int fetch_exec[FP_MAX_INPUTS][4];   /* EXEC interpolating input i comp c */
    int fetch_reg[FP_MAX_INPUTS][4];    /* ... into this register */
@@ -363,6 +396,18 @@ seq_build_readers(struct fp_compiler *c, struct seq_readers *rd)
    }
 }
 
+/* An operand (seq_reader_key) is there from now on: one fewer pending for
+ * the units reading it */
+static void
+seq_produced(struct fp_compiler *c, int key)
+{
+   struct seq_readers *rd = c->seq_readers;
+   int *pending = c->seq_sched->pending;
+   for (int k = rd->start[key]; k < rd->start[key + 1]; k++)
+      if (rd->list[k] >= 0)
+         pending[rd->list[k]]--;
+}
+
 /* Whether an item is still read in EXEC e or later (or not yet scheduled);
  * "except": a unit not to count, -2: no colour write counts */
 static bool
@@ -468,36 +513,37 @@ seq_coord_of(struct fp_compiler *c, int i, int n)
 static bool
 seq_coord_waits(struct fp_compiler *c, int i, int room)
 {
-   bool coord = false;
-   for (int n = 0; n < c->num_tex && !coord; n++) {
-      if (!c->tex[n].live || !seq_coord_of(c, i, n))
-         continue;
-      coord = true;
-      /* the rest of a fetch begun goes on: it frees its registers sooner */
-      for (int k = 0; k < c->tex[n].num_coords; k++) {
-         struct fp_opnd *o = &c->tex[n].coord[k];
-         if (o->kind == FP_OPND_VALUE && o->index != i && c->units[o->index].exec >= 0)
-            return false;
-      }
-   }
-   if (!coord)
+   /* the live fetches it is a coordinate of */
+   unsigned mine = 0;
+   for (int n = 0; n < c->num_tex; n++)
+      if (c->tex[n].live && seq_coord_of(c, i, n))
+         mine |= 1u << n;
+   if (!mine)
       return false;
-   int pending = 0;
-   for (int m = 0; m < c->num_tex; m++) {
-      if (!c->tex[m].live || c->tex[m].exec >= 0 || seq_coord_of(c, i, m))
-         continue;
-      for (int k = 0; k < c->tex[m].num_coords; k++) {
-         struct fp_opnd *o = &c->tex[m].coord[k];
-         if (o->kind == FP_OPND_VALUE && c->units[o->index].exec >= 0) {
-            pending++;
-            break;
-         }
-      }
+   /* the rest of a fetch begun goes on: it frees its registers sooner (the
+    * first such fetch) */
+   int n = ffs(mine) - 1;
+   for (int k = 0; k < c->tex[n].num_coords; k++) {
+      struct fp_opnd *o = &c->tex[n].coord[k];
+      if (o->kind == FP_OPND_VALUE && o->index != i && c->units[o->index].exec >= 0)
+         return false;
    }
    /* seq_tex_serial: those of the next fetch only, whatever the room (six
     * fetches at constant coordinates, all ready in EXEC 0, would take every
     * register before the first TEX: uniform_api ...sampler2D_samplerCube) */
-   return pending > 0 && (room < 4 || c->seq_tex_serial);
+   if (room >= 4 && !c->seq_tex_serial)
+      return false;
+   /* another fetch with coordinates computed, its TEX to come */
+   for (int m = 0; m < c->num_tex; m++) {
+      if (!c->tex[m].live || c->tex[m].exec >= 0 || ((mine >> m) & 1))
+         continue;
+      for (int k = 0; k < c->tex[m].num_coords; k++) {
+         struct fp_opnd *o = &c->tex[m].coord[k];
+         if (o->kind == FP_OPND_VALUE && c->units[o->index].exec >= 0)
+            return true;
+      }
+   }
+   return false;
 }
 
 /* Whether a cube map's r and a bias of fetch n are there for EXEC e */
@@ -735,11 +781,16 @@ seq_live_items(struct fp_compiler *c, const struct seq_owner *owner, int e)
       else
          n += 2;
    }
-   for (int i = 0; i < c->num_units; i++) {
+   struct seq_sched_mem *m = c->seq_sched;
+   for (int k = 0; k < m->num_scheduled; k++) {
+      int i = m->scheduled[k];
       struct fp_unit *u = &c->units[i];
-      if (u->live && u->exec >= 0 && fp_unit_has_value(u) &&
-          seq_item_needed(c, SEQ_VALUE, i, 0, e + 1, -1))
+      if (e + 1 >= m->dead_from[i] || !u->live || !fp_unit_has_value(u))
+         continue;
+      if (seq_item_needed(c, SEQ_VALUE, i, 0, e + 1, -1))
          n += seq_item_size(c, SEQ_VALUE, i);
+      else
+         m->dead_from[i] = e + 1;
    }
    return n;
 }
@@ -976,34 +1027,14 @@ seq_fetch_inputs(struct fp_compiler *c, struct seq_state *s,
 
    /* ... spread over the rows of that round, so that each keeps registers
     * for the values its SFU ops work on (in place, on their own row) */
+   struct seq_sched_mem *m = c->seq_sched;
    int cap = 4;
-   if (c->seq_rows > 1 && !s->late_ipl) {
-      bool used[FP_MAX_INPUTS][4] = { { false } };
-      int total = 0;
-      for (int i = 0; i < c->num_units; i++)
-         if (c->units[i].live)
-            fp_unit_foreach_src(&c->units[i], k, j) {
-               struct fp_opnd *o = &c->units[i].slots[k].src[j];
-               if (o->kind == FP_OPND_INPUT && !used[o->index][o->comp]) {
-                  used[o->index][o->comp] = true;
-                  total++;
-               }
-            }
-      for (int n = 0; n < c->num_tex; n++)
-         if (c->tex[n].live)
-            for (int k = 0; k < c->tex[n].num_coords; k++) {
-               struct fp_opnd *o = &c->tex[n].coord[k];
-               if (o->kind == FP_OPND_INPUT && !used[o->index][o->comp]) {
-                  used[o->index][o->comp] = true;
-                  total++;
-               }
-            }
-      cap = DIV_ROUND_UP(total, c->seq_rows);
-   }
+   if (c->seq_rows > 1 && !s->late_ipl)
+      cap = DIV_ROUND_UP(m->ipl_total, c->seq_rows);
    int fetched = 0;
 
-   for (int n_ = 0; n_ < c->num_units + c->num_tex; n_++) {
-      int i = s->order[n_];
+   for (int n_ = 0; n_ < m->num_ipl[s->by_channel]; n_++) {
+      int i = m->ipl_order[s->by_channel][n_];
       struct fp_opnd *ops[12];
       int n = 0;
 
@@ -1055,6 +1086,7 @@ seq_fetch_inputs(struct fp_compiler *c, struct seq_state *s,
          x->ipl_input[r % 4] = o->index;
          x->ipl_comp[r % 4] = comp;
          s->fetch_exec[o->index][comp] = e;
+         seq_produced(c, FP_MAX_UNITS + 4 * o->index + comp);
          s->fetch_reg[o->index][comp] = r;
          owner[r] = (struct seq_owner) { SEQ_INPUT, o->index, comp };
          live += 2;
@@ -1070,21 +1102,29 @@ seq_fetch_inputs(struct fp_compiler *c, struct seq_state *s,
    return any;
 }
 
-/*
- * Whether ALU unit "index" can go in EXEC e, packet p. A colour write makes
- * r2 or r3 the colour's for good: only once nothing fixed is still needed
- * there and no varying component, texture fetch or destination load that
- * might want it is pending.
- */
+/* Whether ALU unit "index" can read its operands in EXEC e, packet p */
 static bool
-seq_unit_ready(struct fp_compiler *c, struct seq_state *s,
-               const struct seq_owner *owner, int index, int e, int p)
+seq_operands_ready(struct fp_compiler *c, struct seq_state *s, int index, int e, int p)
 {
    struct fp_unit *u = &c->units[index];
 
    fp_unit_foreach_src(u, k, j)
       if (!seq_alu_can_read(c, s, &u->slots[k].src[j], e, p))
          return false;
+   return true;
+}
+
+/*
+ * Whether ALU unit "index", its operands ready (seq_operands_ready), can go
+ * in EXEC e, packet p. A colour write makes r2 or r3 the colour's for good:
+ * only once nothing fixed is still needed there and no varying component,
+ * texture fetch or destination load that might want it is pending.
+ */
+static bool
+seq_unit_ready(struct fp_compiler *c, struct seq_state *s,
+               const struct seq_owner *owner, int index, int e, int p)
+{
+   struct fp_unit *u = &c->units[index];
 
    if (u->output_chan < 0)
       return true;
@@ -1247,7 +1287,14 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
    memset(s->fetch_reg, -1, sizeof(s->fetch_reg));
    s->dst_exec = -1;
    s->last_bary = -1;
-   seq_order(c, s);
+   /* s->order and s->rank: seq_try's, by seq_order */
+   c->seq_sched->num_scheduled = 0;
+   for (int i = 0; i < c->num_units; i++)
+      c->seq_sched->dead_from[i] = INT_MAX;
+   memcpy(c->seq_sched->pending, c->seq_sched->pending0, c->num_units * sizeof(int));
+   struct seq_sched_mem *m = c->seq_sched;
+   memcpy(m->alu, m->alu0, m->num_alu0 * sizeof(int));
+   m->num_alu = m->num_alu0;
    for (int i = 0; i < c->num_units; i++) {
       c->units[i].exec = c->units[i].packet = -1;
       remaining += c->units[i].live;
@@ -1270,16 +1317,16 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
       x->first_packet = packet;
 
       /* MFU: an SFU op whose operand is in its register, else varyings */
-      for (int n_ = 0; n_ < c->num_units + c->num_tex; n_++) {
-         int i = s->order[n_];
-         if (i >= c->num_units)
-            continue;
+      for (int n_ = 0; n_ < m->num_sfu; n_++) {
+         int i = m->sfu_order[s->by_channel][n_];
          struct fp_unit *u = &c->units[i];
-         if (!u->live || seq_is_alu(u) || u->exec >= 0 ||
+         if (u->exec >= 0 ||
              !seq_reg_ready(c, s, &u->slots[0].src[0], e, false) ||
              !seq_sfu_row_ok(c, i, e))
             continue;
          u->exec = e;
+         c->seq_sched->scheduled[c->seq_sched->num_scheduled++] = i;
+         seq_produced(c, i);
          x->sfu_unit = i;
          remaining--;
          progress = true;
@@ -1303,6 +1350,7 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
                    !seq_fixed_free(c, &owner[base + 2 * p + 1], e))
                   continue;
                s->dst_exec = c->dst_exec = e;
+               seq_produced(c, SEQ_KEY_DST);
                c->dst_pair = p;
                owner[base + 2 * p] = owner[base + 2 * p + 1] =
                   (struct seq_owner) { SEQ_DST, 0, 0 };
@@ -1359,6 +1407,7 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
             if (!seq_coord_regs_free(c, owner, n, base, p))
                continue;
             c->tex[n].exec = e;
+            seq_produced(c, SEQ_KEY_TEXEL(n));
             c->tex[n].pair = p;
             c->tex[n].same_pair = same;
             owner[base + 2 * q] = owner[base + 2 * q + 1] =
@@ -1375,14 +1424,27 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
       bool reserve = c->dst_used && s->dst_exec < 0;
       for (int p = 0; p < FP_MAX_PACKETS_PER_EXEC && remaining; p++) {
          unsigned mask = 0;
+         /* the units whose operands the packet can read, the same for every
+          * pick: a unit picked here is read from a later EXEC, or forwarded
+          * to the next packet, by none of this one */
+         int *cand = m->cand, num_cand = 0, num_alu = 0;
+         for (int n = 0; n < m->num_alu; n++) {
+            int i = m->alu[n];
+            if (c->units[i].exec >= 0)
+               continue;
+            m->alu[num_alu++] = i;
+            if (!m->pending[i] && seq_operands_ready(c, s, i, e, packet))
+               cand[num_cand++] = i;
+         }
+         m->num_alu = num_alu;
          for (;;) {
             int best = -1, best_delta = 0;
             /* the same for every candidate: it changes with a pick only */
             int live = seq_live_items(c, owner, e);
-            for (int i = 0; i < c->num_units; i++) {
+            for (int n = 0; n < num_cand; n++) {
+               int i = cand[n];
                struct fp_unit *u = &c->units[i];
-               if (!u->live || !seq_is_alu(u) || u->exec >= 0 ||
-                   !seq_unit_ready(c, s, owner, i, e, packet))
+               if (u->exec >= 0 || !seq_unit_ready(c, s, owner, i, e, packet))
                   continue;
                if (u->num_slots > 1 ? (mask & ((1u << u->num_slots) - 1)) != 0 :
                                       mask == 0xf)
@@ -1411,6 +1473,8 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
                break;
             struct fp_unit *u = &c->units[best];
             u->exec = e;
+            c->seq_sched->scheduled[c->seq_sched->num_scheduled++] = best;
+            seq_produced(c, best);
             u->packet = packet;
             u->slot = u->num_slots > 1 ? 0 : ffs(~mask & 0xf) - 1;
             mask |= ((1u << u->num_slots) - 1) << u->slot;
@@ -1860,6 +1924,74 @@ static bool
 seq_try(struct fp_compiler *c, int step)
 {
    struct seq_state s;
+   /* the order depends on the program and by_channel only (seq_mark_cr
+    * changes the program between tries, not during one) */
+   int n = c->num_units + c->num_tex;
+   int (*order)[FP_MAX_UNITS + FP_MAX_TEXTURES] = c->seq_sched->order;
+   int (*rank)[FP_MAX_UNITS + FP_MAX_TEXTURES] = c->seq_sched->rank;
+   for (int b = 0; b < 2; b++) {
+      s.by_channel = b;
+      seq_order(c, &s);
+      memcpy(order[b], s.order, n * sizeof(int));
+      memcpy(rank[b], s.rank, n * sizeof(int));
+   }
+   struct seq_sched_mem *m = c->seq_sched;
+   bool used[FP_MAX_INPUTS][4] = { { false } };
+   m->ipl_total = 0;
+   for (int b = 0; b < 2; b++) {
+      int ns = 0, ni = 0;
+      for (int n_ = 0; n_ < n; n_++) {
+         int i = order[b][n_];
+         bool ipl = false;
+         if (i < c->num_units) {
+            struct fp_unit *u = &c->units[i];
+            if (!u->live)
+               continue;
+            if (!seq_is_alu(u))
+               m->sfu_order[b][ns++] = i;
+            fp_unit_foreach_src(u, k, j) {
+               struct fp_opnd *o = &u->slots[k].src[j];
+               if (o->kind == FP_OPND_INPUT) {
+                  ipl = true;
+                  if (!b && !used[o->index][o->comp]) {
+                     used[o->index][o->comp] = true;
+                     m->ipl_total++;
+                  }
+               }
+            }
+         } else {
+            int t = i - c->num_units;
+            if (!c->tex[t].live)
+               continue;
+            for (int k = 0; k < c->tex[t].num_coords; k++) {
+               struct fp_opnd *o = &c->tex[t].coord[k];
+               if (o->kind == FP_OPND_INPUT) {
+                  ipl = true;
+                  if (!b && !used[o->index][o->comp]) {
+                     used[o->index][o->comp] = true;
+                     m->ipl_total++;
+                  }
+               }
+            }
+         }
+         if (ipl)
+            m->ipl_order[b][ni++] = i;
+      }
+      m->num_sfu = ns;
+      m->num_ipl[b] = ni;
+   }
+   m->num_alu0 = 0;
+   for (int i = 0; i < c->num_units; i++)
+      if (c->units[i].live && seq_is_alu(&c->units[i]))
+         m->alu0[m->num_alu0++] = i;
+
+   /* each unit appears once among the readers of each operand it reads */
+   struct seq_readers *rd = c->seq_readers;
+   int *pending0 = c->seq_sched->pending0;
+   memset(pending0, 0, c->num_units * sizeof(int));
+   for (int k = 0; k < rd->start[SEQ_KEYS]; k++)
+      if (rd->list[k] >= 0)
+         pending0[rd->list[k]]++;
 
    /* program order first: channel by channel takes more EXECs; more rows:
     * varyings in the first round first, then fetched late */
@@ -1869,6 +2001,8 @@ seq_try(struct fp_compiler *c, int step)
    for (int limit = 2 * SEQ_REGS(c); limit > 0; limit -= step) {
       s.by_channel = by_channel;
       s.late_ipl = late;
+      memcpy(s.order, order[by_channel], n * sizeof(int));
+      memcpy(s.rank, rank[by_channel], n * sizeof(int));
       if (!seq_schedule(c, &s, limit)) {
          if (grate_debug & GRATE_DEBUG_TGSI)
             fprintf(stderr, "GRATE FRAG: sequential schedule failed (%d rows, limit %d%s%s%s)\n",
@@ -2298,19 +2432,24 @@ fp_sched_seq(struct fp_compiler *c)
       seq_reorder_sums(c);
    struct seq_readers *rd = MALLOC_STRUCT(seq_readers);
    struct seq_alloc_mem *mem = MALLOC_STRUCT(seq_alloc_mem);
-   if (!rd || !mem) {
+   struct seq_sched_mem *sched = MALLOC_STRUCT(seq_sched_mem);
+   if (!rd || !mem || !sched) {
       FREE(rd);
       FREE(mem);
+      FREE(sched);
       return false;
    }
    c->seq_mem = mem;
+   c->seq_sched = sched;
    seq_build_readers(c, rd);
    c->seq_readers = rd;
    bool ok = seq_sched_rows(c) && seq_chunk(c);
    c->seq_readers = NULL;
    c->seq_mem = NULL;
+   c->seq_sched = NULL;
    FREE(rd);
    FREE(mem);
+   FREE(sched);
    return ok;
 }
 
