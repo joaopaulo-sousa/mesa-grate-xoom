@@ -27,6 +27,7 @@
 #endif
 
 #include <errno.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -184,6 +185,25 @@ drm_tegra_job_submit(struct drm_tegra_job *job, struct drm_tegra_fence *fence)
     args.bufs_ptr = (uintptr_t)job->buffers;
     args.cmds_ptr = (uintptr_t)job->commands;
     args.gather_data_ptr = (uintptr_t)job->pushbuf->start;
+
+    /* GRATE_DUMP_STREAM=file: every job's command words, as hex, to compare
+     * the register state with other drivers' (gpu/tools: regstate.py) */
+    {
+        static FILE *dump;
+        static int checked;
+        if (!checked) {
+            const char *path = getenv("GRATE_DUMP_STREAM");
+            checked = 1;
+            dump = path ? fopen(path, "a") : NULL;
+        }
+        if (dump) {
+            fprintf(dump, "JOB %u", (unsigned)args.gather_data_words);
+            for (uint32_t *w = job->pushbuf->start; w < job->pushbuf->ptr; w++)
+                fprintf(dump, " %08x", *w);
+            fprintf(dump, "\n");
+            fflush(dump);
+        }
+    }
 
     /*
      * DRM_TEGRA_SUBMIT_BUF_WRITE makes the kernel attach the job fence to the
