@@ -146,6 +146,14 @@ struct grate_moved {
 #define GRATE_FP_MAX_LINKS 32
 
 /*
+ * A sequential program longer than one PSEQ pass (64 EXECs, 64 ALU packets)
+ * runs as several (grate_program.c): the PSEQ fetches each chunk from memory,
+ * runs it, and the registers carry over to the next one. 7 chunks take 15 of
+ * the 16 PSEQ commands (fetch and run each, then the jump back).
+ */
+#define GRATE_FP_MAX_CHUNKS 7
+
+/*
  * Linker instruction: copies components of one VS export (found at draw time
  * by semantic) to columns of a TRAM row, which the fragment MFU interpolates
  * into registers: column k into r(k) (of its row of the pixel packet). The
@@ -209,6 +217,10 @@ struct grate_fp_info {
    bool seq_too_big;        /* the sequential scheduler found no fit */
    bool input_aliases;      /* interpolates a varying again for a fetch (no_alias) */
    int num_execs;           /* EXECs of the program */
+   /* PSEQ passes of a sequential program: EXECs chunk_exec[k] up to
+    * chunk_exec[k + 1] run as pass k (1: all in one, the usual way) */
+   int num_chunks;
+   uint16_t chunk_exec[GRATE_FP_MAX_CHUNKS + 1];
    bool reads_uniforms;     /* the ALU reads uniform registers: upload them */
 };
 
@@ -300,6 +312,7 @@ struct grate_fp_opts {
    /* the sequential scheduler's slower last tries (condition registers,
     * one fetch at a time), after every other option failed */
    bool seq_fallbacks;
+   bool seq_chunks;      /* sequential: in several PSEQ passes if need be (last) */
    /* shared varying texture coordinates copied, not interpolated again
     * (fp_tex_copy_shared_coords) */
    bool no_alias;

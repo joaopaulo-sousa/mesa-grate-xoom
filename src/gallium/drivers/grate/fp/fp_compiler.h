@@ -24,7 +24,13 @@
 #define FP_MAX_TEMPS 32
 #define FP_MAX_INPUTS 16
 #define FP_MAX_EXECS 4           /* multi-row programs */
-#define FP_SEQ_MAX_EXECS 64      /* one-row sequential programs (63 measured) */
+/* sequential programs: each pass of the PSEQ (chunk) has up to
+ * FP_SEQ_CHUNK_EXECS EXECs and FP_SEQ_CHUNK_PACKETS ALU packets (6-bit
+ * addresses) and MFU instructions; a program up to GRATE_FP_MAX_CHUNKS */
+#define FP_SEQ_CHUNK_EXECS 64
+#define FP_SEQ_CHUNK_PACKETS 64
+#define FP_SEQ_MAX_EXECS (FP_SEQ_CHUNK_EXECS * GRATE_FP_MAX_CHUNKS)
+#define FP_SEQ_MAX_PACKETS (FP_SEQ_CHUNK_PACKETS * GRATE_FP_MAX_CHUNKS)
 #ifndef FP_MAX_PACKETS_PER_EXEC   /* fphost-relaxed: how many a program needs */
 #define FP_MAX_PACKETS_PER_EXEC 3
 #endif
@@ -249,7 +255,7 @@ struct fp_compiler {
    struct grate_fp_slots slots;       /* uniform slots while it compiles */
    struct fp_seq_exec seq_exec[FP_SEQ_MAX_EXECS];
 
-   int packet_exec[FP_MAX_PACKETS];
+   int packet_exec[FP_SEQ_MAX_PACKETS];
    int num_packets;
    int num_execs;
 };

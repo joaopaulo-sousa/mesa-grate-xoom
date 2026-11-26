@@ -56,6 +56,13 @@ struct grate_context {
 
    struct grate_twopass *twopass;     /* see grate_twopass.c */
 
+   /* fragment programs of several PSEQ passes (grate_state.c emit_program):
+    * the spill surface the PSEQ keeps its quads in between passes, and
+    * whether PSEQ commands past the first are set (a one-pass program
+    * clears them) */
+   struct grate_bo *spill_bo;
+   bool pseq_cmds_set;
+
    struct pipe_scissor_state scissor;
    /* the viewport rectangle in framebuffer pixels: the hardware clips to
     * its guard band only, so draws are scissored to this (emit_scissor) */

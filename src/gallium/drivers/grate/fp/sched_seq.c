@@ -48,6 +48,12 @@
 #define SEQ_T(e, stage) (8 * (4 * (e) + (stage)))
 #define SEQ_FOREVER (1 << 20)
 /* a schedule or allocation that cannot be: why, with GRATE_DEBUG=tgsi */
+/* PSEQ passes the program may take: one, or several as the last try
+ * (grate_fp_opts.seq_chunks); its EXECs and ALU packets */
+#define SEQ_CHUNKS(c) ((c)->opts.seq_chunks ? GRATE_FP_MAX_CHUNKS : 1)
+#define SEQ_EXECS(c) (FP_SEQ_CHUNK_EXECS * SEQ_CHUNKS(c))
+#define SEQ_PACKETS(c) (FP_SEQ_CHUNK_PACKETS * SEQ_CHUNKS(c))
+
 #define SEQ_FAIL(...) do { \
    if (grate_debug & GRATE_DEBUG_TGSI) \
       fprintf(stderr, "GRATE FRAG: " __VA_ARGS__); \
@@ -1255,7 +1261,7 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
       struct fp_seq_exec *x = &c->seq_exec[e];
       bool progress = false;
 
-      if (e == FP_SEQ_MAX_EXECS)
+      if (e == SEQ_EXECS(c))
          SEQ_FAIL("phase 1: out of EXECs (%d)\n", e);
       memset(x, 0, sizeof(*x));
       x->sfu_unit = x->tex = -1;
@@ -1415,7 +1421,7 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
          }
          if (!mask)
             break;
-         if (packet == FP_MAX_PACKETS)
+         if (packet == SEQ_PACKETS(c))
             SEQ_FAIL("phase 1: out of packets at EXEC %d\n", e);
          packet++;
          x->num_packets++;
@@ -1448,7 +1454,7 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
    /* EXECs in whole rounds of the rows (other counts hang the channel,
     * asmtri exp-rows3): empty ones to fill up */
    while (remaining == 0 && s->num_execs % c->seq_rows) {
-      if (s->num_execs == FP_SEQ_MAX_EXECS)
+      if (s->num_execs == SEQ_EXECS(c))
          SEQ_FAIL("phase 1: out of EXECs filling the rows\n");
       struct fp_seq_exec *x = &c->seq_exec[s->num_execs++];
       memset(x, 0, sizeof(*x));
@@ -1463,7 +1469,7 @@ seq_schedule(struct fp_compiler *c, struct seq_state *s, int limit)
    int total = packet;
    for (int e = 0; c->seq_rows > 1 && e < s->num_execs; e++)
       total += !c->seq_exec[e].num_packets && seq_needs_alu(c, e);
-   if (total > FP_MAX_PACKETS)
+   if (total > SEQ_PACKETS(c))
       SEQ_FAIL("phase 1: %d packets with the empty ones (%d EXECs, %d packets of work)\n",
                total, s->num_execs, packet);
    return true;
@@ -2174,7 +2180,7 @@ seq_reorder_sums(struct fp_compiler *c)
 /*
  * Whether the program cannot fit however it is scheduled: an EXEC runs one
  * SFU op and one TEX, a program has FP_SEQ_MAX_EXECS EXECs and
- * FP_MAX_PACKETS packets of 4 slots (retroarch crt-geom: 227 SFU ops, the
+ * FP_SEQ_MAX_PACKETS packets of 4 slots (in up to GRATE_FP_MAX_CHUNKS passes) (retroarch crt-geom: 227 SFU ops, the
  * search took seconds to find that out)
  */
 static bool
@@ -2192,13 +2198,95 @@ seq_cannot_fit(struct fp_compiler *c)
    }
    for (int n = 0; n < c->num_tex; n++)
       tex += c->tex[n].live;
-   if (sfu > FP_SEQ_MAX_EXECS || tex > FP_SEQ_MAX_EXECS || slots > 4 * FP_MAX_PACKETS) {
+   if (sfu > SEQ_EXECS(c) || tex > SEQ_EXECS(c) || slots > 4 * SEQ_PACKETS(c)) {
       if (grate_debug & GRATE_DEBUG_TGSI)
          fprintf(stderr, "GRATE FRAG: cannot fit: %d SFU ops, %d TEX, %d ALU slots\n",
                  sfu, tex, slots);
       return true;
    }
    return false;
+}
+
+/* ALU packets EXEC e emits: its own, or an empty one where needed */
+static int
+seq_exec_packets(struct fp_compiler *c, int e)
+{
+   const struct fp_seq_exec *x = &c->seq_exec[e];
+   return x->num_packets ? x->num_packets : seq_needs_alu(c, e);
+}
+
+/* MFU instructions EXEC e emits (fp_emit_seq) */
+static int
+seq_exec_mfu(struct fp_compiler *c, int e, bool any_ipl)
+{
+   const struct fp_seq_exec *x = &c->seq_exec[e];
+   bool ipl = false;
+   for (int k = 0; k < 4; k++)
+      ipl |= x->ipl_input[k] >= 0;
+   bool first = c->seq_rows > 1 && e == 0 && any_ipl;
+   return (ipl || first || x->bary || x->sfu_unit >= 0) + x->cube_mfu;
+}
+
+/*
+ * Cut the EXECs into PSEQ passes (info.chunk_exec): each up to
+ * FP_SEQ_CHUNK_EXECS EXECs, FP_SEQ_CHUNK_PACKETS ALU packets and as many MFU
+ * instructions, in whole rounds of the rows (a pass starts on row 0). The
+ * registers carry over from one pass to the next (asmtri exp-pseq2/3); the
+ * ALU forwards results within an EXEC only, so any EXEC boundary will do.
+ */
+/* TEST: GRATE_FP_CHUNK_EXECS=n cuts every sequential program into passes of
+ * up to n EXECs (with grate_fp_opts.seq_chunks from the first try), to try
+ * the passes on programs that would fit in one */
+static int
+seq_chunk_execs(void)
+{
+   static int n = -1;
+   if (n < 0) {
+      const char *e = getenv("GRATE_FP_CHUNK_EXECS");
+      n = e && atoi(e) > 0 ? MIN2(atoi(e), FP_SEQ_CHUNK_EXECS) : FP_SEQ_CHUNK_EXECS;
+   }
+   return n;
+}
+
+static bool
+seq_chunk(struct fp_compiler *c)
+{
+   struct grate_fp_info *info = &c->fp->info;
+   int max_execs = MAX2(seq_chunk_execs(), c->seq_rows);
+   bool any_ipl = false;
+   for (int e = 0; e < c->num_execs; e++)
+      for (int k = 0; k < 4; k++)
+         any_ipl |= c->seq_exec[e].ipl_input[k] >= 0;
+
+   info->num_chunks = 0;
+   int start = 0;
+   while (start < c->num_execs) {
+      int packets = 0, mfu = 0, cut = -1;
+      for (int e = start; e < c->num_execs; e++) {
+         packets += seq_exec_packets(c, e);
+         mfu += seq_exec_mfu(c, e, any_ipl);
+         if (e + 1 - start > max_execs || packets > FP_SEQ_CHUNK_PACKETS ||
+             mfu > FP_SEQ_CHUNK_PACKETS)
+            break;
+         if ((e + 1 - start) % c->seq_rows == 0)
+            cut = e + 1;
+      }
+      if (cut < 0 || info->num_chunks == SEQ_CHUNKS(c)) {
+         info->num_chunks = 0;
+         SEQ_FAIL("chunks: %d EXECs do not fit in %d passes\n", c->num_execs,
+                  GRATE_FP_MAX_CHUNKS);
+      }
+      info->chunk_exec[info->num_chunks++] = start;
+      start = cut;
+   }
+   info->chunk_exec[info->num_chunks] = c->num_execs;
+   if (info->num_chunks > 1 && (grate_debug & GRATE_DEBUG_TGSI)) {
+      fprintf(stderr, "GRATE FRAG: %d PSEQ passes:", info->num_chunks);
+      for (int k = 0; k < info->num_chunks; k++)
+         fprintf(stderr, " %d", info->chunk_exec[k + 1] - info->chunk_exec[k]);
+      fprintf(stderr, " EXECs\n");
+   }
+   return true;
 }
 
 bool
@@ -2218,7 +2306,7 @@ fp_sched_seq(struct fp_compiler *c)
    c->seq_mem = mem;
    seq_build_readers(c, rd);
    c->seq_readers = rd;
-   bool ok = seq_sched_rows(c);
+   bool ok = seq_sched_rows(c) && seq_chunk(c);
    c->seq_readers = NULL;
    c->seq_mem = NULL;
    FREE(rd);
@@ -2339,6 +2427,7 @@ fp_emit_seq(struct fp_compiler *c)
       for (int k = 0; k < 4; k++)
          any_ipl |= c->seq_exec[e].ipl_input[k] >= 0;
 
+   int chunk = 0, chunk_bary = 0;
    for (int e = 0; e < c->num_execs; e++) {
       struct fp_seq_exec *x = &c->seq_exec[e];
       struct fp_instr *inst = CALLOC_STRUCT(fp_instr);
@@ -2351,6 +2440,14 @@ fp_emit_seq(struct fp_compiler *c)
       for (int k = 0; k < 4; k++)
          ipl |= x->ipl_input[k] >= 0;
       bool bary = c->seq_rows == 1 ? ipl : (e == 0 && any_ipl) || x->bary;
+      /* a later PSEQ pass sets the weights up again where it first
+       * interpolates (it is not known that they carry over) */
+      while (chunk + 1 < fp->info.num_chunks && e >= fp->info.chunk_exec[chunk + 1])
+         chunk++;
+      if (ipl && chunk > chunk_bary) {
+         bary = true;
+         chunk_bary = chunk;
+      }
       if (ipl || bary || x->sfu_unit >= 0) {
          struct fp_mfu_instr *mfu = CALLOC_STRUCT(fp_mfu_instr);
          list_inithead(&mfu->link);

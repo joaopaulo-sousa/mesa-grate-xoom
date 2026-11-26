@@ -84,6 +84,8 @@ grate_context_destroy(struct pipe_context *pcontext)
    grate_context_submit(context);
    grate_twopass_destroy(context, context->twopass);
    slab_destroy_child(&context->transfer_pool);
+   if (context->spill_bo)
+      grate_bo_unref(context->spill_bo);
 
    grate_channel_delete(context->gr3d);
    grate_channel_delete(context->gr2d);

@@ -12,6 +12,7 @@
 #include "util/u_framebuffer.h"
 
 #include "grate_common.h"
+#include "grate_bo.h"
 #include "grate_context.h"
 #include "grate_program.h"
 #include "grate_resource.h"
@@ -936,6 +937,58 @@ emit_shader(struct grate_stream *stream, uint32_t **ptrp, struct grate_shader_bl
    grate_stream_push_words(stream, ptrp, blob->commands, blob->num_commands, 0);
 }
 
+/*
+ * The fragment program. One PSEQ pass: its blob has it all (the command
+ * 0x20006000 | EXECs in EVEN(0)). Several (grate_fp_chunks): the PSEQ
+ * fetches each chunk from memory and runs it, as NVIDIA's driver does
+ * (libGLESv2_tegra.so 0x304c4; asmtri exp-pseq2/3):
+ *   0x10000000 | words, address   fetch and write the chunk's registers
+ *   0x20002000 | EXECs, 0          run them, more passes follow
+ *   0x20004000 | EXECs, 0          ... the last pass
+ *   0x40000000 | (-n & 31), 0      back to command 0 for the next quads
+ *                                  (a jump n commands back, libcgdrv.so 0xdce50)
+ * with the spill surface for the quads between passes (0x13d0 bytes in
+ * NVIDIA's driver, 16 per quad ID).
+ */
+static void
+emit_fs_passes(struct grate_context *context, uint32_t **ptrp,
+               struct grate_shader_blob *blob)
+{
+   struct grate_stream *stream = &context->gr3d->stream;
+
+   if (blob->num_chunks < 2 || !blob->chunk_bo) {
+      if (context->pseq_cmds_set) {
+         /* what a program of several passes left past command 0 */
+         GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_PSEQ_COMMAND_ODD(0), 31));
+         for (int i = 0; i < 31; i++)
+            GRATE_PUSHBUF_WORD(*ptrp, 0);
+         context->pseq_cmds_set = false;
+      }
+      emit_shader(stream, ptrp, blob);
+      return;
+   }
+
+   emit_shader(stream, ptrp, blob);
+   if (!context->spill_bo)
+      context->spill_bo = grate_bo_alloc(context->drm, 0x2000, 0);
+   if (context->spill_bo) {
+      GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_GLOBAL_SPILLSURFADDR, 1));
+      grate_stream_push_reloc(stream, ptrp, context->spill_bo, 0, true);
+   }
+   int n = blob->num_chunks, cmds = 2 * n + 1;
+   GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_incr(REG_TGR3D_PSEQ_COMMAND_EVEN(0), 2 * cmds));
+   for (int k = 0; k < n; k++) {
+      GRATE_PUSHBUF_WORD(*ptrp, 0x10000000 | blob->chunk_len[k]);
+      grate_stream_push_reloc(stream, ptrp, blob->chunk_bo, blob->chunk_off[k] * 4, false);
+      GRATE_PUSHBUF_WORD(*ptrp, (k + 1 < n ? 0x20002000 : 0x20004000) | blob->chunk_execs[k]);
+      GRATE_PUSHBUF_WORD(*ptrp, 0);
+   }
+   GRATE_PUSHBUF_WORD(*ptrp, 0x40000000 | (-(2 * n) & 31));
+   GRATE_PUSHBUF_WORD(*ptrp, 0);
+   GRATE_PUSHBUF_WORD(*ptrp, host1x_opcode_imm(REG_TGR3D_PSEQ_PC, 0));
+   context->pseq_cmds_set = true;
+}
+
 static void
 emit_program(struct grate_context *context, uint32_t **ptrp)
 {
@@ -943,7 +996,7 @@ emit_program(struct grate_context *context, uint32_t **ptrp)
    uint32_t cull_face_linker_setup;
 
    emit_shader(stream, ptrp, &context->vshader->blob);
-   emit_shader(stream, ptrp, &context->fshader->blob);
+   emit_fs_passes(context, ptrp, &context->fshader->blob);
 
    /* fragment shader constants: ALU uniform registers 32.. */
    const struct grate_fp_info *fpinfo = context->fshader->info;

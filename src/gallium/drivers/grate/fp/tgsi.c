@@ -2653,6 +2653,7 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    list_inithead(&fp->mfu_instructions);
 
    fp->info.num_links = 0;
+   fp->info.num_chunks = 0;   /* one pass unless sched_seq.c cuts it */
    fp->info.color_input = -1;
    fp->info.max_tram_row = 1;
    BITSET_ZERO(c->slots.used_mask);

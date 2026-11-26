@@ -16,6 +16,7 @@
 #include "grate_device.h"
 #include "host1x01_hardware.h"
 #include "grate_common.h"
+#include "grate_bo.h"
 #include "grate_context.h"
 #include "grate_screen.h"
 #include "grate_program.h"
@@ -248,12 +249,143 @@ grate_fs_translate(struct grate_fp_shader *fp, const struct tgsi_token *tokens,
 }
 
 /* Compile a fragment program variant into its command stream */
+/*
+ * The fragment program's code for EXECs e0 up to e1: PSEQ, MFU (AT), TEX,
+ * ALU and DW instructions, the MFU and ALU addresses taken from the first
+ * of those EXECs that has any (a PSEQ pass loads its own code at 0)
+ */
+static void
+grate_fp_push_code(struct util_dynarray *buf, struct fp_instr **ins, int e0, int e1,
+                   struct fp_mfu_instr **mfu, struct fp_alu_instr_packet **alu,
+                   enum drm_tegra_soc_id soc_id)
+{
+#define PUSHB(x) util_dynarray_append_typed(buf, uint32_t, (x))
+   int n = e1 - e0, mfu0 = -1, mfu1 = 0, alu0 = -1, alu1 = 0;
+   for (int e = e0; e < e1; e++) {
+      struct fp_sched *m = &ins[e]->mfu_sched, *a = &ins[e]->alu_sched;
+      if (m->num_instructions) {
+         if (mfu0 < 0)
+            mfu0 = m->address;
+         mfu1 = m->address + m->num_instructions;
+      }
+      if (a->num_instructions) {
+         if (alu0 < 0)
+            alu0 = a->address;
+         alu1 = a->address + a->num_instructions;
+      }
+   }
+   mfu0 = MAX2(mfu0, 0);
+   alu0 = MAX2(alu0, 0);
+   assert(n <= 64 && mfu1 - mfu0 <= 64 && alu1 - alu0 <= 64);
+
+   PUSHB(host1x_opcode_nonincr(REG_TGR3D_PSEQ_INST_DATA, n));
+   for (int e = e0; e < e1; e++)
+      PUSHB(ins[e]->pseq);
+
+   PUSHB(host1x_opcode_nonincr(REG_TGR3D_AT_REMAP_DATA, n));
+   for (int e = e0; e < e1; e++) {
+      struct fp_sched m = ins[e]->mfu_sched;
+      if (m.num_instructions)
+         m.address -= mfu0;
+      PUSHB(grate_fp_pack_sched(&m));
+   }
+
+   PUSHB(host1x_opcode_nonincr(REG_TGR3D_AT_INST_DATA_LO, (mfu1 - mfu0) * 2));
+   for (int i = mfu0; i < mfu1; i++) {
+      uint32_t words[2];
+      grate_fp_pack_mfu(words, mfu[i]);
+      PUSHB(words[0]);
+      PUSHB(words[1]);
+   }
+
+   PUSHB(host1x_opcode_nonincr(REG_TGR3D_TEX_INST_DATA, n));
+   for (int e = e0; e < e1; e++)
+      PUSHB(ins[e]->tex);
+
+   PUSHB(host1x_opcode_nonincr(REG_TGR3D_ALU_REMAP_DATA, n));
+   for (int e = e0; e < e1; e++) {
+      struct fp_sched a = ins[e]->alu_sched;
+      if (a.num_instructions)
+         a.address -= alu0;
+      if (soc_id == DRM_TEGRA_SOC_T114)
+         PUSHB(grate_fp_pack_alu_sched_t114(&a));
+      else
+         PUSHB(grate_fp_pack_sched(&a));
+   }
+
+   PUSHB(host1x_opcode_nonincr(REG_TGR3D_ALU_INST_DATA, (alu1 - alu0) * 4 * 2));
+   for (int p = alu0; p < alu1; p++) {
+      struct fp_alu_instr_packet *instr = alu[p];
+      for (int i = 0; i < 4; ++i) {
+         uint32_t words[2];
+         if (i == 3 && instr->num_imm) {
+            /* imm0 at bits 4..23 of the first word, imm1 across bits 24..31
+             * and the next word's 0..11, imm2 at 12..31 (libgrate's layout) */
+            const uint32_t *imm = instr->imm;
+            words[0] = imm[0] << 4 | (imm[1] & 0xff) << 24;
+            words[1] = imm[1] >> 8 | imm[2] << 12;
+         } else {
+            grate_fp_pack_alu(words, instr->slots + i);
+         }
+         PUSHB(words[0]);
+         PUSHB(words[1]);
+      }
+   }
+
+   PUSHB(host1x_opcode_nonincr(REG_TGR3D_ALU_P2CX_DATA, n));
+   for (int e = e0; e < e1; e++)
+      PUSHB(0x00000000);
+
+   PUSHB(host1x_opcode_nonincr(REG_TGR3D_DW_INST_DATA, n));
+   for (int e = e0; e < e1; e++)
+      PUSHB(grate_fp_pack_dw(&ins[e]->dw));
+#undef PUSHB
+}
+
+/*
+ * A program of several PSEQ passes (info.chunk_exec): what the PSEQ fetches
+ * for each (blob.chunk_words), as the NVIDIA compiler lays out its chunks
+ * (libcgdrv.so 0xdcc80): the upload counters cleared, then the pass's
+ * code. grate_state.c emit_program points the PSEQ commands at them.
+ */
+static void
+grate_fp_chunks(struct grate_shader_blob *blob, const struct grate_fp_info *info,
+                struct fp_instr **ins, struct fp_mfu_instr **mfu,
+                struct fp_alu_instr_packet **alu, enum drm_tegra_soc_id soc_id)
+{
+   struct util_dynarray buf;
+   util_dynarray_init(&buf, NULL);
+   blob->num_chunks = info->num_chunks;
+   for (int k = 0; k < info->num_chunks; k++) {
+      int e0 = info->chunk_exec[k], e1 = info->chunk_exec[k + 1];
+      blob->chunk_off[k] = buf.size / sizeof(uint32_t);
+      blob->chunk_execs[k] = e1 - e0;
+      util_dynarray_append_typed(&buf, uint32_t, host1x_opcode_incr(REG_TGR3D_GLOBAL_INST_OFFSET, 1));
+      util_dynarray_append_typed(&buf, uint32_t, 0);
+      util_dynarray_append_typed(&buf, uint32_t, host1x_opcode_incr(REG_TGR3D_AT_INST_OFFSET, 1));
+      util_dynarray_append_typed(&buf, uint32_t, 0);
+      util_dynarray_append_typed(&buf, uint32_t, host1x_opcode_incr(REG_TGR3D_ALU_INST_OFFSET, 1));
+      util_dynarray_append_typed(&buf, uint32_t, 0);
+      util_dynarray_append_typed(&buf, uint32_t, host1x_opcode_incr(REG_TGR3D_PSEQ_FLUSH, 1));
+      util_dynarray_append_typed(&buf, uint32_t, 0);
+      grate_fp_push_code(&buf, ins, e0, e1, mfu, alu, soc_id);
+      blob->chunk_len[k] = buf.size / sizeof(uint32_t) - blob->chunk_off[k];
+   }
+   util_dynarray_trim(&buf);
+   blob->chunk_words = buf.data;
+   blob->num_chunk_words = buf.size / sizeof(uint32_t);
+}
+
 static void
 grate_fs_compile(enum drm_tegra_soc_id soc_id, const struct tgsi_token *tokens,
                  const struct grate_fp_key *key, struct grate_fs_variant *v)
 {
    struct grate_fp_shader fp;
-   struct grate_fp_opts opts = { .max_pre = GRATE_FP_MAX_PRE };
+   struct grate_fp_opts opts = {
+      .max_pre = GRATE_FP_MAX_PRE,
+      /* TEST: passes forced (sched_seq.c seq_chunk_execs) */
+      .seq_chunks = getenv("GRATE_FP_CHUNK_EXECS") != NULL,
+   };
    grate_fs_translate(&fp, tokens, key, &opts);
 
    /*
@@ -279,7 +411,11 @@ grate_fs_compile(enum drm_tegra_soc_id soc_id, const struct tgsi_token *tokens,
                /* not for a generic version specialized at draw time */
                fp.info.num_flow == (key ? key->num_flow : 0) &&
                (!fp.info.num_spec || (key && key->spec)))
-         opts.seq_fallbacks = true;   /* slow: last */
+         opts.seq_fallbacks = true;   /* slow */
+      else if (fp.info.seq_too_big && !opts.seq_chunks &&
+               fp.info.num_flow == (key ? key->num_flow : 0) &&
+               (!fp.info.num_spec || (key && key->spec)))
+         opts.seq_chunks = true;      /* several PSEQ passes: last */
       else
          break;
       grate_fs_free(&fp);
@@ -356,93 +492,63 @@ grate_fs_compile(enum drm_tegra_soc_id soc_id, const struct tgsi_token *tokens,
         TGR3D_GLOBAL_PIX_ATTR_NUM_ROWS(fp.info.num_rows - 1));
 
    PUSH(host1x_opcode_imm(REG_TGR3D_PSEQ_QUAD_ID, 0));
-   PUSH(host1x_opcode_imm(REG_TGR3D_GLOBAL_INST_OFFSET, 0));
-   PUSH(host1x_opcode_imm(REG_TGR3D_AT_INST_OFFSET, 0));
-   PUSH(host1x_opcode_imm(REG_TGR3D_ALU_INST_OFFSET, 0));
-
    int num_fp_instrs = list_length(&fp.fp_instructions);
-   assert(num_fp_instrs < 64);
-
-   PUSH(host1x_opcode_incr(REG_TGR3D_PSEQ_COMMAND_EVEN(0), 1));
-   // TODO: document/convert these values
-   PUSH(0x20006000 | num_fp_instrs);
-
-   /*
-    * FP_PSEQ_DW_CFG: PSEQ_TO_DW_EXEC_NB (bits 6..12) = how many instruction
-    * batches run before the DW stage stores the pixel. Every batch we emit
-    * has an ALU packet, so the store has to wait for all of them (a value
-    * of 1 stores the pixel right after the first batch).
-    */
-   PUSH(host1x_opcode_incr(REG_TGR3D_PSEQ_DWR_IF_STATE, 1));
-   PUSH(num_fp_instrs << 6);
-
-   if (soc_id == DRM_TEGRA_SOC_T114) {
-      // TODO: document/convert these values
-      /* XXX: maybe not needed */
-      PUSH(host1x_opcode_incr(0x547, 0x0002));
-      PUSH(0xc0000000);
-      PUSH(0x00000000);
-   }
-
-   PUSH(host1x_opcode_imm(REG_TGR3D_PSEQ_FLUSH, 0));
-
-   PUSH(host1x_opcode_nonincr(REG_TGR3D_PSEQ_INST_DATA, num_fp_instrs));
-   list_for_each_entry(struct fp_instr, instr, &fp.fp_instructions, link)
-      PUSH(instr->pseq);
-
-   PUSH(host1x_opcode_nonincr(REG_TGR3D_AT_REMAP_DATA, num_fp_instrs));
-   list_for_each_entry(struct fp_instr, instr, &fp.fp_instructions, link)
-      PUSH(grate_fp_pack_sched(&instr->mfu_sched));
-
    int num_mfu_instrs = list_length(&fp.mfu_instructions);
-   assert(num_mfu_instrs < 64); // TODO: not sure if this is really correct
-
-   PUSH(host1x_opcode_nonincr(REG_TGR3D_AT_INST_DATA_LO, num_mfu_instrs * 2));
-   list_for_each_entry(struct fp_mfu_instr, instr, &fp.mfu_instructions, link) {
-      uint32_t words[2];
-      grate_fp_pack_mfu(words, instr);
-      PUSH(words[0]);
-      PUSH(words[1]);
-   }
-
-   PUSH(host1x_opcode_nonincr(REG_TGR3D_TEX_INST_DATA, num_fp_instrs));
-   list_for_each_entry(struct fp_instr, instr, &fp.fp_instructions, link)
-      PUSH(instr->tex);
-
-   PUSH(host1x_opcode_nonincr(REG_TGR3D_ALU_REMAP_DATA, num_fp_instrs));
-   list_for_each_entry(struct fp_instr, instr, &fp.fp_instructions, link) {
-      if (soc_id == DRM_TEGRA_SOC_T114)
-         PUSH(grate_fp_pack_alu_sched_t114(&instr->alu_sched));
-      else
-         PUSH(grate_fp_pack_sched(&instr->alu_sched));
-   }
-
    int num_alu_instrs = list_length(&fp.alu_instructions);
-   PUSH(host1x_opcode_nonincr(REG_TGR3D_ALU_INST_DATA, num_alu_instrs * 4 * 2));
-   list_for_each_entry(struct fp_alu_instr_packet, instr, &fp.alu_instructions, link) {
-      for (int i = 0; i < 4; ++i) {
-         uint32_t words[2];
-         if (i == 3 && instr->num_imm) {
-            /* imm0 at bits 4..23 of the first word, imm1 across bits 24..31
-             * and the next word's 0..11, imm2 at 12..31 (libgrate's layout) */
-            const uint32_t *imm = instr->imm;
-            words[0] = imm[0] << 4 | (imm[1] & 0xff) << 24;
-            words[1] = imm[1] >> 8 | imm[2] << 12;
-         } else {
-            grate_fp_pack_alu(words, instr->slots + i);
-         }
-         PUSH(words[0]);
-         PUSH(words[1]);
+   struct fp_instr **ins = MALLOC(sizeof(*ins) * MAX2(num_fp_instrs, 1));
+   struct fp_mfu_instr **mfu = MALLOC(sizeof(*mfu) * MAX2(num_mfu_instrs, 1));
+   struct fp_alu_instr_packet **alu = MALLOC(sizeof(*alu) * MAX2(num_alu_instrs, 1));
+   int n = 0;
+   list_for_each_entry(struct fp_instr, instr, &fp.fp_instructions, link)
+      ins[n++] = instr;
+   n = 0;
+   list_for_each_entry(struct fp_mfu_instr, instr, &fp.mfu_instructions, link)
+      mfu[n++] = instr;
+   n = 0;
+   list_for_each_entry(struct fp_alu_instr_packet, instr, &fp.alu_instructions, link)
+      alu[n++] = instr;
+
+   int num_chunks = fp.info.failed ? 1 : MAX2(fp.info.num_chunks, 1);
+   if (num_chunks == 1) {
+      PUSH(host1x_opcode_imm(REG_TGR3D_GLOBAL_INST_OFFSET, 0));
+      PUSH(host1x_opcode_imm(REG_TGR3D_AT_INST_OFFSET, 0));
+      PUSH(host1x_opcode_imm(REG_TGR3D_ALU_INST_OFFSET, 0));
+
+      assert(num_fp_instrs <= 64);
+
+      PUSH(host1x_opcode_incr(REG_TGR3D_PSEQ_COMMAND_EVEN(0), 1));
+      /* run the program's EXECs as the only pass (see grate_fp_chunks) */
+      PUSH(0x20006000 | num_fp_instrs);
+
+      /*
+       * FP_PSEQ_DW_CFG: PSEQ_TO_DW_EXEC_NB (bits 6..12) = how many instruction
+       * batches run before the DW stage stores the pixel. Every batch we emit
+       * has an ALU packet, so the store has to wait for all of them (a value
+       * of 1 stores the pixel right after the first batch).
+       */
+      PUSH(host1x_opcode_incr(REG_TGR3D_PSEQ_DWR_IF_STATE, 1));
+      PUSH(num_fp_instrs << 6);
+
+      if (soc_id == DRM_TEGRA_SOC_T114) {
+         // TODO: document/convert these values
+         /* XXX: maybe not needed */
+         PUSH(host1x_opcode_incr(0x547, 0x0002));
+         PUSH(0xc0000000);
+         PUSH(0x00000000);
       }
+
+      PUSH(host1x_opcode_imm(REG_TGR3D_PSEQ_FLUSH, 0));
+      grate_fp_push_code(&buf, ins, 0, num_fp_instrs, mfu, alu, soc_id);
+   } else {
+      /* several PSEQ passes: the store waits for the last one's EXECs */
+      int last = fp.info.chunk_exec[num_chunks] - fp.info.chunk_exec[num_chunks - 1];
+      PUSH(host1x_opcode_incr(REG_TGR3D_PSEQ_DWR_IF_STATE, 1));
+      PUSH(last << 6);
+      grate_fp_chunks(&v->blob, &fp.info, ins, mfu, alu, soc_id);
    }
-
-   PUSH(host1x_opcode_nonincr(REG_TGR3D_ALU_P2CX_DATA, num_fp_instrs));
-   list_for_each_entry(struct fp_instr, instr, &fp.fp_instructions, link)
-      PUSH(0x00000000);
-
-   PUSH(host1x_opcode_nonincr(REG_TGR3D_DW_INST_DATA, num_fp_instrs));
-   list_for_each_entry(struct fp_instr, instr, &fp.fp_instructions, link)
-      PUSH(grate_fp_pack_dw(&instr->dw));
+   FREE(ins);
+   FREE(mfu);
+   FREE(alu);
 
    uint32_t tram_setup = 0;
    tram_setup |= TGR3D_GLOBAL_TRI_ATTR_NUM_TRIS(64 / fp.info.max_tram_row);
@@ -470,6 +576,9 @@ grate_fs_compile(enum drm_tegra_soc_id soc_id, const struct tgsi_token *tokens,
             fprintf(stderr, "FPCONST %d %05x\n", i, fp.info.consts[i]);
    }
 }
+
+static void grate_fs_upload_chunks(struct grate_context *context,
+                                   struct grate_shader_blob *blob);
 
 static const struct grate_fp_key grate_fp_key_none = { .colormask = 0xf };
 
@@ -507,6 +616,7 @@ grate_create_fs_state(struct pipe_context *pcontext,
    /* the opaque variant, used without blending */
    grate_fs_compile(context->drm->soc_id, so->base.tokens, &grate_fp_key_none,
                     &so->variants[0]);
+   grate_fs_upload_chunks(context, &so->variants[0].blob);
    so->num_variants = 1;
    so->blob = so->variants[0].blob;
    so->info = &so->variants[0].info;
@@ -623,6 +733,38 @@ grate_fs_key(struct grate_context *context)
    return key;
 }
 
+/* Several PSEQ passes: the chunks into GPU memory, for the PSEQ to fetch */
+static void
+grate_fs_upload_chunks(struct grate_context *context, struct grate_shader_blob *blob)
+{
+   void *map;
+
+   if (blob->num_chunks < 2)
+      return;
+   blob->chunk_bo = grate_bo_alloc(context->drm, blob->num_chunk_words * 4, 0);
+   if (blob->chunk_bo && !grate_bo_map(blob->chunk_bo, &map)) {
+      memcpy(map, blob->chunk_words, blob->num_chunk_words * 4);
+      grate_bo_unmap(blob->chunk_bo);
+      return;
+   }
+   fprintf(stderr, "GRATE FRAG: no memory for %d PSEQ passes\n", blob->num_chunks);
+   if (blob->chunk_bo)
+      grate_bo_unref(blob->chunk_bo);
+   blob->chunk_bo = NULL;
+}
+
+/* A fragment variant's program (the stream may still hold its chunks: the
+ * BO goes when the job is done with it) */
+static void
+grate_fs_blob_free(struct grate_shader_blob *blob)
+{
+   FREE(blob->commands);
+   FREE(blob->chunk_words);
+   if (blob->chunk_bo)
+      grate_bo_unref(blob->chunk_bo);
+   memset(blob, 0, sizeof(*blob));
+}
+
 static struct grate_fs_variant *
 grate_fs_variant(struct grate_context *context,
                  struct grate_fragment_shader_state *so,
@@ -639,11 +781,12 @@ grate_fs_variant(struct grate_context *context,
    } else {
       /* replace one, never the opaque variant 0 */
       i = 1 + so->next_evict++ % (GRATE_FS_MAX_VARIANTS - 1);
-      FREE(so->variants[i].blob.commands);
+      grate_fs_blob_free(&so->variants[i].blob);
       grate_fp_info_fini(&so->variants[i].info);
    }
    grate_fs_compile(context->drm->soc_id, so->base.tokens, key,
                     &so->variants[i]);
+   grate_fs_upload_chunks(context, &so->variants[i].blob);
    return &so->variants[i];
 }
 
@@ -750,7 +893,7 @@ grate_delete_fs_state(struct pipe_context *pcontext, void *hwcso)
 
    grate_trace();
    for (unsigned i = 0; i < so->num_variants; i++) {
-      FREE(so->variants[i].blob.commands);
+      grate_fs_blob_free(&so->variants[i].blob);
       grate_fp_info_fini(&so->variants[i].info);
    }
    FREE((void *)so->base.tokens);

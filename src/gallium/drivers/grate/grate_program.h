@@ -6,9 +6,21 @@
 
 #include "grate_compiler.h"
 
+struct grate_bo;
+
 struct grate_shader_blob {
    uint32_t *commands;
    int num_commands;
+
+   /* a fragment program of several PSEQ passes (grate_fp_chunks): the
+    * register writes the PSEQ fetches for each, in chunk_bo once compiled */
+   int num_chunks;
+   uint32_t *chunk_words;
+   int num_chunk_words;
+   uint16_t chunk_off[GRATE_FP_MAX_CHUNKS];    /* words into chunk_words */
+   uint16_t chunk_len[GRATE_FP_MAX_CHUNKS];
+   uint16_t chunk_execs[GRATE_FP_MAX_CHUNKS];
+   struct grate_bo *chunk_bo;
 };
 
 /* A vertex program compiled to also compute the moved texture coordinates
