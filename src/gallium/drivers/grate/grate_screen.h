@@ -18,8 +18,14 @@ extern uint32_t grate_debug;
  * its edge. Vertex shaders clamp gl_PointSize to it, the hardware does not. */
 #define GRATE_MAX_POINT_SIZE 2048.0f
 
+struct disk_cache;
+
 struct grate_screen {
    struct pipe_screen base;
+
+   /* compiled fragment programs (grate_program.c) and Mesa's own shader
+    * cache, keyed to this build of the driver */
+   struct disk_cache *disk_cache;
 
    struct slab_parent_pool transfer_pool;
 

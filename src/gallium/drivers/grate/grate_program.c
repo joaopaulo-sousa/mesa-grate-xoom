@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include "util/blob.h"
+#include "util/disk_cache.h"
 #include "util/format/u_format.h"
 #include "util/u_dynarray.h"
 #include "util/u_memory.h"
@@ -609,6 +611,140 @@ grate_fs_compile(enum drm_tegra_soc_id soc_id, const struct tgsi_token *tokens,
    }
 }
 
+/*
+ * Fragment program variants in the disk cache (grate_screen.disk_cache):
+ * the compile takes 1-2 s for big programs on the Xoom, the second run of
+ * an application reads them back. Keyed by the TGSI, the variant key, the
+ * SoC and the compiler's test variables (GRATE_FP_*: experiments must not
+ * read each other's programs); the build id names the cache itself.
+ */
+#define GRATE_FS_CACHE_MAGIC 0x31534647   /* "GFS1" */
+
+static const char *const grate_fs_cache_env[] = {
+   "GRATE_FP_ALL_PACKETS", "GRATE_FP_CHUNK_EXECS", "GRATE_FP_CR", "GRATE_FP_FX10",
+   "GRATE_FP_INPLACE", "GRATE_FP_NO_EMBED", "GRATE_FP_NO_MINUS_ONE", "GRATE_FP_ROWS",
+   "GRATE_FP_SEQ", "GRATE_FP_SEQ_ROWS", "GRATE_FP_SUM_ORDER",
+};
+
+static void
+grate_fs_cache_key(struct disk_cache *cache, enum drm_tegra_soc_id soc_id,
+                   const struct tgsi_token *tokens, const struct grate_fp_key *key,
+                   bool quick, cache_key ck)
+{
+   struct blob b;
+   blob_init(&b);
+   blob_write_uint32(&b, GRATE_FS_CACHE_MAGIC);
+   blob_write_uint32(&b, soc_id);
+   blob_write_uint8(&b, quick);
+   blob_write_bytes(&b, key, sizeof(*key));
+   blob_write_bytes(&b, tokens, tgsi_num_tokens(tokens) * sizeof(struct tgsi_token));
+   for (unsigned i = 0; i < ARRAY_SIZE(grate_fs_cache_env); i++) {
+      const char *v = getenv(grate_fs_cache_env[i]);
+      blob_write_string(&b, v ? v : "");
+   }
+   disk_cache_compute_key(cache, b.data, b.size, ck);
+   blob_finish(&b);
+}
+
+static void
+grate_fs_cache_store(struct disk_cache *cache, const cache_key ck,
+                     const struct grate_fs_variant *v)
+{
+   const struct grate_shader_blob *s = &v->blob;
+   struct grate_fp_info info = v->info;
+   struct blob b;
+
+   info.pre = NULL;
+   blob_init(&b);
+   blob_write_uint32(&b, GRATE_FS_CACHE_MAGIC);
+   blob_write_bytes(&b, &info, sizeof(info));
+   blob_write_bytes(&b, v->info.pre, v->info.num_pre * sizeof(v->info.pre[0]));
+   blob_write_uint32(&b, s->num_commands);
+   blob_write_bytes(&b, s->commands, s->num_commands * sizeof(uint32_t));
+   blob_write_uint32(&b, s->num_chunks);
+   blob_write_uint32(&b, s->num_chunk_words);
+   blob_write_bytes(&b, s->chunk_words, s->num_chunk_words * sizeof(uint32_t));
+   blob_write_bytes(&b, s->chunk_off, sizeof(s->chunk_off));
+   blob_write_bytes(&b, s->chunk_len, sizeof(s->chunk_len));
+   blob_write_bytes(&b, s->chunk_execs, sizeof(s->chunk_execs));
+   if (!b.out_of_memory)
+      disk_cache_put(cache, ck, b.data, b.size, NULL);
+   blob_finish(&b);
+}
+
+static bool
+grate_fs_cache_load(struct disk_cache *cache, const cache_key ck,
+                    const struct grate_fp_key *key, struct grate_fs_variant *v)
+{
+   size_t size;
+   void *data = disk_cache_get(cache, ck, &size);
+   if (!data)
+      return false;
+
+   struct grate_shader_blob *s = &v->blob;
+   struct blob_reader r;
+   memset(v, 0, sizeof(*v));
+   blob_reader_init(&r, data, size);
+   bool ok = blob_read_uint32(&r) == GRATE_FS_CACHE_MAGIC;
+   if (ok)
+      blob_copy_bytes(&r, &v->info, sizeof(v->info));
+   v->info.pre = NULL;
+   if (ok && v->info.num_pre > 0 && v->info.num_pre <= GRATE_FP_MAX_PRE) {
+      v->info.pre = MALLOC(v->info.num_pre * sizeof(v->info.pre[0]));
+      blob_copy_bytes(&r, v->info.pre, v->info.num_pre * sizeof(v->info.pre[0]));
+   } else if (v->info.num_pre) {
+      ok = false;
+   }
+   if (ok) {
+      s->num_commands = blob_read_uint32(&r);
+      s->commands = MALLOC(MAX2(s->num_commands, 1) * sizeof(uint32_t));
+      blob_copy_bytes(&r, s->commands, s->num_commands * sizeof(uint32_t));
+      s->num_chunks = blob_read_uint32(&r);
+      s->num_chunk_words = blob_read_uint32(&r);
+      if (s->num_chunk_words) {
+         s->chunk_words = MALLOC(s->num_chunk_words * sizeof(uint32_t));
+         blob_copy_bytes(&r, s->chunk_words, s->num_chunk_words * sizeof(uint32_t));
+      }
+      blob_copy_bytes(&r, s->chunk_off, sizeof(s->chunk_off));
+      blob_copy_bytes(&r, s->chunk_len, sizeof(s->chunk_len));
+      blob_copy_bytes(&r, s->chunk_execs, sizeof(s->chunk_execs));
+      ok = !r.overrun && r.current == r.end;
+   }
+   free(data);
+   if (!ok) {
+      FREE(v->info.pre);
+      FREE(s->commands);
+      FREE(s->chunk_words);
+      memset(v, 0, sizeof(*v));
+      return false;
+   }
+   v->key = *key;
+   return true;
+}
+
+/* grate_fs_compile, through the disk cache (not with GRATE_DEBUG=tgsi,
+ * whose dumps want the compile) */
+static void
+grate_fs_compile_cached(struct grate_context *context, const struct tgsi_token *tokens,
+                        const struct grate_fp_key *key, struct grate_fs_variant *v,
+                        bool quick)
+{
+   struct disk_cache *cache = grate_screen(context->base.screen)->disk_cache;
+   enum drm_tegra_soc_id soc_id = context->drm->soc_id;
+   cache_key ck;
+
+   if (grate_debug & GRATE_DEBUG_TGSI)
+      cache = NULL;
+   if (cache) {
+      grate_fs_cache_key(cache, soc_id, tokens, key, quick, ck);
+      if (grate_fs_cache_load(cache, ck, key, v))
+         return;
+   }
+   grate_fs_compile(soc_id, tokens, key, v, quick);
+   if (cache)
+      grate_fs_cache_store(cache, ck, v);
+}
+
 static void grate_fs_upload_chunks(struct grate_context *context,
                                    struct grate_shader_blob *blob);
 
@@ -646,8 +782,8 @@ grate_create_fs_state(struct pipe_context *pcontext,
    so->reads_z = scan.reads_z;
 
    /* the opaque variant, used without blending */
-   grate_fs_compile(context->drm->soc_id, so->base.tokens, &grate_fp_key_none,
-                    &so->variants[0], false);
+   grate_fs_compile_cached(context, so->base.tokens, &grate_fp_key_none,
+                           &so->variants[0], false);
    grate_fs_upload_chunks(context, &so->variants[0].blob);
    so->num_variants = 1;
    so->blob = so->variants[0].blob;
@@ -816,8 +952,8 @@ grate_fs_variant(struct grate_context *context,
       grate_fs_blob_free(&so->variants[i].blob);
       grate_fp_info_fini(&so->variants[i].info);
    }
-   grate_fs_compile(context->drm->soc_id, so->base.tokens, key,
-                    &so->variants[i], key->move && so->move_quick);
+   grate_fs_compile_cached(context, so->base.tokens, key, &so->variants[i],
+                           key->move && so->move_quick);
    grate_fs_upload_chunks(context, &so->variants[i].blob);
    return &so->variants[i];
 }

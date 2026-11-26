@@ -6,7 +6,10 @@
 
 #include "tegra.h"
 
+#include "util/build_id.h"
+#include "util/disk_cache.h"
 #include "util/hash_table.h"
+#include "util/mesa-blake3.h"
 #include "util/macros.h"
 #include "util/u_inlines.h"
 #include "util/u_memory.h"
@@ -40,6 +43,8 @@ grate_screen_destroy(struct pipe_screen *pscreen)
    struct grate_screen *screen = grate_screen(pscreen);
 
    slab_destroy_parent(&screen->transfer_pool);
+   if (screen->disk_cache)
+      disk_cache_destroy(screen->disk_cache);
 
    grate_device_close(screen->drm);
    FREE(screen);
@@ -593,6 +598,25 @@ grate_screen_is_dmabuf_modifier_supported(struct pipe_screen *pscreen,
    return false;
 }
 
+static struct disk_cache *
+grate_screen_get_disk_shader_cache(struct pipe_screen *pscreen)
+{
+   return grate_screen(pscreen)->disk_cache;
+}
+
+/* The shader cache, named by the driver's build id: a new build starts an
+ * empty one (MESA_SHADER_CACHE_DISABLE=true turns it off) */
+static void
+grate_disk_cache_init(struct grate_screen *screen)
+{
+   const struct build_id_note *note = build_id_find_nhdr_for_addr(grate_disk_cache_init);
+   if (!note || build_id_length(note) != 20)
+      return;
+   char id[BLAKE3_HEX_LEN];   /* _mesa_sha1_format writes a BLAKE3 key's hex */
+   _mesa_sha1_format(id, build_id_data(note));
+   screen->disk_cache = disk_cache_create("grate", id, 0);
+}
+
 struct pipe_screen *
 grate_screen_create(int fd)
 {
@@ -623,6 +647,7 @@ grate_screen_create(int fd)
    screen->base.is_format_supported = grate_screen_is_format_supported;
    screen->base.query_dmabuf_modifiers = grate_screen_query_dmabuf_modifiers;
    screen->base.is_dmabuf_modifier_supported = grate_screen_is_dmabuf_modifier_supported;
+   screen->base.get_disk_shader_cache = grate_screen_get_disk_shader_cache;
    
    screen->base.nir_options[MESA_SHADER_VERTEX] = &grate_base_compiler_options;
    screen->base.nir_options[MESA_SHADER_FRAGMENT] = &grate_base_compiler_options;
@@ -637,6 +662,7 @@ grate_screen_create(int fd)
    grate_screen_init_caps(screen);
 
    slab_create_parent(&screen->transfer_pool, sizeof(struct pipe_transfer), 16);
+   grate_disk_cache_init(screen);
 
    return &screen->base;
 }
