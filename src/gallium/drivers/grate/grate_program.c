@@ -805,9 +805,11 @@ grate_npot_repeat(const struct pipe_sampler_view *view,
    if (!view || !view->texture || !sampler)
       return false;
    unsigned wrap = axis ? sampler->wrap_t : sampler->wrap_s;
+   /* the size of the level the view starts at (emit_textures) */
+   unsigned first = view->target == PIPE_TEXTURE_CUBE ? 0 : view->u.tex.first_level;
    return wrap == PIPE_TEX_WRAP_REPEAT &&
-          !(util_is_power_of_two_nonzero(view->texture->width0) &&
-            util_is_power_of_two_nonzero(view->texture->height0));
+          !(util_is_power_of_two_nonzero(u_minify(view->texture->width0, first)) &&
+            util_is_power_of_two_nonzero(u_minify(view->texture->height0, first)));
 }
 
 /*
@@ -856,7 +858,14 @@ grate_fs_key(struct grate_context *context)
       unsigned sw[4] = { view->swizzle_r, view->swizzle_g, view->swizzle_b,
                          view->swizzle_a };
       unsigned bits = 0;
+      /* the X of RGBX formats: the TEX unit reads the byte as alpha, the
+       * format means one (the GL frontend swizzles it away; u_blitter, e.g.
+       * glReadPixels of an RGB framebuffer, does not) */
+      bool x8 = view->format == PIPE_FORMAT_R8G8B8X8_UNORM ||
+                view->format == PIPE_FORMAT_B8G8R8X8_UNORM;
       for (int c = 0; c < 4; c++) {
+         if (x8 && sw[c] == PIPE_SWIZZLE_W)
+            sw[c] = PIPE_SWIZZLE_1;
          if (sw[c] <= PIPE_SWIZZLE_W)
             sw[c] = grate_sampler_channel(view->format, sw[c]);
          bits |= sw[c] << (3 * c);
