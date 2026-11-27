@@ -290,6 +290,33 @@ fp_info_uniforms(struct fp_compiler *c)
    }
 }
 
+/* A failed program still emits something sane: magenta, one packet */
+static void
+fp_set_magenta(struct fp_compiler *c)
+{
+   memset(c->exec_input, -1, sizeof(c->exec_input));
+   memset(c->tram, -1, sizeof(c->tram));
+   c->num_units = 0;
+   c->num_tex = 0;
+   c->dst_used = false;
+   c->seq = false;
+   for (int i = 0; i < 4; i++) {
+      struct fp_unit *u = fp_new_unit(c);
+      struct fp_opnd one = fp_opnd_one(c, true);
+      fp_unit_op(&u->slots[0], FP_ALU_OP_MAD, i == 1 ? fp_opnd_zero(c, true) : one,
+                 one, fp_opnd_zero(c, true));
+      u->output_chan = i;
+      u->live = true;
+      u->packet = 0;
+      u->slot = i;
+   }
+   c->dw.enable = 1;
+   c->dw.src_regs = FP_DW_REGS_R2_R3;
+   c->num_packets = 1;
+   c->num_execs = 1;
+   c->packet_exec[0] = 0;
+}
+
 /* An ALU slot that does nothing: writes vec2(0, 1) to the read-only r31 */
 struct fp_alu_instr
 fp_alu_nop(void)
@@ -2784,30 +2811,8 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
    if ((grate_debug & GRATE_DEBUG_TGSI) && !c->seq)
       fp_dump_rows(c);
 
-   if (c->failed) {
-      /* still emit something sane: magenta, one packet */
-      memset(c->exec_input, -1, sizeof(c->exec_input));
-      memset(c->tram, -1, sizeof(c->tram));
-      c->num_units = 0;
-      c->num_tex = 0;
-      c->dst_used = false;
-      c->seq = false;
-      for (int i = 0; i < 4; i++) {
-         struct fp_unit *u = fp_new_unit(c);
-         struct fp_opnd one = fp_opnd_one(c, true);
-         fp_unit_op(&u->slots[0], FP_ALU_OP_MAD, i == 1 ? fp_opnd_zero(c, true) : one,
-                    one, fp_opnd_zero(c, true));
-         u->output_chan = i;
-         u->live = true;
-         u->packet = 0;
-         u->slot = i;
-      }
-      c->dw.enable = 1;
-      c->dw.src_regs = FP_DW_REGS_R2_R3;
-      c->num_packets = 1;
-      c->num_execs = 1;
-      c->packet_exec[0] = 0;
-   }
+   if (c->failed)
+      fp_set_magenta(c);
 
    if (c->seq)
       fp_emit_seq(c);
@@ -2815,6 +2820,29 @@ grate_tgsi_to_fp(struct grate_fp_shader *fp, struct tgsi_parse_context *tgsi,
       fp_emit_rows(c);
    fp_embed_constants(c);
    fp_info_uniforms(c);
+   /*
+    * Out of uniform registers only once emitted (fp_info_uniforms counts
+    * what the packets still read): the program left in the lists reads
+    * slots never numbered into registers and may not fit one PSEQ pass,
+    * which a failed program gets (grate_program.c). Skia's blur under
+    * WebKit: 54 EXECs, 84 packets.
+    */
+   if (c->failed && c->num_execs > 1) {
+      list_for_each_entry_safe(struct fp_instr, i, &fp->fp_instructions, link)
+         FREE(i);
+      list_for_each_entry_safe(struct fp_alu_instr_packet, i, &fp->alu_instructions, link)
+         FREE(i);
+      list_for_each_entry_safe(struct fp_mfu_instr, i, &fp->mfu_instructions, link)
+         FREE(i);
+      list_inithead(&fp->fp_instructions);
+      list_inithead(&fp->alu_instructions);
+      list_inithead(&fp->mfu_instructions);
+      fp->info.num_chunks = 0;
+      fp_set_magenta(c);
+      fp_emit_rows(c);
+      fp_embed_constants(c);
+      fp_info_uniforms(c);
+   }
    fp_build_links(c);
    fp->info.num_rows = c->seq ? MAX2(c->seq_rows, 1) : c->num_execs;
    fp->info.sequential = c->seq;
