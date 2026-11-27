@@ -256,7 +256,14 @@ grate_screen_init_caps(struct grate_screen *screen)
    
    // well, not quite. but perhaps close enough?
    caps->fragment_shader_texture_lod = true;
-   caps->fragment_shader_derivatives = true;
+   /*
+    * No DDX/DDY in the fragment compiler yet: every shader using them
+    * drew magenta. Without OES_standard_derivatives, GLES2 users (Skia
+    * under WebKit) take their other paths. The NVIDIA compiler does them
+    * by exchanging values between the quad's pixels through the uniform
+    * registers (cgdump: the ALU writes u0, reads u0/u8/u16/u24).
+    */
+   caps->fragment_shader_derivatives = false;
    caps->min_texel_offset = 0;
    caps->max_texel_offset = 0;
    /* one colour buffer, surface GRATE_RT_COLOR; further ones would be
