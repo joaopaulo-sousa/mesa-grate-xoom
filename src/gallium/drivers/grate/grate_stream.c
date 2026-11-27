@@ -150,7 +150,7 @@ grate_stream_release_bos(struct grate_stream *stream, bool submitted)
 {
    util_dynarray_foreach(&stream->bos, struct grate_bo *, bo) {
       if (submitted)
-         (*bo)->fence[stream->slot] = stream->last_fence;
+         grate_bo_add_fence(*bo, &stream->last_fence);
       if ((*bo)->batch[stream->slot] == stream) {
          (*bo)->batch[stream->slot] = NULL;
          (*bo)->batch_written[stream->slot] = 0;

@@ -29,6 +29,7 @@
 #include <stdlib.h>
 #include <util/u_dynarray.h>
 #include <util/sparse_array.h>
+#include <util/list.h>
 
 #include "tegra.h"
 
@@ -41,12 +42,23 @@ struct grate_bo {
     int32_t refcnt;
     void *map;
     
+    /* Shared with another process (exported or imported): never cached */
+    bool shared;
+    /* In grate_device.bo_cache since cache_time (os_time_get_nano) */
+    struct list_head cache_link;
+    int64_t cache_time;
+
     /* List of channel mappings where made for this BO, for cleanup */
     struct util_dynarray channel_maps;
 
-    /* Last job of each stream (GRATE_STREAM_2D/3D) that used this BO;
-     * drm is NULL once it is known to have completed */
-    struct drm_tegra_fence fence[2];
+    /* The last job that used this BO on each syncpoint (each context's
+     * 2D and 3D streams have their own), up to GRATE_BO_MAX_FENCES; drm is
+     * NULL for a free entry or one known to have completed. One per stream
+     * slot lost the jobs of the other contexts: WebKit draws from several
+     * threads, and a BO reused from the cache while another context's job
+     * still read it hung the GPU. */
+#define GRATE_BO_MAX_FENCES 4
+    struct drm_tegra_fence fence[GRATE_BO_MAX_FENCES];
 
     /* Stream (per GRATE_STREAM_2D/3D) whose open job references this BO,
      * not submitted yet: its fence is not stamped, a wait must submit it */
@@ -61,6 +73,7 @@ struct grate_device;
 struct grate_bo *grate_bo_alloc(struct grate_device *drm, uint32_t size, uint32_t flags);
 struct grate_bo *grate_bo_ref(struct grate_bo *bo);
 int grate_bo_wait(struct grate_bo *bo);
+void grate_bo_add_fence(struct grate_bo *bo, const struct drm_tegra_fence *fence);
 void grate_bo_unref(struct grate_bo *bo);
 int grate_bo_get_handle(struct grate_bo *bo, uint32_t *handle);
 int grate_bo_map(struct grate_bo *bo, void **ptr);
@@ -68,4 +81,5 @@ int grate_bo_unmap(struct grate_bo *bo);
 
 int grate_bo_export(struct grate_bo *bo, uint32_t flags);
 struct grate_bo* grate_bo_import(struct grate_device *drm, int fd);
+void grate_bo_cache_fini(struct grate_device *drm);
 #endif /* __GRATE_BO_H__ */

@@ -7,6 +7,7 @@
 #include <stdlib.h>
 
 #include <util/sparse_array.h>
+#include <util/list.h>
 
 #ifndef __maybe_unused
 #define __maybe_unused  __attribute__((unused))
@@ -42,6 +43,16 @@ struct grate_device {
 
    pthread_mutex_t bo_map_lock;
    struct util_sparse_array bo_map;
+
+   /* BOs freed by this process, kept (mapped, idle or not) for the next
+    * allocation of about their size (grate_bo.c), oldest first; under
+    * bo_map_lock */
+   struct list_head bo_cache;
+   uint32_t bo_cache_size;
+
+   /* grate_bo.fence of all the BOs: contexts submit from their own threads
+    * (inside bo_map_lock when both are taken) */
+   pthread_mutex_t fence_lock;
 
    /* the channel mappings of the BOs (grate_bo.channel_maps) and of the
     * channels (drm_tegra_channel.mappings): BOs outlive the contexts whose

@@ -35,6 +35,7 @@
 #include <util/os_mman.h>
 #include <util/u_atomic.h>
 #include <util/macros.h>
+#include <util/os_time.h>
 
 #include <xf86drm.h>
 
@@ -73,6 +74,84 @@ static void grate_bo_prepare(struct grate_bo *bo)
    util_dynarray_init(&bo->channel_maps, NULL);
 }
 
+/*
+ * BO cache: a BO the process frees stays allocated (and mapped, and mapped
+ * into the channels) for a while, for the next allocation of about its
+ * size. A new GEM object costs the kernel a clear and a cache flush of all
+ * its pages (CMA): Xorg/glamor creating and dropping a window-sized pixmap
+ * per frame of a scrolling WebKit view spent a third of its time there
+ * (v7_dma_flush_range, l2c210_flush_range, memset). The reused BO keeps its
+ * old contents, which GL leaves undefined anyway.
+ */
+#define GRATE_BO_CACHE_MAX_SIZE (16u << 20)
+#define GRATE_BO_CACHE_MAX_AGE_NS 1000000000ll
+
+/* Free the cached BOs over the size limit or older than the age limit;
+ * under bo_map_lock */
+static void grate_bo_cache_trim(struct grate_device *drm, int64_t now)
+{
+   list_for_each_entry_safe(struct grate_bo, bo, &drm->bo_cache, cache_link) {
+      if (drm->bo_cache_size <= GRATE_BO_CACHE_MAX_SIZE &&
+          now - bo->cache_time < GRATE_BO_CACHE_MAX_AGE_NS)
+         break;
+      list_del(&bo->cache_link);
+      drm->bo_cache_size -= bo->size;
+      grate_bo_free(bo);
+   }
+}
+
+/* Whether the GPU is done with the BO, without waiting */
+static bool grate_bo_idle(struct grate_bo *bo)
+{
+   bool idle = true;
+
+   pthread_mutex_lock(&bo->drm->fence_lock);
+   for (unsigned i = 0; i < ARRAY_SIZE(bo->fence) && idle; i++) {
+      if (!bo->fence[i].drm)
+         continue;
+      if (drm_tegra_fence_wait(&bo->fence[i], 0))
+         idle = false;
+      else
+         bo->fence[i].drm = NULL;
+   }
+   pthread_mutex_unlock(&bo->drm->fence_lock);
+   return idle;
+}
+
+/* A cached BO of the flags and of size .. size * 5 / 4 the GPU is done
+ * with, most recently freed first; NULL when none */
+static struct grate_bo *grate_bo_cache_get(struct grate_device *drm, uint32_t size,
+                                           uint32_t flags)
+{
+   struct grate_bo *ret = NULL;
+
+   pthread_mutex_lock(&drm->bo_map_lock);
+   grate_bo_cache_trim(drm, os_time_get_nano());
+   list_for_each_entry_rev(struct grate_bo, bo, &drm->bo_cache, cache_link) {
+      if (bo->flags != flags || bo->size < size || bo->size > size + size / 4 ||
+          !grate_bo_idle(bo))
+         continue;
+      list_del(&bo->cache_link);
+      drm->bo_cache_size -= bo->size;
+      p_atomic_set(&bo->refcnt, 1);
+      ret = bo;
+      break;
+   }
+   pthread_mutex_unlock(&drm->bo_map_lock);
+   return ret;
+}
+
+void grate_bo_cache_fini(struct grate_device *drm)
+{
+   pthread_mutex_lock(&drm->bo_map_lock);
+   list_for_each_entry_safe(struct grate_bo, bo, &drm->bo_cache, cache_link) {
+      list_del(&bo->cache_link);
+      grate_bo_free(bo);
+   }
+   drm->bo_cache_size = 0;
+   pthread_mutex_unlock(&drm->bo_map_lock);
+}
+
 struct grate_bo *grate_bo_alloc(struct grate_device *drm, uint32_t size, uint32_t flags)
 {
     struct drm_tegra_gem_create args;
@@ -81,6 +160,11 @@ struct grate_bo *grate_bo_alloc(struct grate_device *drm, uint32_t size, uint32_
 
     if (!drm || size == 0)
         return NULL;
+
+    size = align(size, 4096);
+    bo = grate_bo_cache_get(drm, size, flags);
+    if (bo)
+        return bo;
 
     memset(&args, 0, sizeof(args));
     args.flags = flags;
@@ -130,23 +214,64 @@ struct grate_bo *grate_bo_ref(struct grate_bo *bo)
 }
 
 /*
+ * Record a job that used the BO at submit time (grate_stream_flush): it
+ * replaces the earlier one on its syncpoint, takes a free entry otherwise;
+ * with all of them taken by other syncpoints, the first one is waited for.
+ */
+void grate_bo_add_fence(struct grate_bo *bo, const struct drm_tegra_fence *fence)
+{
+   int free = -1;
+
+   pthread_mutex_lock(&bo->drm->fence_lock);
+   for (unsigned i = 0; i < ARRAY_SIZE(bo->fence); i++) {
+      if (bo->fence[i].drm && bo->fence[i].syncpt == fence->syncpt) {
+         bo->fence[i] = *fence;
+         pthread_mutex_unlock(&bo->drm->fence_lock);
+         return;
+      }
+      if (!bo->fence[i].drm && free < 0)
+         free = i;
+   }
+   if (free < 0) {
+      if (drm_tegra_fence_wait(&bo->fence[0], GRATE_JOB_TIMEOUT_NS))
+         fprintf(stderr, "grate: waiting for bo %u failed\n", bo->handle);
+      free = 0;
+   }
+   bo->fence[free] = *fence;
+   pthread_mutex_unlock(&bo->drm->fence_lock);
+}
+
+/*
  * Wait until the GPU is done with the BO: the jobs that used it are the
- * fences stamped at submit time (grate_stream_flush).
+ * fences stamped at submit time (grate_bo_add_fence).
  */
 int grate_bo_wait(struct grate_bo *bo)
 {
+   struct drm_tegra_fence fence[GRATE_BO_MAX_FENCES];
    int ret = 0;
 
-   for (unsigned i = 0; i < ARRAY_SIZE(bo->fence); i++) {
-      if (!bo->fence[i].drm)
+   pthread_mutex_lock(&bo->drm->fence_lock);
+   memcpy(fence, bo->fence, sizeof(fence));
+   pthread_mutex_unlock(&bo->drm->fence_lock);
+
+   for (unsigned i = 0; i < ARRAY_SIZE(fence); i++) {
+      if (!fence[i].drm)
          continue;
 
-      int err = drm_tegra_fence_wait(&bo->fence[i], GRATE_JOB_TIMEOUT_NS);
-      if (err == 0)
-         bo->fence[i].drm = NULL;
-      else
+      int err = drm_tegra_fence_wait(&fence[i], GRATE_JOB_TIMEOUT_NS);
+      if (err) {
          ret = err;
+         fence[i].drm = NULL;   /* keep the entry */
+      }
    }
+
+   /* forget the fences that passed, unless a newer job replaced them */
+   pthread_mutex_lock(&bo->drm->fence_lock);
+   for (unsigned i = 0; i < ARRAY_SIZE(fence); i++)
+      if (fence[i].drm && bo->fence[i].drm &&
+          bo->fence[i].syncpt == fence[i].syncpt && bo->fence[i].value == fence[i].value)
+         bo->fence[i].drm = NULL;
+   pthread_mutex_unlock(&bo->drm->fence_lock);
 
    if (ret)
       fprintf(stderr, "grate: waiting for bo %u failed: %d\n", bo->handle, ret);
@@ -174,7 +299,14 @@ void grate_bo_unref(struct grate_bo *bo)
     */
    if (p_atomic_read(&bo->refcnt) == 0) {
       grate_bo_logd(bo, "");
-      grate_bo_free(bo);
+      if (!bo->shared && bo->size <= GRATE_BO_CACHE_MAX_SIZE / 2) {
+         bo->cache_time = os_time_get_nano();
+         list_addtail(&bo->cache_link, &drm->bo_cache);
+         drm->bo_cache_size += bo->size;
+         grate_bo_cache_trim(drm, bo->cache_time);
+      } else {
+         grate_bo_free(bo);
+      }
    }
    
    pthread_mutex_unlock(&drm->bo_map_lock);
@@ -230,20 +362,15 @@ int grate_bo_map(struct grate_bo *bo, void **ptr)
     return 0;
 }
 
+/*
+ * The CPU mapping stays until the BO is freed (grate_bo_free): mapping a
+ * BO again for each transfer cost an ioctl, an mmap and a page fault per
+ * page touched
+ */
 int grate_bo_unmap(struct grate_bo *bo)
 {
     if (!bo)
         return -EINVAL;
-
-    if (!bo->map)
-        return 0;
-
-    grate_bo_logd(bo, "\n");
-
-    if (munmap(bo->map, bo->size))
-        return -errno;
-
-    bo->map = NULL;
 
     return 0;
 }
@@ -253,6 +380,7 @@ int grate_bo_export(struct grate_bo *bo, uint32_t flags)
     int fd, err;
 
     flags |= DRM_CLOEXEC;
+    bo->shared = true;
 
     err = drmPrimeHandleToFD(bo->drm->fd, bo->handle, flags, &fd);
     if (err < 0) {
@@ -308,9 +436,11 @@ grate_bo_import(struct grate_device *drm, int fd)
       bo->drm = drm;
       bo->size = (uint32_t) size;
       bo->handle = gem_handle;
+      bo->shared = true;
 
       grate_bo_prepare(bo);
    } else {
+      bo->shared = true;
       /* bo->refcnt == 0 can happen if the BO
        * was being released but grate_bo_import() acquired the
        * lock before grate_bo_unref(). In that case, refcnt
